@@ -705,6 +705,7 @@ if(${WITH_MDS})
     mds/MDSTableClient.cc
     mds/MDSTableServer.cc
     mds/ScrubStack.cc
+    mds/DamageTable.cc
     mds/SimpleLock.cc
     mds/SnapRealm.cc
     mds/SnapServer.cc
