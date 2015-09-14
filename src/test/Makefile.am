@@ -181,6 +181,11 @@ unittest_shared_mutex_CXXFLAGS = $(UNITTEST_CXXFLAGS)
 unittest_shared_mutex_LDADD = $(UNITTEST_LDADD) $(CEPH_GLOBAL) ${EXTRALIBS}
 check_TESTPROGRAMS += unittest_shared_mutex
 
+unittest_mutex_debug_SOURCES = test/common/test_mutex_debug.cc
+unittest_mutex_debug_CXXFLAGS = $(UNITTEST_CXXFLAGS)
+unittest_mutex_debug_LDADD = $(UNITTEST_LDADD) $(CEPH_GLOBAL) ${EXTRALIBS}
+check_TESTPROGRAMS += unittest_mutex_debug
+
 unittest_sharedptr_registry_SOURCES = test/common/test_sharedptr_registry.cc
 unittest_sharedptr_registry_CXXFLAGS = $(UNITTEST_CXXFLAGS)
 unittest_sharedptr_registry_LDADD = $(UNITTEST_LDADD) $(CEPH_GLOBAL)
