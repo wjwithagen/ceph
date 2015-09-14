@@ -1426,10 +1426,11 @@ void Server::handle_osd_map()
   /* Note that we check the OSDMAP_FULL flag directly rather than
    * using osdmap_full_flag(), because we want to know "is the flag set"
    * rather than "does the flag apply to us?" */
-  const OSDMap *osdmap = mds->objecter->get_osdmap_read();
-  is_full = osdmap->test_flag(CEPH_OSDMAP_FULL);
-  dout(7) << __func__ << ": full = " << is_full << " epoch = " << osdmap->get_epoch() << dendl;
-  mds->objecter->put_osdmap_read();
+  mds->objecter->with_osdmap([this](const OSDMap& o) {
+      is_full = o.test_flag(CEPH_OSDMAP_FULL);
+      dout(7) << __func__ << ": full = " << is_full << " epoch = "
+	      << o.get_epoch() << dendl;
+    });
 }
 
 void Server::dispatch_client_request(MDRequestRef& mdr)
@@ -4083,10 +4084,11 @@ void Server::handle_set_vxattr(MDRequestRef& mdr, CInode *cur,
 	layout = mdcache->default_file_layout;
 
       rest = name.substr(name.find("layout"));
-      const OSDMap *osdmap = mds->objecter->get_osdmap_read();
-      int r = parse_layout_vxattr(rest, value, osdmap, &layout);
-      epoch_t epoch = osdmap->get_epoch();
-      mds->objecter->put_osdmap_read();
+      epoch_t epoch;
+      int r = mds->objecter->with_osdmap([&](const OSDMap& o) {
+	  epoch = o.get_epoch();
+	  return parse_layout_vxattr(rest, value, &o, &layout);
+	});
       if (r < 0) {
 	if (r == -ENOENT) {
 	  epoch_t req_epoch = req->get_osdmap_epoch();
@@ -4132,10 +4134,11 @@ void Server::handle_set_vxattr(MDRequestRef& mdr, CInode *cur,
       }
       ceph_file_layout layout = cur->get_projected_inode()->layout;
       rest = name.substr(name.find("layout"));
-      const OSDMap *osdmap = mds->objecter->get_osdmap_read();
-      int r = parse_layout_vxattr(rest, value, osdmap, &layout);
-      epoch_t epoch = osdmap->get_epoch();
-      mds->objecter->put_osdmap_read();
+      epoch_t epoch;
+      int r = mds->objecter->with_osdmap([&](const OSDMap& o) {
+	  epoch = o.get_epoch();
+	  return parse_layout_vxattr(rest, value, &o, &layout);
+	});
       if (r < 0) {
 	if (r == -ENOENT) {
 	  epoch_t req_epoch = req->get_osdmap_epoch();
