@@ -15,6 +15,7 @@
 #ifndef CEPH_COMMON_SHARED_MUTEX_H
 #define CEPH_COMMON_SHARED_MUTEX_H
 
+#include <atomic>
 #include <mutex>
 #include <system_error>
 
@@ -346,6 +347,160 @@ public:
 
   explicit operator bool() const {
     return owns;
+  }
+};
+
+class shared_mutex_debug {
+protected:
+  pthread_rwlock_t l;
+  std::string name;
+  int id;
+  std::atomic<uint32_t> nrlock, nwlock;
+
+public:
+  // Mutex concept is DefaultConstructible
+  shared_mutex_debug(const std::string& n = std::string());
+  // Mutex is Destructible
+  ~shared_mutex_debug();
+
+  // Mutex concept is non-Copyable
+  shared_mutex_debug(const shared_mutex_debug&) = delete;
+  shared_mutex_debug& operator =(const shared_mutex_debug&) = delete;
+
+  // Mutex concept is non-Movable
+  shared_mutex_debug(shared_mutex_debug&&) = delete;
+  shared_mutex_debug& operator =(shared_mutex_debug&&) = delete;
+
+  // BasicLockable concept
+  void lock(bool no_lockdep = false);
+
+  void unlock(bool no_lockdep = false) noexcept;
+
+  // Lockable concept
+  bool try_lock(bool no_lockdep = false);
+
+  // SharedMutex concept
+  void lock_shared(bool no_lockdep = false);
+
+  bool try_lock_shared(bool no_lockdep = false);
+
+  // I think having unlock and unlock_shared both is schmuck bait,
+  // but it's in the Standard and that's what I'm coding to.
+  void unlock_shared(bool no_lockdep = false) noexcept {
+    unlock(no_lockdep);
+  }
+
+  bool is_locked() const {
+    return (nwlock > 0);
+  }
+
+  bool is_locked_shared() const {
+    return (nrlock > 0);
+  }
+
+  explicit operator bool() const {
+    return (nrlock > 0) || (nwlock > 0);
+  }
+};
+
+class shared_timed_mutex_debug : public shared_mutex_debug {
+public:
+  // TimedLock/TimedMutex concepts
+  template<typename Rep, typename Period>
+  bool try_lock_for(
+    const typename std::chrono::duration<Rep, Period>& dur,
+    bool no_lockdep = false) {
+    // POSIX requires that timedwrlock work in terms of
+    // CLOCK_REALTIME only. This displeases me.
+    return try_lock_until(ceph::real_clock::now() + dur, no_lockdep);
+  }
+
+  template<typename Rep, typename Period>
+  bool try_lock_for(
+    const CephContext* cct,
+    const typename std::chrono::duration<Rep, Period>& dur,
+    bool no_lockdep = false) {
+    // POSIX requires that timedwrlock work in terms of
+    // CLOCK_REALTIME only. This displeases me.
+    return try_lock_until(cct, ceph::real_clock::now() + dur, no_lockdep);
+  }
+
+  bool try_lock_until(const ceph::real_time& t, bool no_lockdep = false);
+
+  bool try_lock_until(const CephContext* cct, const ceph::real_time& t,
+		      bool no_ockdep = false);
+
+  template<typename Clock, typename Duration>
+  bool try_lock_until(const typename std::chrono::time_point<
+		      Clock, Duration>& t, bool no_lockdep = false) {
+    ceph::signedspan ss = t - Clock::now();
+    if (ss < ceph::signedspan::zero())
+      return try_lock(no_lockdep);
+    else
+      return try_lock_for(ss, no_lockdep);
+  }
+
+  template<typename Clock, typename Duration>
+  bool try_lock_until(const CephContext* cct,
+		      const typename std::chrono::time_point<
+		      Clock, Duration>& t,
+		      bool no_lockdep = false) {
+    ceph::signedspan ss = t - Clock::now();
+    if (ss < ceph::signedspan::zero())
+      return try_lock(no_lockdep);
+    else
+      return try_lock_for(cct, ss, no_lockdep);
+  }
+
+  // SharedTimedMutex concept
+  template<typename Rep, typename Period>
+  bool try_lock_shared_for(
+    const typename std::chrono::duration<Rep, Period>& dur,
+    bool no_lockdep = false) noexcept {
+    // POSIX requires that timedrdlock work in terms of
+    // CLOCK_REALTIME only. This displeases me.
+    return try_lock_shared_until(ceph::real_clock::now() + dur, no_lockdep);
+  }
+
+  // SharedTimedMutex concept
+  template<typename Rep, typename Period>
+  bool try_lock_shared_for(
+    const CephContext* cct,
+    const typename std::chrono::duration<Rep, Period>& dur,
+    bool no_lockdep = false) noexcept {
+    // POSIX requires that timedrdlock work in terms of
+    // CLOCK_REALTIME only. This displeases me.
+    return try_lock_shared_until(cct, ceph::real_clock::now() + dur,
+				 no_lockdep);
+  }
+
+  bool try_lock_shared_until(const ceph::real_time& t,
+			     bool no_lockdep = false);
+
+  bool try_lock_shared_until(const CephContext* cct,
+			     const ceph::real_time& t,
+			     bool no_lockdep = false);
+
+  template<typename Clock, typename Duration>
+  bool try_lock_shared_until(const typename std::chrono::time_point<
+			     Clock, Duration>& t, bool no_lockdep = false) {
+    ceph::signedspan ss = t - Clock::now();
+    if (ss < ceph::signedspan::zero())
+      return try_lock_shared(no_lockdep);
+    else
+      return try_lock_shared_for(ss, no_lockdep);
+  }
+
+  template<typename Clock, typename Duration>
+  bool try_lock_shared_until(const CephContext* cct,
+			     const typename std::chrono::time_point<
+			     Clock, Duration>& t,
+			     bool no_lockdep = false) {
+    ceph::signedspan ss = t - Clock::now();
+    if (ss < ceph::signedspan::zero())
+      return try_lock_shared(no_lockdep);
+    else
+      return try_lock_shared_for(cct, ss, no_lockdep);
   }
 };
 } // namespace ceph

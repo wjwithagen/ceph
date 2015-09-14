@@ -1119,3 +1119,440 @@ TEST(SharedLock, NoRecursion) {
 				std::chrono::milliseconds(10)),
 	       std::system_error);
 }
+
+TEST(SharedMutexDebug, TestLock) {
+  ceph::shared_mutex_debug sm;
+  auto ttl = &test_try_lock<ceph::shared_mutex_debug>;
+  auto ttls = &test_try_lock_shared<ceph::shared_mutex_debug>;
+
+  sm.lock();
+  ASSERT_TRUE(sm.is_locked());
+  // What the heck, why do you use decay here?
+  auto f1 = std::async(std::launch::async, ttl, &sm);
+  ASSERT_FALSE(f1.get());
+
+  ASSERT_TRUE(sm.is_locked());
+  ASSERT_FALSE(sm.is_locked_shared());
+  ASSERT_TRUE(!!sm);
+
+  auto f2 = std::async(std::launch::async, ttls, &sm);
+  ASSERT_FALSE(f2.get());
+
+  ASSERT_TRUE(sm.is_locked());
+  ASSERT_FALSE(sm.is_locked_shared());
+  ASSERT_TRUE(!!sm);
+
+  sm.unlock();
+  ASSERT_FALSE(sm.is_locked());
+  ASSERT_FALSE(sm.is_locked_shared());
+  ASSERT_FALSE(!!sm);
+
+  auto f3 = std::async(std::launch::async, ttl, &sm);
+  ASSERT_TRUE(f3.get());
+
+  ASSERT_FALSE(sm.is_locked());
+  ASSERT_FALSE(sm.is_locked_shared());
+  ASSERT_FALSE(!!sm);
+
+  auto f4 = std::async(std::launch::async, ttls, &sm);
+  ASSERT_TRUE(f4.get());
+
+  ASSERT_FALSE(sm.is_locked());
+  ASSERT_FALSE(sm.is_locked_shared());
+  ASSERT_FALSE(!!sm);
+}
+
+TEST(SharedMutexDebug, TestLockShared) {
+  ceph::shared_mutex_debug sm;
+
+  auto ttl = test_try_lock<ceph::shared_mutex_debug>;
+  auto ttls = test_try_lock_shared<ceph::shared_mutex_debug>;
+
+  sm.lock_shared();
+
+  ASSERT_FALSE(sm.is_locked());
+  ASSERT_TRUE(sm.is_locked_shared());
+  ASSERT_TRUE(!!sm);
+
+  auto f1 = std::async(std::launch::async, ttl, &sm);
+  ASSERT_FALSE(f1.get());
+
+  ASSERT_FALSE(sm.is_locked());
+  ASSERT_TRUE(sm.is_locked_shared());
+  ASSERT_TRUE(!!sm);
+
+  auto f2 = std::async(std::launch::async, ttls, &sm);
+  ASSERT_TRUE(f2.get());
+
+  ASSERT_FALSE(sm.is_locked());
+  ASSERT_TRUE(sm.is_locked_shared());
+  ASSERT_TRUE(!!sm);
+
+  sm.unlock_shared();
+
+  auto f3 = std::async(std::launch::async, ttl, &sm);
+  ASSERT_TRUE(f3.get());
+
+  ASSERT_FALSE(sm.is_locked());
+  ASSERT_FALSE(sm.is_locked_shared());
+  ASSERT_FALSE(!!sm);
+
+  auto f4 = std::async(std::launch::async, ttls, &sm);
+  ASSERT_TRUE(f4.get());
+
+  ASSERT_FALSE(sm.is_locked());
+  ASSERT_FALSE(sm.is_locked_shared());
+  ASSERT_FALSE(!!sm);
+}
+
+TEST(SharedTimedMutexDebug, TestTimedFail) {
+  ceph::shared_timed_mutex_debug sm;
+
+  auto ttlf = test_try_lock_for<ceph::shared_timed_mutex_debug, uint64_t,
+				std::nano>;
+  auto ttlsf = test_try_lock_shared_for<ceph::shared_timed_mutex_debug,
+					uint64_t, std::nano>;
+
+  auto ttlu = test_try_lock_until<ceph::shared_timed_mutex_debug,
+				  ceph::real_clock, ceph::timespan>;
+  auto ttlsu = test_try_lock_shared_until<ceph::shared_timed_mutex_debug,
+					  ceph::real_clock, ceph::timespan>;
+
+  auto ttlum = test_try_lock_until<ceph::shared_timed_mutex_debug,
+				   ceph::mono_clock, ceph::timespan>;
+  auto ttlsum = test_try_lock_shared_until<ceph::shared_timed_mutex_debug,
+					   ceph::mono_clock, ceph::timespan>;
+  sm.lock();
+
+  ASSERT_TRUE(sm.is_locked());
+  ASSERT_FALSE(sm.is_locked_shared());
+  ASSERT_TRUE(!!sm);
+
+  auto f1 = std::async(std::launch::async, ttlf, &sm,
+		       std::chrono::milliseconds(10));
+  ASSERT_FALSE(f1.get());
+
+  ASSERT_TRUE(sm.is_locked());
+  ASSERT_FALSE(sm.is_locked_shared());
+  ASSERT_TRUE(!!sm);
+
+  auto f2 = std::async(std::launch::async, ttlu, &sm,
+		       ceph::real_clock::now() +
+		       std::chrono::milliseconds(10));
+  ASSERT_FALSE(f2.get());
+
+  ASSERT_TRUE(sm.is_locked());
+  ASSERT_FALSE(sm.is_locked_shared());
+  ASSERT_TRUE(!!sm);
+
+  auto f3 = std::async(std::launch::async, ttlum, &sm,
+		       ceph::mono_clock::now() +
+		       std::chrono::milliseconds(10));
+  ASSERT_FALSE(f3.get());
+
+  ASSERT_TRUE(sm.is_locked());
+  ASSERT_FALSE(sm.is_locked_shared());
+  ASSERT_TRUE(!!sm);
+
+  auto f4 = std::async(std::launch::async, ttlsf, &sm,
+		       std::chrono::milliseconds(10));
+  ASSERT_FALSE(f4.get());
+
+  ASSERT_TRUE(sm.is_locked());
+  ASSERT_FALSE(sm.is_locked_shared());
+  ASSERT_TRUE(!!sm);
+
+  auto f5 = std::async(std::launch::async, ttlsu, &sm,
+		       ceph::real_clock::now() +
+		       std::chrono::milliseconds(10));
+  ASSERT_FALSE(f5.get());
+
+  ASSERT_TRUE(sm.is_locked());
+  ASSERT_FALSE(sm.is_locked_shared());
+  ASSERT_TRUE(!!sm);
+
+  auto f6 = std::async(std::launch::async, ttlsum, &sm,
+		       ceph::mono_clock::now() +
+		       std::chrono::milliseconds(10));
+  ASSERT_FALSE(f6.get());
+
+  ASSERT_TRUE(sm.is_locked());
+  ASSERT_FALSE(sm.is_locked_shared());
+  ASSERT_TRUE(!!sm);
+
+  sm.unlock();
+
+  ASSERT_FALSE(sm.is_locked());
+  ASSERT_FALSE(sm.is_locked_shared());
+  ASSERT_FALSE(!!sm);
+
+  sm.lock_shared();
+
+  ASSERT_FALSE(sm.is_locked());
+  ASSERT_TRUE(sm.is_locked_shared());
+  ASSERT_TRUE(!!sm);
+
+  auto f7 = std::async(std::launch::async, ttlf, &sm,
+		       std::chrono::milliseconds(10));
+  ASSERT_FALSE(f7.get());
+
+  ASSERT_FALSE(sm.is_locked());
+  ASSERT_TRUE(sm.is_locked_shared());
+  ASSERT_TRUE(!!sm);
+
+  auto f8 = std::async(std::launch::async, ttlu, &sm,
+		       ceph::real_clock::now() +
+		       std::chrono::milliseconds(10));
+  ASSERT_FALSE(f8.get());
+
+  ASSERT_FALSE(sm.is_locked());
+  ASSERT_TRUE(sm.is_locked_shared());
+  ASSERT_TRUE(!!sm);
+
+  auto f9 = std::async(std::launch::async, ttlum, &sm,
+		       ceph::mono_clock::now() +
+		       std::chrono::milliseconds(10));
+  ASSERT_FALSE(f9.get());
+
+  ASSERT_FALSE(sm.is_locked());
+  ASSERT_TRUE(sm.is_locked_shared());
+  ASSERT_TRUE(!!sm);
+
+  sm.unlock_shared();
+
+  ASSERT_FALSE(sm.is_locked());
+  ASSERT_FALSE(sm.is_locked_shared());
+  ASSERT_FALSE(!!sm);
+}
+
+TEST(SharedTimedMutexDebug, TestTimedAcquire) {
+  ceph::shared_timed_mutex_debug sm;
+
+  auto ttlf = test_try_lock_for<ceph::shared_timed_mutex_debug, uint64_t,
+				std::nano>;
+  auto ttlsf = test_try_lock_shared_for<ceph::shared_timed_mutex_debug,
+					uint64_t, std::nano>;
+
+  auto ttlu = test_try_lock_until<ceph::shared_timed_mutex_debug,
+				  ceph::real_clock, ceph::timespan>;
+  auto ttlsu = test_try_lock_shared_until<ceph::shared_timed_mutex_debug,
+					  ceph::real_clock, ceph::timespan>;
+
+  auto ttlum = test_try_lock_until<ceph::shared_timed_mutex_debug,
+				   ceph::mono_clock, ceph::timespan>;
+  auto ttlsum = test_try_lock_shared_until<ceph::shared_timed_mutex_debug,
+					   ceph::mono_clock, ceph::timespan>;
+
+  sm.lock();
+
+  ASSERT_TRUE(sm.is_locked());
+  ASSERT_FALSE(sm.is_locked_shared());
+  ASSERT_TRUE(!!sm);
+
+  auto f1 = std::async(std::launch::async, ttlf, &sm,
+		       std::chrono::milliseconds(100));
+  sm.unlock();
+  ASSERT_TRUE(f1.get());
+
+  ASSERT_FALSE(sm.is_locked());
+  ASSERT_FALSE(sm.is_locked_shared());
+  ASSERT_FALSE(!!sm);
+
+  sm.lock();
+
+  ASSERT_TRUE(sm.is_locked());
+  ASSERT_FALSE(sm.is_locked_shared());
+  ASSERT_TRUE(!!sm);
+
+  auto f2 = std::async(std::launch::async, ttlu, &sm,
+		       ceph::real_clock::now() +
+		       std::chrono::milliseconds(100));
+  sm.unlock();
+  ASSERT_TRUE(f2.get());
+
+  ASSERT_FALSE(sm.is_locked());
+  ASSERT_FALSE(sm.is_locked_shared());
+  ASSERT_FALSE(!!sm);
+
+  sm.lock();
+
+  ASSERT_TRUE(sm.is_locked());
+  ASSERT_FALSE(sm.is_locked_shared());
+  ASSERT_TRUE(!!sm);
+
+  auto f3 = std::async(std::launch::async, ttlum, &sm,
+		       ceph::mono_clock::now() +
+		       std::chrono::milliseconds(100));
+  sm.unlock();
+  ASSERT_TRUE(f3.get());
+
+  ASSERT_FALSE(sm.is_locked());
+  ASSERT_FALSE(sm.is_locked_shared());
+  ASSERT_FALSE(!!sm);
+
+  sm.lock();
+
+  ASSERT_TRUE(sm.is_locked());
+  ASSERT_FALSE(sm.is_locked_shared());
+  ASSERT_TRUE(!!sm);
+
+  auto f4 = std::async(std::launch::async, ttlsf, &sm,
+		       std::chrono::milliseconds(100));
+  sm.unlock();
+  ASSERT_TRUE(f4.get());
+
+  ASSERT_FALSE(sm.is_locked());
+  ASSERT_FALSE(sm.is_locked_shared());
+  ASSERT_FALSE(!!sm);
+
+  sm.lock();
+
+  ASSERT_TRUE(sm.is_locked());
+  ASSERT_FALSE(sm.is_locked_shared());
+  ASSERT_TRUE(!!sm);
+
+  auto f5 = std::async(std::launch::async, ttlsu, &sm,
+		       ceph::real_clock::now() +
+		       std::chrono::milliseconds(100));
+  sm.unlock();
+  ASSERT_TRUE(f5.get());
+
+  ASSERT_FALSE(sm.is_locked());
+  ASSERT_FALSE(sm.is_locked_shared());
+  ASSERT_FALSE(!!sm);
+
+  sm.lock();
+
+  ASSERT_TRUE(sm.is_locked());
+  ASSERT_FALSE(sm.is_locked_shared());
+  ASSERT_TRUE(!!sm);
+
+  auto f6 = std::async(std::launch::async, ttlsum, &sm,
+		       ceph::mono_clock::now() +
+		       std::chrono::milliseconds(100));
+  sm.unlock();
+
+  ASSERT_TRUE(f6.get());
+
+  ASSERT_FALSE(sm.is_locked());
+  ASSERT_FALSE(sm.is_locked_shared());
+  ASSERT_FALSE(!!sm);
+
+  sm.lock_shared();
+
+  ASSERT_FALSE(sm.is_locked());
+  ASSERT_TRUE(sm.is_locked_shared());
+  ASSERT_TRUE(!!sm);
+
+  auto f7 = std::async(std::launch::async, ttlf, &sm,
+		       std::chrono::milliseconds(100));
+  sm.unlock_shared();
+  ASSERT_TRUE(f7.get());
+
+  ASSERT_FALSE(sm.is_locked());
+  ASSERT_FALSE(sm.is_locked_shared());
+  ASSERT_FALSE(!!sm);
+
+  sm.lock_shared();
+
+  ASSERT_FALSE(sm.is_locked());
+  ASSERT_TRUE(sm.is_locked_shared());
+  ASSERT_TRUE(!!sm);
+
+  auto f8 = std::async(std::launch::async, ttlu, &sm,
+		       ceph::real_clock::now() +
+		       std::chrono::milliseconds(100));
+  sm.unlock_shared();
+  ASSERT_TRUE(f8.get());
+
+  ASSERT_FALSE(sm.is_locked());
+  ASSERT_FALSE(sm.is_locked_shared());
+  ASSERT_FALSE(!!sm);
+
+  sm.lock_shared();
+
+  ASSERT_FALSE(sm.is_locked());
+  ASSERT_TRUE(sm.is_locked_shared());
+  ASSERT_TRUE(!!sm);
+
+  auto f9 = std::async(std::launch::async, ttlum, &sm,
+		       ceph::mono_clock::now() +
+		       std::chrono::milliseconds(100));
+  sm.unlock_shared();
+  ASSERT_TRUE(f9.get());
+
+  ASSERT_FALSE(sm.is_locked());
+  ASSERT_FALSE(sm.is_locked_shared());
+  ASSERT_FALSE(!!sm);
+}
+
+TEST(SharedTimedMutexDebug, TestTimedUncontested) {
+  ceph::shared_timed_mutex_debug sm;
+
+  auto ttlf = test_try_lock_for<ceph::shared_timed_mutex_debug, uint64_t,
+				std::nano>;
+  auto ttlsf = test_try_lock_shared_for<ceph::shared_timed_mutex_debug,
+					uint64_t, std::nano>;
+
+  auto ttlu = test_try_lock_until<ceph::shared_timed_mutex_debug,
+				  ceph::real_clock, ceph::timespan>;
+  auto ttlsu = test_try_lock_shared_until<ceph::shared_timed_mutex_debug,
+					  ceph::real_clock, ceph::timespan>;
+
+  auto ttlum = test_try_lock_until<ceph::shared_timed_mutex_debug,
+				   ceph::mono_clock, ceph::timespan>;
+  auto ttlsum = test_try_lock_shared_until<ceph::shared_timed_mutex_debug,
+					   ceph::mono_clock, ceph::timespan>;
+
+  auto f1 = std::async(std::launch::async, ttlf, &sm,
+		       std::chrono::milliseconds(100));
+  ASSERT_TRUE(f1.get());
+
+  ASSERT_FALSE(sm.is_locked());
+  ASSERT_FALSE(sm.is_locked_shared());
+  ASSERT_FALSE(!!sm);
+
+  auto f2 = std::async(std::launch::async, ttlu, &sm,
+		       ceph::real_clock::now() +
+		       std::chrono::milliseconds(10));
+  ASSERT_TRUE(f2.get());
+
+  ASSERT_FALSE(sm.is_locked());
+  ASSERT_FALSE(sm.is_locked_shared());
+  ASSERT_FALSE(!!sm);
+
+  auto f3 = std::async(std::launch::async, ttlum, &sm,
+		       ceph::mono_clock::now() +
+		       std::chrono::milliseconds(10));
+  ASSERT_TRUE(f3.get());
+
+  ASSERT_FALSE(sm.is_locked());
+  ASSERT_FALSE(sm.is_locked_shared());
+  ASSERT_FALSE(!!sm);
+
+  auto f4 = std::async(std::launch::async, ttlsf, &sm,
+		       std::chrono::milliseconds(10));
+  ASSERT_TRUE(f4.get());
+
+  ASSERT_FALSE(sm.is_locked());
+  ASSERT_FALSE(sm.is_locked_shared());
+  ASSERT_FALSE(!!sm);
+
+  auto f5 = std::async(std::launch::async, ttlsu, &sm,
+		       ceph::real_clock::now() +
+		       std::chrono::milliseconds(10));
+  ASSERT_TRUE(f5.get());
+
+  ASSERT_FALSE(sm.is_locked());
+  ASSERT_FALSE(sm.is_locked_shared());
+  ASSERT_FALSE(!!sm);
+
+  auto f6 = std::async(std::launch::async, ttlsum, &sm,
+		       ceph::mono_clock::now() +
+		       std::chrono::milliseconds(10));
+  ASSERT_TRUE(f6.get());
+
+  ASSERT_FALSE(sm.is_locked());
+  ASSERT_FALSE(sm.is_locked_shared());
+  ASSERT_FALSE(!!sm);
+}

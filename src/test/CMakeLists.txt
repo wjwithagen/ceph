@@ -512,7 +512,7 @@ add_executable(unittest_shared_mutex
   $<TARGET_OBJECTS:heap_profiler_objs>
   )
 target_link_libraries(unittest_shared_mutex global
-  ${BLKID_LIBRARIES} ${CMAKE_DL_LIBS} ${TCMALLOC_LIBS} ${UNITTEST_LIBS})
+  ${BLKID_LIBRARIES} ${CMAKE_DL_LIBS} ${TCMALLOC_LIBS} ${UNITTEST_LIBS} ${EXTRALIBS})
 set_target_properties(unittest_shared_mutex
   PROPERTIES COMPILE_FLAGS ${UNITTEST_CXX_FLAGS})
 

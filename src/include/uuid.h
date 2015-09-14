@@ -1,3 +1,17 @@
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
+// vim: ts=8 sw=2 smarttab
+/*
+ * Ceph - scalable distributed file system
+ *
+ * Copyright (C) 2004-2006 Sage Weil <sage@newdream.net>
+ *
+ * This is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License version 2.1, as published by the Free Software
+ * Foundation.  See file COPYING.
+ *
+ */
+
 #ifndef _CEPH_UUID_H
 #define _CEPH_UUID_H
 
@@ -27,10 +41,11 @@ struct uuid_d {
 
   void generate_random() {
     boost::random::random_device rng("/dev/urandom");
-    boost::uuids::basic_random_generator<boost::random::random_device> gen(&rng);
+    boost::uuids::basic_random_generator<boost::random::
+	    random_device> gen(&rng);
     uuid = gen();
   }
-  
+
   bool parse(const char *s) {
     try {
       boost::uuids::string_generator gen;
@@ -44,10 +59,14 @@ struct uuid_d {
     memcpy(s, boost::uuids::to_string(uuid).c_str(), 37);
   }
 
+  std::string to_string() const {
+    return boost::uuids::to_string(uuid);
+  }
+
   char *bytes() const {
     return (char*)uuid.data;
   }
-  
+
   void encode(bufferlist& bl) const {
     ::encode_raw(uuid, bl);
   }

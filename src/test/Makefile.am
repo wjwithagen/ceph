@@ -178,7 +178,7 @@ check_TESTPROGRAMS += unittest_str_map
 
 unittest_shared_mutex_SOURCES = test/common/test_shared_mutex.cc
 unittest_shared_mutex_CXXFLAGS = $(UNITTEST_CXXFLAGS)
-unittest_shared_mutex_LDADD = $(UNITTEST_LDADD) $(CEPH_GLOBAL)
+unittest_shared_mutex_LDADD = $(UNITTEST_LDADD) $(CEPH_GLOBAL) ${EXTRALIBS}
 check_TESTPROGRAMS += unittest_shared_mutex
 
 unittest_sharedptr_registry_SOURCES = test/common/test_sharedptr_registry.cc
