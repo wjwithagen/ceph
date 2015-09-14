@@ -503,6 +503,19 @@ target_link_libraries(unittest_str_map common global
 set_target_properties(unittest_str_map
   PROPERTIES COMPILE_FLAGS ${UNITTEST_CXX_FLAGS})
 
+# unittest_shared_mutex
+set(unittest_shared_mutex_srcs
+  common/test_shared_mutex.cc
+  )
+add_executable(unittest_shared_mutex
+  ${unittest_shared_mutex_srcs}
+  $<TARGET_OBJECTS:heap_profiler_objs>
+  )
+target_link_libraries(unittest_shared_mutex global
+  ${BLKID_LIBRARIES} ${CMAKE_DL_LIBS} ${TCMALLOC_LIBS} ${UNITTEST_LIBS})
+set_target_properties(unittest_shared_mutex
+  PROPERTIES COMPILE_FLAGS ${UNITTEST_CXX_FLAGS})
+
 # unittest_sharedptr_registry
 add_executable(unittest_sharedptr_registry EXCLUDE_FROM_ALL
   common/test_sharedptr_registry.cc
