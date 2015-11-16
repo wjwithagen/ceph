@@ -4419,7 +4419,7 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	  break;
 	}
 	if (oi.is_dirty()) {
-	  result = start_flush(ctx->op, ctx->obc, false, NULL, NULL);
+	  result = start_flush(ctx->op, ctx->obc, false, NULL, boost::none);
 	  if (result == -EINPROGRESS)
 	    result = -EAGAIN;
 	} else {
@@ -4452,7 +4452,7 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	}
 	hobject_t missing;
 	if (oi.is_dirty()) {
-	  result = start_flush(ctx->op, ctx->obc, true, &missing, NULL);
+	  result = start_flush(ctx->op, ctx->obc, true, &missing, boost::none);
 	  if (result == -EINPROGRESS)
 	    result = -EAGAIN;
 	} else {
@@ -7714,7 +7714,7 @@ struct C_Flush : public Context {
 int ReplicatedPG::start_flush(
   OpRequestRef op, ObjectContextRef obc,
   bool blocking, hobject_t *pmissing,
-  Context *on_flush)
+  boost::optional<std::function<void()>> &&on_flush)
 {
   const object_info_t& oi = obc->obs.oi;
   const hobject_t& soid = oi.soid;
@@ -7876,7 +7876,7 @@ int ReplicatedPG::start_flush(
   fop->obc = obc;
   fop->flushed_version = oi.user_version;
   fop->blocking = blocking;
-  fop->on_flush = on_flush;
+  fop->on_flush = std::move(on_flush);
   fop->op = op;
 
   ObjectOperation o;
@@ -7940,9 +7940,8 @@ void ReplicatedPG::finish_flush(hobject_t oid, ceph_tid_t tid, int r)
       requeue_ops(fop->dup_ops);
     }
     if (fop->on_flush) {
-      Context *on_flush = fop->on_flush;
-      fop->on_flush = NULL;
-      on_flush->complete(-EBUSY);
+      (*(fop->on_flush))();
+      fop->on_flush = boost::none;
     }
     flush_ops.erase(oid);
     return;
@@ -7978,9 +7977,8 @@ int ReplicatedPG::try_flush_mark_clean(FlushOpRef fop)
       requeue_ops(fop->dup_ops);
     }
     if (fop->on_flush) {
-      Context *on_flush = fop->on_flush;
-      fop->on_flush = NULL;
-      on_flush->complete(-EBUSY);
+      (*(fop->on_flush))();
+      fop->on_flush = boost::none;
     }
     flush_ops.erase(oid);
     if (fop->blocking)
@@ -8009,9 +8007,8 @@ int ReplicatedPG::try_flush_mark_clean(FlushOpRef fop)
       agent_maybe_evict(obc, true)) {
     osd->logger->inc(l_osd_tier_clean);
     if (fop->on_flush) {
-      Context *on_flush = fop->on_flush;
-      fop->on_flush = NULL;
-      on_flush->complete(0);
+      (*(fop->on_flush))();
+      fop->on_flush = boost::none;
     }
     flush_ops.erase(oid);
     return 0;
@@ -8037,8 +8034,8 @@ int ReplicatedPG::try_flush_mark_clean(FlushOpRef fop)
   dout(10) << __func__ << " clearing DIRTY flag for " << oid << dendl;
   OpContextUPtr ctx = simple_opc_create(fop->obc);
 
-  ctx->on_finish = fop->on_flush;
-  fop->on_flush = NULL;
+  ctx->register_on_finish(*(fop->on_flush));
+  fop->on_flush = boost::none;
 
   ctx->lock_to_release = OpContext::W_LOCK;  // we took it above
   ctx->at_version = get_next_version();
@@ -8090,9 +8087,8 @@ void ReplicatedPG::cancel_flush(FlushOpRef fop, bool requeue)
     requeue_ops(fop->dup_ops);
   }
   if (fop->on_flush) {
-    Context *on_flush = fop->on_flush;
-    fop->on_flush = NULL;
-    on_flush->complete(-ECANCELED);
+    (*(fop->on_flush))();
+    fop->on_flush = boost::none;
   }
   flush_ops.erase(fop->obc->obs.oi.soid);
 }
@@ -11685,17 +11681,6 @@ void ReplicatedPG::agent_load_hit_sets()
   }
 }
 
-struct C_AgentFlushStartStop : public Context {
-  ReplicatedPGRef pg;
-  hobject_t oid;
-  C_AgentFlushStartStop(ReplicatedPG *p, hobject_t o) : pg(p), oid(o) {
-    pg->osd->agent_start_op(oid);
-  }
-  void finish(int r) {
-    pg->osd->agent_finish_op(oid);
-  }
-};
-
 bool ReplicatedPG::agent_maybe_flush(ObjectContextRef& obc)
 {
   if (!obc->obs.oi.is_dirty()) {
@@ -11737,12 +11722,18 @@ bool ReplicatedPG::agent_maybe_flush(ObjectContextRef& obc)
   // FIXME: flush anything dirty, regardless of what distribution of
   // ages we expect.
 
-  Context *on_flush = new C_AgentFlushStartStop(this, obc->obs.oi.soid);
+  hobject_t oid = obc->obs.oi.soid;
+  osd->agent_start_op(oid);
+  // no need to capture a pg ref, can't outlive fop or ctx
+  std::function<void()> on_flush = [this, oid]() {
+    osd->agent_finish_op(oid);
+  };
+    
   int result = start_flush(
     OpRequestRef(), obc, false, NULL,
     on_flush);
   if (result != -EINPROGRESS) {
-    on_flush->complete(result);
+    on_flush();
     dout(10) << __func__ << " start_flush() failed " << obc->obs.oi
       << " with " << result << dendl;
     osd->logger->inc(l_osd_agent_skip);
@@ -11817,7 +11808,7 @@ bool ReplicatedPG::agent_maybe_evict(ObjectContextRef& obc, bool after_flush)
   OpContextUPtr ctx = simple_opc_create(obc);
 
   osd->agent_start_evict_op();
-  ctx->register_on_complete(
+  ctx->register_on_finish(
     [this]() {
       osd->agent_finish_evict_op();
     });
