@@ -179,7 +179,7 @@
        const eversion_t &trim_to,
        const eversion_t &trim_rollback_to,
        bool transaction_applied,
-       ObjectStore::Transaction *t) = 0;
+       ObjectStore::Transaction &t) = 0;
 
      virtual void update_peer_last_complete_ondisk(
        pg_shard_t fromosd,
@@ -465,6 +465,8 @@
      virtual uint64_t get_bytes_written() const = 0;
      virtual ~PGTransaction() {}
    };
+   using PGTransactionUPtr = std::unique_ptr<PGTransaction>;
+
    /// Get implementation specific empty transaction
    virtual PGTransaction *get_transaction() = 0;
 
@@ -472,7 +474,7 @@
    virtual void submit_transaction(
      const hobject_t &hoid,               ///< [in] object
      const eversion_t &at_version,        ///< [in] version
-     PGTransaction *t,                    ///< [in] trans to execute
+     PGTransactionUPtr &&t,               ///< [in] trans to execute (move)
      const eversion_t &trim_to,           ///< [in] trim log to here
      const eversion_t &trim_rollback_to,  ///< [in] trim rollback info to here
      const vector<pg_log_entry_t> &log_entries, ///< [in] log entries for t
