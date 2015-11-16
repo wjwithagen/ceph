@@ -8398,7 +8398,6 @@ void ReplicatedPG::remove_repop(RepGather *repop)
   }
 
   release_op_ctx_locks(repop->ctx);
-  repop->ctx->finish(0);  // FIXME: return value here is sloppy
   repop->put();
 
   osd->logger->dec(l_osd_op_wip);
