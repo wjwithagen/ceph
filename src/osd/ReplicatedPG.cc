@@ -158,7 +158,7 @@ public:
 	if (ctx->op)
 	  ctx->pg->requeue_op(ctx->op);
       }
-      ctx->pg->close_op_ctx(ctx, r);
+      ctx->pg->close_op_ctx(ctx);
     }
   }
 
@@ -1996,13 +1996,13 @@ void ReplicatedPG::do_op(OpRequestRef& op)
   } else if (!get_rw_locks(write_ordered, ctx)) {
     dout(20) << __func__ << " waiting for rw locks " << dendl;
     op->mark_delayed("waiting for rw locks");
-    close_op_ctx(ctx, -EBUSY);
+    close_op_ctx(ctx);
     return;
   }
 
   if (r) {
     dout(20) << __func__ << " returned an error: " << r << dendl;
-    close_op_ctx(ctx, r);
+    close_op_ctx(ctx);
     osd->reply_op_error(op, r);
     return;
   }
@@ -2031,7 +2031,7 @@ void ReplicatedPG::do_op(OpRequestRef& op)
 	classic = true;
       }
       fill_in_copy_get_noent(op, oid, m->ops[0], classic);
-      close_op_ctx(ctx, -ENOENT);
+      close_op_ctx(ctx);
       return;
     }
     reply_ctx(ctx, -ENOENT);
@@ -2852,7 +2852,7 @@ void ReplicatedPG::execute_ctx(OpContext *ctx)
 
   if (result == -EAGAIN) {
     // clean up after the ctx
-    close_op_ctx(ctx, result);
+    close_op_ctx(ctx);
     return;
   }
 
@@ -3001,14 +3001,14 @@ void ReplicatedPG::reply_ctx(OpContext *ctx, int r)
 {
   if (ctx->op)
     osd->reply_op_error(ctx->op, r);
-  close_op_ctx(ctx, r);
+  close_op_ctx(ctx);
 }
 
 void ReplicatedPG::reply_ctx(OpContext *ctx, int r, eversion_t v, version_t uv)
 {
   if (ctx->op)
     osd->reply_op_error(ctx->op, r, v, uv);
-  close_op_ctx(ctx, r);
+  close_op_ctx(ctx);
 }
 
 void ReplicatedPG::log_op_stats(OpContext *ctx)
@@ -6754,7 +6754,7 @@ void ReplicatedPG::complete_read_ctx(int result, OpContext *ctx)
   reply->set_result(result);
   reply->add_flags(CEPH_OSD_FLAG_ACK | CEPH_OSD_FLAG_ONDISK);
   osd->send_message_osd_client(reply, m->get_connection());
-  close_op_ctx(ctx, 0);
+  close_op_ctx(ctx);
 }
 
 // ========================================================================
@@ -9791,7 +9791,7 @@ void ReplicatedPG::on_change(ObjectStore::Transaction *t)
          in_progress_async_reads.begin();
        i != in_progress_async_reads.end();
        in_progress_async_reads.erase(i++)) {
-    close_op_ctx(i->second, -ECANCELED);
+    close_op_ctx(i->second);
     if (is_primary())
       requeue_op(i->first);
   }

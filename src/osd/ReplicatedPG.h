@@ -802,7 +802,7 @@ protected:
    *
    * @param ctx [in] ctx to clean up
    */
-  void close_op_ctx(OpContext *ctx, int r) {
+  void close_op_ctx(OpContext *ctx) {
     release_op_ctx_locks(ctx);
     ctx->op_t.reset();
     for (auto p = ctx->on_finish.begin();
