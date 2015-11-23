@@ -18,3 +18,8 @@ usr/share/man/man8/crushtool.8
 usr/share/man/man8/monmaptool.8
 usr/share/man/man8/osdmaptool.8
 usr/lib/python*/dist-packages/ceph_daemon.py*
+usr/lib/python*/dist-packages/ceph_detect_init*
+usr/lib/python*/dist-packages/ceph_rest_api.py
+usr/share/man/man8/ceph-detect-init.8
+usr/share/man/man8/ceph-create-keys.8
+usr/bin/ceph-client-debug
