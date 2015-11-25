@@ -216,9 +216,15 @@ Group:         System Environment/Base
 Requires:      ceph-osd = %{epoch}:%{version}-%{release}
 Requires:      ceph-mds = %{epoch}:%{version}-%{release}
 Requires:      ceph-mon = %{epoch}:%{version}-%{release}
-Requires:      ceph-common = %{epoch}:%{version}-%{release}
 %description ceph
 Ceph is the meta package that includes all the daemons and ceph-common
+
+%package base
+Summary:       Ceph Base Package
+Group:         System Environment/Base
+Requires:      ceph-common = %{epoch}:%{version}-%{release}
+%description base
+Base is the package that includes all the files shared amongst ceph servers
 
 %package -n ceph-common
 Summary:	Ceph Common
@@ -249,7 +255,7 @@ Comprised of files that are common to Ceph clients and servers.
 %package mds
 Summary:	Ceph Metadata Server Daemon
 Group:		System Environment/Base
-Requires:	ceph = %{epoch}:%{version}-%{release}
+Requires:	ceph-base = %{epoch}:%{version}-%{release}
 %description mds
 ceph-mds is the metadata server daemon for the Ceph distributed file system.
 One or more instances of ceph-mds collectively manage the file system
@@ -258,7 +264,7 @@ namespace, coordinating access to the shared OSD cluster.
 %package mon
 Summary:	Ceph Monitor Daemon
 Group:		System Environment/Base
-Requires:	ceph = %{epoch}:%{version}-%{release}
+Requires:	ceph-base = %{epoch}:%{version}-%{release}
 # For ceph-rest-api
 Requires:	python-flask
 %description mon
@@ -315,7 +321,7 @@ managers such as Pacemaker.
 %package osd
 Summary:	Ceph Object Storage Daemon
 Group:		System Environment/Base
-Requires:	ceph = %{epoch}:%{version}-%{release}
+Requires:	ceph-base = %{epoch}:%{version}-%{release}
 %description osd
 ceph-osd is the object storage daemon for the Ceph distributed file
 system.  It is responsible for storing objects on a local file system
@@ -801,37 +807,31 @@ rm -rf $RPM_BUILD_ROOT
 # files
 #################################################################################
 %files
+
+%files base
 %defattr(-,root,root,-)
 %docdir %{_docdir}
 %dir %{_docdir}/ceph
 %{_docdir}/ceph/sample.ceph.conf
 %{_docdir}/ceph/sample.fetch_config
-%{_bindir}/cephfs
 %{_bindir}/crushtool
 %{_bindir}/monmaptool
 %{_bindir}/osdmaptool
 %{_bindir}/ceph-run
 %{_bindir}/ceph-detect-init
-%{_bindir}/librados-config
 %{_bindir}/ceph-client-debug
-%{_bindir}/cephfs-journal-tool
-%{_bindir}/cephfs-table-tool
-%{_bindir}/cephfs-data-scan
-%{_bindir}/ceph-debugpack
-%{_bindir}/ceph-coverage
+%{_bindir}/cephfs
 %if 0%{?_with_systemd}
 %{_unitdir}/ceph-mds@.service
 %{_unitdir}/ceph-mon@.service
 %{_unitdir}/ceph-create-keys@.service
 %{_unitdir}/ceph-osd@.service
 %{_unitdir}/ceph-radosgw@.service
-%{_unitdir}/ceph-disk@.service
 %{_unitdir}/ceph.target
 %else
 %{_initrddir}/ceph
 %endif
-%{_sbindir}/ceph-disk
-%{_sbindir}/ceph-disk-udev
+%{_unitdir}/ceph-disk@.service
 %{_sbindir}/ceph-create-keys
 %{_sbindir}/rcceph
 %if 0%{?rhel} >= 7 || 0%{?fedora} || 0%{?suse_version}
@@ -841,7 +841,6 @@ rm -rf $RPM_BUILD_ROOT
 %endif
 %dir %{_libdir}/ceph
 %{_libdir}/ceph/ceph_common.sh
-%{_libexecdir}/ceph/ceph-osd-prestart.sh
 %dir %{_libdir}/rados-classes
 %{_libdir}/rados-classes/libcls_cephfs.so*
 %{_libdir}/rados-classes/libcls_rbd.so*
@@ -881,8 +880,6 @@ rm -rf $RPM_BUILD_ROOT
 %{_mandir}/man8/monmaptool.8*
 %{_mandir}/man8/cephfs.8*
 %{_mandir}/man8/mount.ceph.8*
-%{_mandir}/man8/ceph-debugpack.8*
-%{_mandir}/man8/librados-config.8*
 #set up placeholder directories
 %attr(750,ceph,ceph) %dir %{_localstatedir}/lib/ceph/tmp
 %attr(750,ceph,ceph) %dir %{_localstatedir}/lib/ceph/mon
@@ -978,6 +975,7 @@ fi
 %{_bindir}/ceph-mds
 %{_bindir}/cephfs-journal-tool
 %{_bindir}/cephfs-table-tool
+%{_bindir}/cephfs-data-scan
 %{_mandir}/man8/ceph-mds.8*
 %dir %{_localstatedir}/lib/ceph/mds
 
@@ -1071,6 +1069,7 @@ fi
 %{_bindir}/ceph-objectstore-tool
 %{_bindir}/ceph-osd
 %{_sbindir}/ceph-disk
+%{_sbindir}/ceph-disk-udev
 %{_libexecdir}/ceph/ceph-osd-prestart.sh
 %dir %{_libdir}/rados-classes
 %{_libdir}/rados-classes/libcls_rbd.so*
@@ -1125,6 +1124,8 @@ fi
 %{_includedir}/rados/rados_types.hpp
 %{_includedir}/rados/memory.h
 %{_libdir}/librados.so
+%{_bindir}/librados-config
+%{_mandir}/man8/librados-config.8*
 
 #################################################################################
 %files -n python-rados
@@ -1228,9 +1229,12 @@ ln -sf %{_libdir}/librbd.so.1 /usr/lib64/qemu/librbd.so.1
 %{_bindir}/ceph_test_*
 %{_bindir}/ceph_tpbench
 %{_bindir}/ceph_xattr_bench
+%{_bindir}/ceph-coverage
 %{_bindir}/ceph-monstore-tool
 %{_bindir}/ceph-osdomap-tool
 %{_bindir}/ceph-kvstore-tool
+%{_bindir}/ceph-debugpack
+%{_mandir}/man8/ceph-debugpack.8*
 %dir %{_libdir}/ceph
 %{_libdir}/ceph/ceph-monstore-update-crush.sh
 
