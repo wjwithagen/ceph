@@ -822,16 +822,10 @@ rm -rf $RPM_BUILD_ROOT
 %{_bindir}/ceph-client-debug
 %{_bindir}/cephfs
 %if 0%{?_with_systemd}
-%{_unitdir}/ceph-mds@.service
-%{_unitdir}/ceph-mon@.service
 %{_unitdir}/ceph-create-keys@.service
-%{_unitdir}/ceph-osd@.service
-%{_unitdir}/ceph-radosgw@.service
-%{_unitdir}/ceph.target
 %else
 %{_initrddir}/ceph
 %endif
-%{_unitdir}/ceph-disk@.service
 %{_sbindir}/ceph-create-keys
 %{_sbindir}/rcceph
 %if 0%{?rhel} >= 7 || 0%{?fedora} || 0%{?suse_version}
@@ -913,6 +907,7 @@ rm -rf $RPM_BUILD_ROOT
 %{_bindir}/ceph-brag
 %if 0%{?_with_systemd}
 %{_tmpfilesdir}/ceph-common.conf
+%{_unitdir}/ceph.target
 %endif
 %{_mandir}/man8/ceph-authtool.8*
 %{_mandir}/man8/ceph-conf.8*
@@ -977,6 +972,11 @@ fi
 %{_bindir}/cephfs-table-tool
 %{_bindir}/cephfs-data-scan
 %{_mandir}/man8/ceph-mds.8*
+%if 0%{?_with_systemd}
+%{_unitdir}/ceph-mds@.service
+%else
+%{_initrddir}/ceph
+%endif
 %dir %{_localstatedir}/lib/ceph/mds
 
 %files mon
@@ -986,6 +986,11 @@ fi
 %{_mandir}/man8/ceph-rest-api.8*
 %dir %{_localstatedir}/lib/ceph/mon
 %{python_sitelib}/ceph_rest_api.py*
+%if 0%{?_with_systemd}
+%{_unitdir}/ceph-mon@.service
+%else
+%{_initrddir}/ceph
+%endif
 
 #################################################################################
 %files fuse
@@ -1015,6 +1020,7 @@ fi
 %config %{_sysconfdir}/bash_completion.d/radosgw-admin
 %dir %{_localstatedir}/lib/ceph/radosgw
 %if 0%{?_with_systemd}
+%{_unitdir}/ceph-radosgw@.service
 %else
 %{_initrddir}/ceph-radosgw
 %{_sbindir}/rcceph-radosgw
@@ -1088,6 +1094,12 @@ fi
 %{_mandir}/man8/ceph-clsinfo.8*
 %{_mandir}/man8/ceph-disk.8*
 %{_mandir}/man8/ceph-osd.8*
+%if 0%{?_with_systemd}
+%{_unitdir}/ceph-osd@.service
+%{_unitdir}/ceph-disk@.service
+%else
+%{_initrddir}/ceph
+%endif
 %dir %{_localstatedir}/lib/ceph/osd
 
 #################################################################################
