@@ -11300,8 +11300,8 @@ void ReplicatedPG::hit_set_persist()
 
   ctx->new_obs = obc->obs;
 
-  obc->ssc->snapset.head_exists = true;
-  ctx->new_snapset = obc->ssc->snapset;
+  ctx->force_write_snapset();
+  ctx->set_new_snapset_head_exists(true);
 
   ctx->delta_stats.num_objects++;
   ctx->delta_stats.num_objects_hit_set_archive++;
@@ -11309,7 +11309,7 @@ void ReplicatedPG::hit_set_persist()
   ctx->delta_stats.num_bytes_hit_set_archive += bl.length();
 
   bufferlist bss;
-  ::encode(ctx->new_snapset, bss);
+  ::encode(*ctx->get_cur_snapset(), bss);
   bufferlist boi(sizeof(ctx->new_obs.oi));
   ::encode(ctx->new_obs.oi, boi);
 
