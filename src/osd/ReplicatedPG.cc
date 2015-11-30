@@ -5830,7 +5830,6 @@ int ReplicatedPG::_verify_no_head_clones(const hobject_t& soid,
 
 inline int ReplicatedPG::_delete_oid(OpContext *ctx, bool no_whiteout)
 {
-  SnapSet& snapset = ctx->new_snapset;
   ObjectState& obs = ctx->new_obs;
   object_info_t& oi = obs.oi;
   const hobject_t& soid = oi.soid;
@@ -5884,8 +5883,12 @@ inline int ReplicatedPG::_delete_oid(OpContext *ctx, bool no_whiteout)
     dout(20) << __func__ << " setting whiteout on " << soid << dendl;
     oi.set_flag(object_info_t::FLAG_WHITEOUT);
     ctx->delta_stats.num_whiteouts++;
-    t->touch(soid);
     osd->logger->inc(l_osd_tier_whiteout);
+
+    // ensure snapset is rewritten after the obj removal above
+    ctx->force_write_snapset();
+
+    t->touch(soid);  // and recreate the object
     return 0;
   }
 
@@ -5896,8 +5899,9 @@ inline int ReplicatedPG::_delete_oid(OpContext *ctx, bool no_whiteout)
     dout(20) << __func__ << " deleting whiteout on " << soid << dendl;
     ctx->delta_stats.num_whiteouts--;
   }
-  if (soid.is_head())
-    snapset.head_exists = false;
+  if (soid.is_head()) {
+    ctx->set_new_snapset_head_exists(false);
+  }
   obs.exists = false;
   return 0;
 }
