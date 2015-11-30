@@ -6042,7 +6042,6 @@ int ReplicatedPG::_rollback_to(OpContext *ctx, ceph_osd_op& op)
 	obs.oi.set_omap_digest(rollback_to->obs.oi.omap_digest);
       else
 	obs.oi.clear_omap_digest();
-      snapset.head_exists = true;
     }
   }
   return ret;
