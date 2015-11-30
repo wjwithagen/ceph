@@ -5899,6 +5899,7 @@ inline int ReplicatedPG::_delete_oid(OpContext *ctx, bool no_whiteout)
     dout(20) << __func__ << " deleting whiteout on " << soid << dendl;
     ctx->delta_stats.num_whiteouts--;
   }
+  ctx->force_write_snapset();
   if (soid.is_head()) {
     ctx->set_new_snapset_head_exists(false);
   }
