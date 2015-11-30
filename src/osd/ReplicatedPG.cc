@@ -4897,7 +4897,7 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
       }
       break;
 
-    case CEPH_OSD_OP_ROLLBACK :
+    case CEPH_OSD_OP_ROLLBACK:
       ++ctx->num_write;
       tracepoint(osd, do_osd_op_pre_rollback, soid.oid.name.c_str(), soid.snap.val);
       result = _rollback_to(ctx, op);
@@ -5908,7 +5908,6 @@ inline int ReplicatedPG::_delete_oid(OpContext *ctx, bool no_whiteout)
 
 int ReplicatedPG::_rollback_to(OpContext *ctx, ceph_osd_op& op)
 {
-  SnapSet& snapset = ctx->new_snapset;
   ObjectState& obs = ctx->new_obs;
   object_info_t& oi = obs.oi;
   const hobject_t& soid = oi.soid;
@@ -6008,14 +6007,17 @@ int ReplicatedPG::_rollback_to(OpContext *ctx, ceph_osd_op& op)
       }
       ctx->mod_desc.create();
       t->clone(rollback_to_sobject, soid);
-      snapset.head_exists = true;
+      ctx->force_write_snapset();
+      ctx->set_new_snapset_head_exists(true);
 
-      map<snapid_t, interval_set<uint64_t> >::iterator iter =
-	snapset.clone_overlap.lower_bound(snapid);
+      // note we look at clone_overlap only
+      const SnapSet *cur_snapset = ctx->get_cur_snapset();
+      map<snapid_t, interval_set<uint64_t> >::const_iterator iter =
+	cur_snapset->clone_overlap.lower_bound(snapid);
       interval_set<uint64_t> overlaps = iter->second;
-      assert(iter != snapset.clone_overlap.end());
+      assert(iter != cur_snapset->clone_overlap.end());
       for ( ;
-	    iter != snapset.clone_overlap.end();
+	    iter != cur_snapset->clone_overlap.end();
 	    ++iter)
 	overlaps.intersection_of(iter->second);
 
