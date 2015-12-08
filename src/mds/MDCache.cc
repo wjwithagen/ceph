@@ -576,10 +576,15 @@ struct C_MDS_RetryOpenRoot : public MDSInternalContext {
   MDCache *cache;
   C_MDS_RetryOpenRoot(MDCache *c) : MDSInternalContext(c->mds), cache(c) {}
   void finish(int r) {
-    if (r < 0)
-      cache->mds->suicide();
-    else
+    if (r < 0) {
+      // If we can't open root, something disastrous has happened: mark
+      // this rank damaged for operator intervention.  Note that
+      // it is not okay to call suicide() here because we are in
+      // a Finisher callback.
+      cache->mds->damaged();
+    } else {
       cache->open_root();
+    }
   }
 };
 
