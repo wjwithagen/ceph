@@ -19,6 +19,11 @@ namespace libradosstriper
   class RadosStriper;
 }
 
+namespace ceph
+{
+  class Formatter;
+}
+
 namespace librados
 {
   using ceph::bufferlist;
@@ -1121,6 +1126,20 @@ namespace librados
     IoCtxImpl *io_ctx_impl;
   };
 
+  struct PlacementGroupImpl;
+  class CEPH_RADOS_API PlacementGroup {
+    std::unique_ptr<PlacementGroupImpl> impl;
+    friend class Rados;
+    friend std::ostream& operator<<(std::ostream&, const PlacementGroup&);
+  public:
+    PlacementGroup();
+    PlacementGroup(const PlacementGroup&);
+    ~PlacementGroup();
+    bool parse(const char*);
+  };
+
+  CEPH_RADOS_API std::ostream& operator<<(std::ostream&, const PlacementGroup&);
+
   class CEPH_RADOS_API Rados
   {
   public:
@@ -1187,6 +1206,15 @@ namespace librados
 		       std::map<std::string, stats_map>& stats);
     int cluster_stat(cluster_stat_t& result);
     int cluster_fsid(std::string *fsid);
+
+    /**
+     * List inconsistent placement groups in the given pool
+     *
+     * @param pool_id the pool id
+     * @param pgs [out] the inconsistent PGs
+     */
+    int get_inconsistent_pgs(int64_t pool_id,
+                             std::vector<PlacementGroup>* pgs);
 
     /// get/wait for the most recent osdmap
     int wait_for_latest_osdmap();

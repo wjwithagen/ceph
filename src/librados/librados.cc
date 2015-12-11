@@ -17,6 +17,7 @@
 #include "common/config.h"
 #include "common/errno.h"
 #include "common/ceph_argparse.h"
+#include "common/ceph_json.h"
 #include "common/common_init.h"
 #include "common/TracepointProvider.h"
 #include "common/hobject.h"
@@ -2258,6 +2259,88 @@ int librados::Rados::cluster_stat(cluster_stat_t& result)
 int librados::Rados::cluster_fsid(string *fsid)
 {
   return client->get_fsid(fsid);
+}
+
+namespace librados {
+  struct PlacementGroupImpl {
+    pg_t pgid;
+  };
+
+  PlacementGroup::PlacementGroup()
+    : impl{new PlacementGroupImpl}
+  {}
+
+  PlacementGroup::PlacementGroup(const PlacementGroup& pg)
+    : impl{new PlacementGroupImpl}
+  {
+    impl->pgid = pg.impl->pgid;
+  }
+
+  PlacementGroup::~PlacementGroup()
+  {}
+
+  bool PlacementGroup::parse(const char* s)
+  {
+    return impl->pgid.parse(s);
+  }
+}
+
+std::ostream& librados::operator<<(std::ostream& out,
+				   const librados::PlacementGroup& pg)
+{
+  return out << pg.impl->pgid;
+}
+
+static int decode_json(JSONObj *obj, pg_t& pg)
+{
+  string pg_str;
+  JSONDecoder::decode_json("pgid", pg_str, obj);
+  if (pg.parse(pg_str.c_str())) {
+    return 0;
+  } else {
+    return -EINVAL;
+  }
+}
+
+int librados::Rados::get_inconsistent_pgs(int64_t pool_id,
+					  std::vector<PlacementGroup>* pgs)
+{
+  const string cmd = "{\"prefix\": \"pg ls\","
+    "\"pool\": " + std::to_string(pool_id) + ","
+    "\"states\": [\"inconsistent\"],"
+    "\"format\": \"json\"}";
+  const char *cmds[1] = {cmd.c_str()};
+  char *buf, *status;
+  size_t buf_len, status_len;
+  int ret = rados_mon_command((rados_t)client, cmds, 1, "", 0,
+			      &buf, &buf_len, &status, &status_len);
+  if (ret) {
+    return ret;
+  }
+  if (!buf_len) {
+    // no pg returned
+    return ret;
+  }
+  JSONParser parser;
+  if (!parser.parse(buf, buf_len)) {
+    return -EINVAL;
+  }
+  if (!parser.is_array()) {
+    return -EINVAL;
+  }
+  vector<string> v = parser.get_array_elements();
+  for (auto i : v) {
+    JSONParser pg_json;
+    if (!pg_json.parse(i.c_str(), i.length())) {
+      return -EINVAL;
+    }
+    PlacementGroup pg;
+    if (decode_json(&pg_json, pg.impl->pgid)) {
+      return -EINVAL;
+    }
+    pgs->emplace_back(pg);
+  }
+  return 0;
 }
 
 int librados::Rados::wait_for_latest_osdmap()
