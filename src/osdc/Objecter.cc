@@ -5005,3 +5005,24 @@ void Objecter::_enumerate_reply(
   return;
 }
 
+void ::ObjectOperation::scrub_ls_arg_t::encode(bufferlist& bl) const
+{
+  ENCODE_START(1 ,1, bl);
+  ::encode(interval, bl);
+  ::encode(start_after.name, bl);
+  ::encode(start_after.nspace, bl);
+  ::encode(start_after.snap, bl);
+  ::encode(max_return, bl);
+  ENCODE_FINISH(bl);
+}
+
+void ::ObjectOperation::scrub_ls_arg_t::decode(bufferlist::iterator& bp)
+{
+  DECODE_START(1, bp);
+  ::decode(interval, bp);
+  ::decode(start_after.name, bp);
+  ::decode(start_after.nspace, bp);
+  ::decode(start_after.snap, bp);
+  ::decode(max_return, bp);
+  DECODE_FINISH(bp);
+}

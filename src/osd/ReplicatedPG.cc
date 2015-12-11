@@ -1293,6 +1293,9 @@ void ReplicatedPG::do_pg_op(OpRequestRef op)
       }
       break;
 
+    case CEPH_OSD_OP_SCRUBLS:
+      result = do_scrub_ls(m, &osd_op);
+      break;
 
     default:
       result = -EINVAL;
@@ -1309,6 +1312,51 @@ void ReplicatedPG::do_pg_op(OpRequestRef op)
   reply->set_reply_versions(info.last_update, info.last_user_version);
   osd->send_message_osd_client(reply, m->get_connection());
   delete filter;
+}
+
+int ReplicatedPG::do_scrub_ls(MOSDOp *m, OSDOp *osd_op)
+{
+  if (!pool.info.supports_omap()) {
+    return -EINVAL;
+  }
+  if (m->get_pg() != info.pgid.pgid) {
+    dout(10) << " scrubls pg=" << m->get_pg() << " != " << info.pgid << dendl;
+    return -EINVAL; // hmm?
+  }
+  auto bp = osd_op->indata.begin();
+  ObjectOperation::scrub_ls_arg_t arg;
+  try {
+    arg.decode(bp);
+  } catch (buffer::error&) {
+    return -EINVAL;
+  }
+  ::encode(info.history.same_interval_since, osd_op->outdata);
+  if (arg.interval != 0 && arg.interval != info.history.same_interval_since) {
+    return -EAGAIN;
+  }
+  ghobject_t ghoid{Scrub::make_scrub_object(get_pgid().pgid)};
+  auto iter = osd->store->get_omap_iterator(coll.get_temp(), ghoid);
+  if (!iter) {
+    return -ENOENT;
+  }
+  string start;
+  if (arg.start_after.name.empty()) {
+    start = Scrub::first_object_key(get_pgid().pool());
+  } else {
+    start = Scrub::to_object_key(get_pgid().pool(),
+				 arg.start_after.name,
+				 arg.start_after.nspace,
+				 arg.start_after.snap);
+  }
+  iter->upper_bound(start);
+  const string end = Scrub::last_object_key(get_pgid().pool());
+  vector<bufferlist> vals;
+  for (;arg.max_return && iter->valid() && iter->key() < end;
+       iter->next(false), arg.max_return--) {
+    vals.push_back(iter->value());
+  }
+  ::encode(vals, osd_op->outdata);
+  return 0;
 }
 
 void ReplicatedPG::calc_trim_to()
