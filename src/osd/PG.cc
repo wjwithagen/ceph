@@ -17,7 +17,7 @@
 #include "common/config.h"
 #include "OSD.h"
 #include "OpRequest.h"
-
+#include "ScrubResult.h"
 #include "common/Timer.h"
 
 #include "messages/MOSDOp.h"
@@ -933,6 +933,21 @@ void PG::clear_primary_state()
 
   agent_clear();
 }
+
+PG::Scrubber::Scrubber()
+ : reserved(false), reserve_failed(false),
+   epoch_start(0),
+   active(false), queue_snap_trim(false),
+   waiting_on(0), shallow_errors(0), deep_errors(0), fixed(0),
+   must_scrub(false), must_deep_scrub(false), must_repair(false),
+   auto_repair(false),
+   num_digest_updates_pending(0),
+   state(INACTIVE),
+   deep(false),
+   seed(0)
+{}
+
+PG::Scrubber::~Scrubber() {}
 
 /**
  * find_best_info
@@ -3994,6 +4009,16 @@ void PG::chunky_scrub(ThreadPool::TPHandle &handle)
 	  scrubber.reserved_peers.clear();
 	}
 
+	{
+	  hobject_t oid = Scrub::make_scrub_object(info.pgid.pgid);
+	  coll_t temp_coll = coll.get_temp();
+	  scrubber.store.reset(new Scrub::Store{temp_coll, oid, osd->store});
+	  ObjectStore::Transaction t;
+	  t.touch(temp_coll, ghobject_t{oid});
+	  osd->store->apply_transaction(osr.get(), t);
+	  get_pgbackend()->add_temp_obj(oid);
+	}
+
         scrubber.start = hobject_t();
         scrubber.state = PG::Scrubber::NEW_CHUNK;
 
@@ -4270,9 +4295,15 @@ void PG::scrub_compare_maps()
       missing_digest,
       scrubber.shallow_errors,
       scrubber.deep_errors,
+      scrubber.store.get(),
       info.pgid, acting,
       ss);
     dout(2) << ss.str() << dendl;
+    if (!scrubber.store->empty()) {
+      dout(10) << __func__ << ": updating scrub object" << dendl;
+      auto txn = scrubber.store->get_transaction();
+      osd->store->queue_transaction_and_cleanup(osr.get(), txn);
+    }
 
     if (!ss.str().empty()) {
       osd->clog->error(ss);
@@ -4303,6 +4334,11 @@ void PG::scrub_compare_maps()
 
   // ok, do the pg-type specific scrubbing
   _scrub(authmap, missing_digest);
+  if (!scrubber.store->empty()) {
+    dout(10) << __func__ << ": updating scrub object" << dendl;
+    auto txn = scrubber.store->get_transaction();
+    osd->store->queue_transaction_and_cleanup(osr.get(), txn);
+  }
 }
 
 bool PG::scrub_process_inconsistent()

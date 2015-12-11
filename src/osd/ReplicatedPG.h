@@ -59,6 +59,10 @@ void put_with_id(ReplicatedPG *pg, uint64_t id);
   typedef boost::intrusive_ptr<ReplicatedPG> ReplicatedPGRef;
 #endif
 
+namespace Scrub {
+  class SnapError;
+}
+
 class ReplicatedPG : public PG, public PGBackend::Listener {
   friend class OSD;
   friend class Watch;
@@ -1484,6 +1488,7 @@ public:
 
   void do_osd_op_effects(OpContext *ctx, const ConnectionRef& conn);
 private:
+  int do_scrub_ls(MOSDOp *op, OSDOp *osd_op);
   hobject_t earliest_backfill() const;
   bool check_src_targ(const hobject_t& soid, const hobject_t& toid) const;
 
@@ -1510,7 +1515,8 @@ private:
     const char *mode,
     bool allow_incomplete_clones,
     boost::optional<snapid_t> target,
-    vector<snapid_t>::reverse_iterator *curclone);
+    vector<snapid_t>::reverse_iterator *curclone,
+    Scrub::SnapError &snap_error);
 
 public:
   coll_t get_coll() {

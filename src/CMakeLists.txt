@@ -709,6 +709,7 @@ set(osd_srcs
   osd/OpRequest.cc
   common/TrackedOp.cc
   osd/SnapMapper.cc
+  osd/ScrubResult.cc
   osd/osd_types.cc
   osd/ECUtil.cc
   objclass/class_api.cc

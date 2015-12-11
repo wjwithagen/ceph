@@ -72,6 +72,10 @@ class MOSDPGInfo;
 
 class PG;
 
+namespace Scrub {
+  class Store;
+}
+
 void intrusive_ptr_add_ref(PG *pg);
 void intrusive_ptr_release(PG *pg);
 
@@ -1065,19 +1069,8 @@ public:
 
   // -- scrub --
   struct Scrubber {
-    Scrubber() :
-      reserved(false), reserve_failed(false),
-      epoch_start(0),
-      active(false), queue_snap_trim(false),
-      waiting_on(0), shallow_errors(0), deep_errors(0), fixed(0),
-      must_scrub(false), must_deep_scrub(false), must_repair(false),
-      auto_repair(false),
-      num_digest_updates_pending(0),
-      state(INACTIVE),
-      deep(false),
-      seed(0)
-    {
-    }
+    Scrubber();
+    ~Scrubber();
 
     // metadata
     set<pg_shard_t> reserved_peers;
@@ -1129,6 +1122,8 @@ public:
       WAIT_DIGEST_UPDATES,
       FINISH,
     } state;
+
+    std::unique_ptr<Scrub::Store> store;
 
     // deep scrub
     bool deep;
@@ -1209,6 +1204,7 @@ public:
       num_digest_updates_pending = 0;
     }
 
+    void create_results(const hobject_t& obj);
   } scrubber;
 
   bool scrub_after_recovery;
