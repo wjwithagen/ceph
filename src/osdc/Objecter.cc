@@ -5005,6 +5005,105 @@ void Objecter::_enumerate_reply(
   return;
 }
 
+namespace {
+  using namespace librados;
+
+
+  struct C_ObjectOperation_scrub_ls : public Context {
+    bufferlist bl;
+    uint32_t *interval;
+    std::vector<inconsistent_obj_t> *objects;
+    int *rval;
+
+    C_ObjectOperation_scrub_ls(uint32_t *interval,
+			       std::vector<inconsistent_obj_t> *objects,
+			       int *rval)
+      : interval(interval), objects(objects), rval(rval) {}
+    void finish(int r) override {
+      if (r < 0 && r != -EAGAIN)
+	return;
+      try {
+	decode(r);
+      } catch (buffer::error&) {
+	if (rval)
+	  *rval = -EIO;
+      }
+    }
+  private:
+    static void decode(shard_info_t& shard, bufferlist::iterator& bl,
+		       uint64_t errors)
+    {
+      if (errors & inconsistent_obj_t::SHARD_MISSING) {
+	::decode(shard.missing, bl);
+	if (shard.missing)
+	  return;
+      }
+      if (errors & inconsistent_obj_t::SHARD_READ_ERR) {
+	::decode(shard.read_error, bl);
+      }
+      if (errors & inconsistent_obj_t::DATA_DIGEST_MISMATCH) {
+	::decode(shard.data_digest, bl);
+      }
+      if (errors & inconsistent_obj_t::OMAP_DIGEST_MISMATCH) {
+	::decode(shard.omap_digest, bl);
+      }
+      if (errors & inconsistent_obj_t::SIZE_MISMATCH) {
+	::decode(shard.size, bl);
+      }
+      if (errors & inconsistent_obj_t::ATTR_MISMATCH) {
+	::decode(shard.attrs, bl);
+      }
+    }
+
+    static void decode(librados::inconsistent_obj_t& inc,
+		       bufferlist::iterator& bl)
+    {
+      DECODE_START(1, bl);
+      hobject_t hoid;
+      ::decode(hoid, bl);
+      inc.object = librados::object_id_t{hoid.oid.name,
+					 hoid.nspace,
+					 hoid.get_key(),
+					 hoid.snap};
+      ::decode(inc.errors, bl);
+      uint32_t n;
+      ::decode(n, bl);
+      while (n--) {
+	int32_t osd;
+	::decode(osd, bl);  // the osd_id
+	shard_info_t shard;
+	decode(shard, bl, inc.errors);
+	inc.shard_by_osd.emplace(osd, shard);
+      }
+      DECODE_FINISH(bl);
+    }
+
+    static void decode(std::vector<inconsistent_t>& objects,
+		       bufferlist::iterator& bl)
+    {
+      vector<bufferlist> vals;
+      ::decode(vals, bl);
+      for (auto val : vals) {
+	auto ival = val.begin();
+	inconsistent_t inc;
+	decode(inc, ival);
+	objects.emplace_back(inc);
+      }
+    }
+
+    void decode(int r) {
+      auto p = bl.begin();
+      epoch_t epoch;
+      ::decode(epoch, p);
+      *interval = epoch;
+      if (r == -EAGAIN) {
+	return;
+      }
+      decode(*objects, p);
+    }
+  };
+}
+
 void ::ObjectOperation::scrub_ls_arg_t::encode(bufferlist& bl) const
 {
   ENCODE_START(1 ,1, bl);
@@ -5025,4 +5124,22 @@ void ::ObjectOperation::scrub_ls_arg_t::decode(bufferlist::iterator& bp)
   ::decode(start_after.snap, bp);
   ::decode(max_return, bp);
   DECODE_FINISH(bp);
+}
+
+void ::ObjectOperation::scrub_ls(const librados::object_id_t& start_after,
+				 uint64_t max_to_get,
+				 std::vector<librados::inconsistent_obj_t> *objects,
+				 uint32_t *interval,
+				 int *rval)
+{
+  OSDOp& osd_op = add_op(CEPH_OSD_OP_SCRUBLS);
+  flags |= CEPH_OSD_FLAG_PGOP;
+  assert(interval);
+  scrub_ls_arg_t arg = {*interval, start_after, max_to_get};
+  arg.encode(osd_op.indata);
+  unsigned p = ops.size() - 1;
+  auto *h = new C_ObjectOperation_scrub_ls{interval, objects, rval};
+  out_handler[p] = h;
+  out_bl[p] = &h->bl;
+  out_rval[p] = rval;
 }
