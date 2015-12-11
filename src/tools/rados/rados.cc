@@ -144,6 +144,7 @@ void usage(ostream& out)
 "\n"
 "SCRUB AND REPAIR:\n"
 "   list-inconsistent-pg <pool>      list inconsistent PGs in the given pool\n"
+"   list-inconsistent-obj <pgid>     list inconsistent objects in the given pg\n"
 "\n"
 "CACHE POOLS: (for testing/development only)\n"
 "   cache-flush <obj-name>           flush cache pool object (blocking)\n"
@@ -1228,6 +1229,124 @@ static int do_get_inconsistent_pg_cmd(const std::vector<const char*> &nargs,
   formatter.close_section();
   formatter.flush(cout);
   return 0;
+}
+
+static void dump_shard_info(const shard_info_t& shard,
+			    const inconsistent_obj_t& inc,
+			    Formatter &f)
+{
+  if (inc.has_shard_missing()) {
+    f.dump_bool("missing", shard.missing);
+    if (shard.missing) {
+      return;
+    }
+  }
+  if (inc.has_read_error()) {
+    f.dump_bool("read_error", shard.read_error);
+    if (shard.read_error) {
+      return;
+    }
+  }
+  if (inc.has_data_digest_mismatch()) {
+    f.dump_format("data_digest", "0x%08x", shard.data_digest);
+  }
+  if (inc.has_omap_digest_mismatch()) {
+    f.dump_format("omap_digest", "0x%08x", shard.omap_digest);
+  }
+  if (inc.has_size_mismatch()) {
+    f.dump_unsigned("size", shard.size);
+  }
+  if (inc.has_attr_mismatch()) {
+    f.open_object_section("attrs");
+    for (auto kv : shard.attrs) {
+      f.open_object_section("attr");
+      f.dump_string("name", kv.first);
+      bufferlist bl, b64;
+      bl.append(kv.second);
+      bl.encode_base64(b64);
+      string v(b64.c_str(), b64.length());
+      f.dump_string("value", v);
+      f.close_section();
+    }
+    f.close_section();
+  }
+}
+
+static void dump_inconsistent_obj(const inconsistent_obj_t& inc,
+				  Formatter &f)
+{
+  f.open_object_section("object");
+  f.dump_string("name", inc.object.name);
+  f.dump_string("nspace", inc.object.nspace);
+  f.dump_string("locator", inc.object.locator);
+  f.dump_unsigned("snap", inc.object.snap);
+  f.close_section();
+  f.dump_bool("missing", inc.has_shard_missing());
+  f.dump_bool("stat_err", inc.has_stat_error());
+  f.dump_bool("read_err", inc.has_read_error());
+  f.dump_bool("data_digest_mismatch", inc.has_data_digest_mismatch());
+  f.dump_bool("omap_digest_mismatch", inc.has_omap_digest_mismatch());
+  f.dump_bool("size_mismatch", inc.has_size_mismatch());
+  f.dump_bool("attr_mismatch", inc.has_attr_mismatch());
+  f.open_array_section("shards");
+  for (auto osd_shard : inc.shard_by_osd) {
+    f.open_object_section("shard");
+    f.dump_int("osd", osd_shard.first);
+    dump_shard_info(osd_shard.second, inc, f);
+    f.close_section();
+  }
+  f.close_section();
+  f.close_section();
+}
+
+static int do_get_inconsistent_obj_cmd(const std::vector<const char*> &nargs,
+				       Rados& rados,
+				       Formatter& formatter)
+{
+  if (nargs.size() < 2) {
+    usage_exit();
+  }
+  PlacementGroup pg;
+  int ret = 0;
+  ret = pg.parse(nargs[1]);
+  if (!ret) {
+    cerr << "bad pg: " << nargs[1] << std::endl;
+    return ret;
+  }
+
+  uint32_t interval = 0;
+  const unsigned max_object_num = 32;
+  for (librados::object_id_t start;;) {
+    std::vector<inconsistent_obj_t> objects;
+    auto completion = librados::Rados::aio_create_completion();
+    ret = rados.get_inconsistent_objects(pg, start, max_object_num,
+					 completion,
+					 &objects, &interval);
+    completion->wait_for_safe();
+    ret = completion->get_return_value();
+    completion->release();
+    if (ret == -EAGAIN) {
+      cerr << "interval#" << interval << " expired." << std::endl;
+      break;
+    }
+    if (start.name.empty()) {
+      formatter.open_array_section("inconsistents");
+    }
+    for (auto& object : objects) {
+      formatter.open_object_section("inconsistent");
+      dump_inconsistent_obj(object, formatter);
+    }
+    if (objects.size() < max_object_num) {
+      formatter.close_section();
+      break;
+    }
+    if (!objects.empty()) {
+      start = objects.back().object;
+    }
+    objects.clear();
+  }
+  formatter.flush(cout);
+  return ret;
 }
 
 /**********************************************
@@ -2838,6 +2957,11 @@ static int rados_tool_common(const std::map < std::string, std::string > &opts,
       formatter = new JSONFormatter(pretty_format);
     }
     ret = do_get_inconsistent_pg_cmd(nargs, rados, *formatter);
+  } else if (strcmp(nargs[0], "list-inconsistent-obj") == 0) {
+    if (!formatter) {
+      formatter = new JSONFormatter(pretty_format);
+    }
+    ret = do_get_inconsistent_obj_cmd(nargs, rados, *formatter);
   } else if (strcmp(nargs[0], "cache-flush") == 0) {
     if (!pool_name || nargs.size() < 2)
       usage_exit();
