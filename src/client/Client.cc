@@ -494,7 +494,19 @@ int Client::init()
   objecter->start();
 
   monclient->set_want_keys(CEPH_ENTITY_TYPE_MDS | CEPH_ENTITY_TYPE_OSD);
-  monclient->sub_want("mdsmap", 0, 0);
+
+  std::string want = "mdsmap";
+  const auto &want_ns = cct->_conf->client_mds_namespace;
+  if (want_ns != MDS_NAMESPACE_NONE) {
+    std::ostringstream oss;
+    oss << want << "." << want_ns;
+    want = oss.str();
+  }
+  ldout(cct, 10) << "Subscribing to map '" << want << "'" << dendl;
+
+  // FIXME: if there's no filesystem, I still need a way to start
+  // up a Client() instance to use mds_command.
+  monclient->sub_want(want, 0, 0);
   monclient->renew_subs();
 
   // logger
@@ -5193,6 +5205,9 @@ int Client::resolve_mds(
       }
     }
   } else if (mds_spec == "*") {
+    // TODO: extend mds_spec syntax to allow '*' for all MDSs, and
+    // <namespace>.* for all MDSs assigned to a particular namespace.
+#if 0
     // It is a wildcard: use all MDSs
     const std::map<mds_gid_t, MDSMap::mds_info_t> &mds_info = mdsmap->get_mds_info();
 
@@ -5205,6 +5220,7 @@ int Client::resolve_mds(
         i != mds_info.end(); ++i) {
       targets->push_back(i->first);
     }
+#endif
   } else {
     // It did not parse as an integer, it is not a wildcard, it must be a name
     const mds_gid_t mds_gid = mdsmap->find_mds_gid_by_name(mds_spec);
@@ -5580,7 +5596,8 @@ void Client::flush_cap_releases()
   for (map<mds_rank_t,MetaSession*>::iterator p = mds_sessions.begin();
        p != mds_sessions.end();
        ++p) {
-    if (p->second->release && mdsmap->is_clientreplay_or_active_or_stopping(p->first)) {
+    if (p->second->release && mdsmap->is_clientreplay_or_active_or_stopping(
+          p->first)) {
       if (cct->_conf->client_inject_release_failure) {
         ldout(cct, 20) << __func__ << " injecting failure to send cap release message" << dendl;
         p->second->release->put();

@@ -866,6 +866,7 @@ private:
   int _posix_acl_create(Inode *dir, mode_t *mode, bufferlist& xattrs_bl, int uid, int gid);
   int _posix_acl_chmod(Inode *in, mode_t mode, int uid, int gid);
   int _posix_acl_permission(Inode *in, uid_t uid, UserGroups& groups, unsigned want);
+
 public:
   int mount(const std::string &mount_root, bool require_mds=false);
   void unmount();
