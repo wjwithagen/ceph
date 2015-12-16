@@ -28,7 +28,10 @@ class RecoveryDriver {
     bool force_init;
 
   public:
-    virtual int init(librados::Rados &rados, const MDSMap *mdsmap) = 0;
+    virtual int init(
+        librados::Rados &rados,
+        const FSMap *fsmap,
+        mds_namespace_t ns) = 0;
 
     void set_force_corrupt(const bool val)
     {
@@ -112,7 +115,10 @@ class LocalFileDriver : public RecoveryDriver
     {}
 
     // Implement RecoveryDriver interface
-    int init(librados::Rados &rados, const MDSMap *mdsmap);
+    int init(
+        librados::Rados &rados,
+        const FSMap *fsmap,
+        mds_namespace_t ns);
 
     int inject_with_backtrace(
         const inode_backtrace_t &bt,
@@ -205,7 +211,10 @@ class MetadataDriver : public RecoveryDriver, public MetadataTool
   public:
 
     // Implement RecoveryDriver interface
-    int init(librados::Rados &rados, const MDSMap *mdsmap);
+    int init(
+        librados::Rados &rados,
+        const FSMap *fsmap,
+        mds_namespace_t ns);
 
     int inject_with_backtrace(
         const inode_backtrace_t &bt,
@@ -224,6 +233,7 @@ class DataScan : public MDSUtility, public MetadataTool
 {
   protected:
     RecoveryDriver *driver;
+    mds_namespace_t ns;
 
     // IoCtx for data pool (where we scrape file backtraces from)
     librados::IoCtx data_io;
@@ -249,7 +259,7 @@ class DataScan : public MDSUtility, public MetadataTool
      */
     int scan_frags();
 
-    // Accept pools which are not in the MDSMap
+    // Accept pools which are not in the FSMap
     bool force_pool;
     // Respond to decode errors by overwriting
     bool force_corrupt;
@@ -281,7 +291,7 @@ class DataScan : public MDSUtility, public MetadataTool
     int main(const std::vector<const char *> &args);
 
     DataScan()
-      : driver(NULL), data_pool_id(-1), n(0), m(1),
+      : driver(NULL), ns(MDS_NAMESPACE_NONE), data_pool_id(-1), n(0), m(1),
         force_pool(false), force_corrupt(false),
         force_init(false)
     {

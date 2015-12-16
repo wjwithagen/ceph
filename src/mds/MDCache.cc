@@ -327,18 +327,18 @@ void MDCache::remove_inode(CInode *o)
   delete o; 
 }
 
-ceph_file_layout MDCache::gen_default_file_layout(const MDSMap &mdsmap)
+ceph_file_layout MDCache::gen_default_file_layout(int64_t data_pool)
 {
   ceph_file_layout result = g_default_file_layout;
-  result.fl_pg_pool = mdsmap.get_first_data_pool();
+  result.fl_pg_pool = data_pool;
 
   return result;
 }
 
-ceph_file_layout MDCache::gen_default_log_layout(const MDSMap &mdsmap)
+ceph_file_layout MDCache::gen_default_log_layout(int64_t metadata_pool)
 {
   ceph_file_layout result = g_default_file_layout;
-  result.fl_pg_pool = mdsmap.get_metadata_pool();
+  result.fl_pg_pool = metadata_pool;
   if (g_conf->mds_log_segment_size > 0) {
     result.fl_object_size = g_conf->mds_log_segment_size;
     result.fl_stripe_unit = g_conf->mds_log_segment_size;
@@ -349,8 +349,10 @@ ceph_file_layout MDCache::gen_default_log_layout(const MDSMap &mdsmap)
 
 void MDCache::init_layouts()
 {
-  default_file_layout = gen_default_file_layout(*(mds->mdsmap));
-  default_log_layout = gen_default_log_layout(*(mds->mdsmap));
+  default_file_layout = gen_default_file_layout(
+      mds->mdsmap->get_first_data_pool());
+  default_log_layout = gen_default_log_layout(
+      mds->mdsmap->get_metadata_pool());
 
 }
 
