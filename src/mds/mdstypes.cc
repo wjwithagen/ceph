@@ -6,6 +6,8 @@
 
 const mds_gid_t MDS_GID_NONE = mds_gid_t(0);
 const mds_rank_t MDS_RANK_NONE = mds_rank_t(-1);
+const mds_namespace_t MDS_NAMESPACE_NONE = mds_namespace_t(-1);
+const mds_namespace_t MDS_NAMESPACE_ANONYMOUS = mds_namespace_t(0);
 
 void dump(const ceph_file_layout& l, Formatter *f)
 {
@@ -1121,5 +1123,11 @@ void MDSCacheObject::dump_states(Formatter *f) const
 void ceph_file_layout_wrapper::dump(Formatter *f) const
 {
   ::dump(static_cast<const ceph_file_layout&>(*this), f);
+}
+
+ostream& operator<<(ostream &out, const mds_role_t &role)
+{
+  out << role.ns << ":" << role.rank;
+  return out;
 }
 
