@@ -33,6 +33,42 @@ namespace Scrub {
     uint64_t errors = 0;
   };
 
+  struct SnapError {
+    uint64_t errors = 0;
+    // the head/snapset/dangling object related to this error
+    hobject_t oid;
+    SnapSet *snapset = nullptr;
+    vector<snapid_t> missing;
+    SnapError() = default;
+    SnapError(const hobject_t& oid);
+    // a clone without head is spotted, but i am expecting a clone belonging to
+    // current snapset, or a new snapset/head.
+    static SnapError headless_clone(const hobject_t& oid);
+    void set_snapset(SnapSet *ss);
+    // soid claims that it is a head or a snapdir, but its SS_ATTR
+    // attr is missing.
+    //
+    // please note that missing/corrupted OI_ATTR attr is considered as an
+    // error, but `PGBackend::be_compare_scrub_objects()` already filters out
+    // objects with this error.
+    void set_ss_attr_missing();
+    void set_ss_attr_corrupted();
+    // snapset with missing clone
+    void add_clone_missing(snapid_t);
+    // the snapset claims that it has clones but its `seq` is 0
+    void set_snapset_mismatch();
+    // two possiblities
+    // 1. soid claims that it is a head object, but snapset puts otherwise
+    // 2. soid claims that it is a snapdir, but snapset indicates that it has a
+    //    head
+    void set_head_mismatch();
+    void add_headless_clone(const hobject_t& clone);
+    // the snap is either missing in ss.clone_size or ss.clone_overlap
+    // or its size is not consistent per OI_ATTR and SS_ATTR
+    void add_size_mismatch(snapid_t);
+    void encode(bufferlist& bl) const;
+  };
+
   /**
    * errors found when 
    */
@@ -102,6 +138,23 @@ namespace Scrub {
   inline string last_object_key(int64_t pool)
   {
     return "SCRUB_OBJ_" + std::to_string(pool) + "/";
+  }
+
+  inline string first_snap_key(int64_t pool)
+  {
+    return "SCRUB_SS_" + std::to_string(pool) + "-";
+  }
+
+  inline string to_snap_key(int64_t pool,
+			    const std::string& name,
+			    const std::string& nspace)
+  {
+    return "SCRUB_SS_" + std::to_string(pool) + "." + name + nspace;
+  }
+
+  inline string last_snap_key(int64_t pool)
+  {
+    return "SCRUB_SS_" + std::to_string(pool) + "/";
   }
 }
 

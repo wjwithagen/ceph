@@ -55,6 +55,67 @@ void ShardError::set_attr_unexpected()
   errors |= inc_obj_t::ATTR_MISMATCH;
 }
 
+SnapError::SnapError(const hobject_t& oid)
+  : oid(oid)
+{}
+
+using inc_snapset_t = librados::inconsistent_snapset_t;
+
+SnapError SnapError::headless_clone(const hobject_t& clone)
+{
+  SnapError e{clone};
+  e.errors |= inc_snapset_t::HEADLESS_CLONE;
+  return e;
+}
+
+void SnapError::set_snapset(SnapSet *ss)
+{
+  snapset = ss;
+}
+
+void SnapError::set_ss_attr_missing()
+{
+  errors |= inc_snapset_t::ATTR_MISSING;
+}
+
+void SnapError::set_ss_attr_corrupted()
+{
+  errors |= inc_snapset_t::ATTR_MISSING;
+}
+
+void SnapError::add_clone_missing(snapid_t snap)
+{
+  errors |= inc_snapset_t::CLONE_MISSING;
+  missing.push_back(snap);
+}
+
+void SnapError::set_snapset_mismatch()
+{
+  errors |= inc_snapset_t::SNAP_MISMATCH;
+}
+
+void SnapError::set_head_mismatch()
+{
+  errors |= inc_snapset_t::HEAD_MISMATCH;
+}
+
+void SnapError::add_size_mismatch(snapid_t)
+{
+  errors |= inc_snapset_t::SIZE_MISMATCH;
+}
+
+void SnapError::encode(bufferlist& bl) const
+{
+  ENCODE_START(1, 1, bl);
+  ::encode(oid, bl);
+  ::encode(errors, bl);
+  if (errors & inc_snapset_t::CLONE_MISSING) {
+    ::encode(snapset->clones, bl);
+    ::encode(missing, bl);
+  }
+  ENCODE_FINISH(bl);
+}
+
 ObjectError::ObjectError(const hobject_t& oid)
   : oid(oid)
 {}
@@ -144,6 +205,19 @@ Store::add_object_error(const ObjectError& e)
   map<string, bufferlist> keys;
   keys[key] = bl;
   OSDriver::OSTransaction t = driver.get_transaction(_transaction());
+  backend.set_keys(keys, &t);
+}
+
+void
+Store::add_snap_error(const SnapError& e)
+{
+  OSDriver::OSTransaction t = driver.get_transaction(_transaction());
+  map<string, bufferlist> keys;
+  bufferlist bl;
+  e.encode(bl);
+  const string key = to_snap_key(e.oid.pool, e.oid.oid.name,
+				 e.oid.nspace);
+  keys[key] = bl;
   backend.set_keys(keys, &t);
 }
 
