@@ -100,6 +100,37 @@ struct inconsistent_obj_t {
   }
 };
 
+struct inconsistent_snapset_t {
+  enum {
+    ATTR_MISSING   = 1 << 0,
+    CLONE_MISSING  = 1 << 1,
+    SNAP_MISMATCH  = 1 << 2,
+    HEAD_MISMATCH  = 1 << 3,
+    HEADLESS_CLONE = 1 << 4,
+    SIZE_MISMATCH  = 1 << 5,
+  };
+  object_id_t object;
+  uint64_t errors = 0;
+  std::vector<snap_t> clones;
+  std::vector<snap_t> missing;
+
+  bool has_attr_missing() const {
+    return errors & ATTR_MISSING;
+  }
+  bool has_clone_missing() const {
+    return errors & CLONE_MISSING;
+  }
+  bool has_snapset_mismatch() const {
+    return errors & SNAP_MISMATCH;
+  }
+  bool is_headless_clone() const {
+    return errors & HEADLESS_CLONE;
+  }
+  bool has_size_mismatch() const {
+    return errors & SIZE_MISMATCH;
+  }
+};
+
 /**
  * @var all_nspaces
  * Pass as nspace argument to IoCtx::set_namespace()
