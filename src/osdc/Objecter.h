@@ -231,6 +231,7 @@ struct ObjectOperation {
 
   struct scrub_ls_arg_t {
     uint32_t interval;
+    uint32_t get_snapsets;
     librados::object_id_t start_after;
     uint64_t max_return;
     void encode(bufferlist& bl) const;

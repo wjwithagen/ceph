@@ -1341,12 +1341,18 @@ int ReplicatedPG::do_scrub_ls(MOSDOp *m, OSDOp *osd_op)
   }
   string start;
   if (arg.start_after.name.empty()) {
-    start = Scrub::first_object_key(get_pgid().pool());
+    start = (arg.get_snapsets ?
+	     Scrub::first_snap_key(get_pgid().pool()) :
+	     Scrub::first_object_key(get_pgid().pool()));
   } else {
-    start = Scrub::to_object_key(get_pgid().pool(),
-				 arg.start_after.name,
-				 arg.start_after.nspace,
-				 arg.start_after.snap);
+    start = (arg.get_snapsets ?
+	     Scrub::to_snap_key(get_pgid().pool(),
+				arg.start_after.name,
+				arg.start_after.nspace) :
+	     Scrub::to_object_key(get_pgid().pool(),
+				  arg.start_after.name,
+				  arg.start_after.nspace,
+				  arg.start_after.snap));
   }
   iter->upper_bound(start);
   const string end = Scrub::last_object_key(get_pgid().pool());
