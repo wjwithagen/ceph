@@ -300,7 +300,11 @@ COMMAND("mon metadata name=id,type=CephString",
 COMMAND("mds stat", "show MDS status", "mds", "r", "cli,rest")
 COMMAND("mds dump " 
 	"name=epoch,type=CephInt,req=false,range=0", \
-	"dump info, optionally from epoch", "mds", "r", "cli,rest")
+	"dump legacy MDS cluster info, optionally from epoch",
+        "mds", "r", "cli,rest")
+COMMAND("fs dump "
+	"name=epoch,type=CephInt,req=false,range=0", \
+	"dump all CephFS status, optionally from epoch", "mds", "r", "cli,rest")
 COMMAND("mds getmap " \
 	"name=epoch,type=CephInt,req=false,range=0", \
 	"get MDS map, optionally from epoch", "mds", "r", "cli,rest")
@@ -337,12 +341,12 @@ COMMAND("mds set_state " \
 	"set mds state of <gid> to <numeric-state>", "mds", "rw", "cli,rest")
 COMMAND("mds fail name=who,type=CephString", \
 	"force mds to status failed", "mds", "rw", "cli,rest")
-COMMAND("mds repaired name=rank,type=CephInt", \
+COMMAND("mds repaired name=rank,type=CephString", \
 	"mark a damaged MDS rank as no longer damaged", "mds", "rw", "cli,rest")
 COMMAND("mds rm " \
 	"name=gid,type=CephInt,range=0", \
 	"remove nonactive mds", "mds", "rw", "cli,rest")
-COMMAND("mds rmfailed name=who,type=CephInt,range=0", "remove failed mds", \
+COMMAND("mds rmfailed name=who,type=CephString", "remove failed mds", \
 	"mds", "rw", "cli,rest")
 COMMAND("mds cluster_down", "take MDS cluster down", "mds", "rw", "cli,rest")
 COMMAND("mds cluster_up", "bring MDS cluster up", "mds", "rw", "cli,rest")
