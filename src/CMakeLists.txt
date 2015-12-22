@@ -1150,6 +1150,7 @@ add_custom_target(vstart DEPENDS
 add_custom_target(cephfs_testing DEPENDS
     vstart
     rados
+    cls_cephfs
     ceph-fuse
     ceph-dencoder
     cephfs-journal-tool
