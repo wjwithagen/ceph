@@ -3655,6 +3655,8 @@ extern "C" int rados_object_list(rados_ioctx_t io,
     const rados_object_list_cursor start,
     const rados_object_list_cursor finish,
     const size_t result_item_count,
+    const char *filter_buf,
+    const size_t filter_buf_len,
     rados_object_list_item *result_items,
     rados_object_list_cursor *next)
 {
@@ -3668,6 +3670,11 @@ extern "C" int rados_object_list(rados_ioctx_t io,
   std::list<librados::ListObjectImpl> result;
   hobject_t next_hash;
 
+  bufferlist filter_bl;
+  if (filter_buf != nullptr) {
+    filter_bl.append(filter_buf, filter_buf_len);
+  }
+
   C_SaferCond cond;
   ctx->objecter->enumerate_objects(
       ctx->poolid,
@@ -3675,6 +3682,7 @@ extern "C" int rados_object_list(rados_ioctx_t io,
       *((hobject_t*)start),
       *((hobject_t*)finish),
       result_item_count,
+      filter_bl,
       &result,
       &next_hash,
       &cond);
@@ -5200,6 +5208,7 @@ bool librados::IoCtx::object_list_is_end(const ObjectCursor &oc)
 int librados::IoCtx::object_list(const ObjectCursor &start,
                 const ObjectCursor &finish,
                 const size_t result_item_count,
+                const bufferlist &filter,
                 std::vector<ObjectItem> *result,
                 ObjectCursor *next)
 {
@@ -5216,6 +5225,7 @@ int librados::IoCtx::object_list(const ObjectCursor &start,
       *((hobject_t*)start.c_cursor),
       *((hobject_t*)finish.c_cursor),
       result_item_count,
+      filter,
       &obj_result,
       &next_hash,
       &cond);
