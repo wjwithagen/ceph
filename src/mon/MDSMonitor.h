@@ -26,7 +26,6 @@ using namespace std;
 #include "msg/Messenger.h"
 
 #include "mds/FSMap.h"
-#include "mds/MDSMap.h"
 
 #include "PaxosService.h"
 #include "Session.h"
@@ -100,17 +99,25 @@ class MDSMonitor : public PaxosService {
   void get_health(list<pair<health_status_t,string> >& summary,
 		  list<pair<health_status_t,string> > *detail) const;
   int fail_mds(std::ostream &ss, const std::string &arg);
-  void fail_mds_gid(mds_gid_t gid);
+  /**
+   * Return true if a blacklist was done (i.e. OSD propose needed)
+   */
+  bool fail_mds_gid(mds_gid_t gid);
 
   bool preprocess_command(MonOpRequestRef op);
   bool prepare_command(MonOpRequestRef op);
 
-  int parse_role(const std::string &role_str, mds_role_t *role);
+  int parse_role(
+      const std::string &role_str,
+      mds_role_t *role,
+      std::ostream &ss);
   int management_command(
       MonOpRequestRef op,
       std::string const &prefix,
       map<string, cmd_vartype> &cmdmap,
       std::stringstream &ss);
+  void modify_legacy_filesystem(
+      std::function<void(std::shared_ptr<Filesystem> )> fn);
   int legacy_filesystem_command(
       MonOpRequestRef op,
       std::string const &prefix,
@@ -129,7 +136,10 @@ class MDSMonitor : public PaxosService {
   };
   map<mds_gid_t, beacon_info_t> last_beacon;
 
-  bool try_standby_replay(FSMap::mds_info_t& finfo, FSMap::mds_info_t& ainfo);
+  bool try_standby_replay(
+      const MDSMap::mds_info_t& finfo,
+      const Filesystem &leader_fs,
+      const MDSMap::mds_info_t& ainfo);
 
 public:
   MDSMonitor(Monitor *mn, Paxos *p, string service_name)

@@ -867,6 +867,8 @@ private:
   int _posix_acl_chmod(Inode *in, mode_t mode, int uid, int gid);
   int _posix_acl_permission(Inode *in, uid_t uid, UserGroups& groups, unsigned want);
 
+  mds_rank_t _get_random_up_mds() const;
+
 public:
   int mount(const std::string &mount_root, bool require_mds=false);
   void unmount();

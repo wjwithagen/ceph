@@ -936,7 +936,7 @@ void MDSDaemon::handle_mds_map(MMDSMap *m)
       // here!
       if (g_conf->mds_enforce_unique_name) {
         if (mds_gid_t existing = mdsmap->find_mds_gid_by_name(name)) {
-          MDSMap::mds_info_t& i = mdsmap->get_info_gid(existing);
+          const MDSMap::mds_info_t& i = mdsmap->get_info_gid(existing);
           if (i.global_id > monc->get_global_id()) {
             dout(1) << "handle_mds_map i (" << addr
                     << ") dne in the mdsmap, new instance has larger gid " << i.global_id
@@ -974,8 +974,15 @@ void MDSDaemon::handle_mds_map(MMDSMap *m)
           timer, beacon, mdsmap, messenger, monc, objecter,
           new C_VoidFn(this, &MDSDaemon::respawn),
           new C_VoidFn(this, &MDSDaemon::suicide));
+
       dout(10) <<  __func__ << ": initializing MDS rank "
                << mds_rank->get_nodeid() << dendl;
+
+      dout(10) << "Map at initialization:\n";
+      mdsmap->print(*_dout);
+      *_dout << dendl;
+      
+
       mds_rank->init();
     }
 

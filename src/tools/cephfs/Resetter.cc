@@ -34,7 +34,7 @@ int Resetter::reset(mds_role_t role)
 
   auto fs =  fsmap->get_filesystem(role.ns);
   assert(fs != nullptr);
-  int const pool_id = fs->get_metadata_pool();
+  int const pool_id = fs->mds_map.get_metadata_pool();
 
   JournalPointer jp(role.rank, pool_id);
   int jp_load_result = jp.load(objecter);
@@ -117,7 +117,7 @@ int Resetter::reset_hard(mds_role_t role)
 {
   auto fs =  fsmap->get_filesystem(role.ns);
   assert(fs != nullptr);
-  int const pool_id = fs->get_metadata_pool();
+  int const pool_id = fs->mds_map.get_metadata_pool();
 
   JournalPointer jp(role.rank, pool_id);
   jp.front = role.rank + MDS_INO_LOG_OFFSET;
@@ -135,7 +135,7 @@ int Resetter::reset_hard(mds_role_t role)
   journaler.set_writeable();
 
   ceph_file_layout default_log_layout = MDCache::gen_default_log_layout(
-      fsmap->get_filesystem(role.ns)->get_metadata_pool());
+      fsmap->get_filesystem(role.ns)->mds_map.get_metadata_pool());
   journaler.create(&default_log_layout, g_conf->mds_journal_format);
 
   C_SaferCond cond;

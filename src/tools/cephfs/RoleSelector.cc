@@ -6,7 +6,11 @@ int MDSRoleSelector::parse_rank(
     std::string const &str)
 {
   if (str == "all" || str == "*") {
-    for (auto rank : fsmap.get_filesystem(ns)->in) {
+    std::set<mds_rank_t> in;
+    const MDSMap &mds_map = fsmap.get_filesystem(ns)->mds_map;
+    mds_map.get_mds_set(in);
+
+    for (auto rank : in) {
       roles.push_back(mds_role_t(ns, rank));
     }
 
@@ -17,7 +21,7 @@ int MDSRoleSelector::parse_rank(
     if (!rank_err.empty()) {
       return -EINVAL;
     }
-    if (fsmap.get_filesystem(ns)->is_dne(rank)) {
+    if (fsmap.get_filesystem(ns)->mds_map.is_dne(rank)) {
       return -ENOENT;
     }
     roles.push_back(mds_role_t(ns, rank));

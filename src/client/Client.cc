@@ -1408,7 +1408,7 @@ mds_rank_t Client::choose_target_mds(MetaRequest *req)
 
 random_mds:
   if (mds < 0) {
-    mds = mdsmap->get_random_up_mds();
+    mds = _get_random_up_mds();
     ldout(cct, 10) << "did not get mds through better means, so chose random mds " << mds << dendl;
   }
 
@@ -1615,7 +1615,7 @@ int Client::make_request(MetaRequest *request,
 
 	if (!mdsmap->is_active_or_stopping(mds)) {
 	  ldout(cct, 10) << "hmm, still have no address for mds." << mds << ", trying a random mds" << dendl;
-	  request->resend_mds = mdsmap->get_random_up_mds();
+	  request->resend_mds = _get_random_up_mds();
 	  continue;
 	}
       }
@@ -12297,3 +12297,19 @@ void intrusive_ptr_release(Inode *in)
 {
   in->client->put_inode(in);
 }
+
+mds_rank_t Client::_get_random_up_mds() const
+{
+  assert(client_lock.is_locked_by_me());
+
+  std::set<mds_rank_t> up;
+  mdsmap->get_up_mds_set(up);
+
+  if (up.empty())
+    return -1;
+  std::set<mds_rank_t>::const_iterator p = up.begin();
+  for (int n = rand() % up.size(); n; n--)
+    ++p;
+  return *p;
+}
+

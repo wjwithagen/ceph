@@ -116,7 +116,7 @@ int JournalTool::main(std::vector<const char*> &argv)
  
   auto fs = fsmap->get_filesystem(role_selector.get_ns());
   assert(fs != nullptr);
-  int const pool_id = fs->get_metadata_pool();
+  int const pool_id = fs->mds_map.get_metadata_pool();
   dout(4) << "JournalTool: resolving pool " << pool_id << dendl;
   std::string pool_name;
   r = rados.pool_reverse_lookup(pool_id, &pool_name);
@@ -1218,9 +1218,9 @@ int JournalTool::consume_inos(const std::set<inodeno_t> &inos)
   int r = 0;
 
   // InoTable is a per-MDS structure, so iterate over assigned ranks
-  auto fs =  fsmap->get_filesystem(role_selector.get_ns());
+  auto fs = fsmap->get_filesystem(role_selector.get_ns());
   std::set<mds_rank_t> in_ranks;
-  fs->get_mds_set(in_ranks);
+  fs->mds_map.get_mds_set(in_ranks);
 
   for (std::set<mds_rank_t>::iterator rank_i = in_ranks.begin();
       rank_i != in_ranks.end(); ++rank_i)

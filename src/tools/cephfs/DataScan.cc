@@ -213,7 +213,7 @@ int DataScan::main(const std::vector<const char*> &args)
         << "' has ID " << data_pool_id << dendl;
     }
 
-    if (!fs->is_data_pool(data_pool_id)) {
+    if (!fs->mds_map.is_data_pool(data_pool_id)) {
       std::cerr << "Warning: pool '" << data_pool_name << "' is not a "
         "CephFS data pool!" << std::endl;
       if (!force_pool) {
@@ -230,7 +230,12 @@ int DataScan::main(const std::vector<const char*> &args)
   }
 
   if (command == "scan_frags") {
-    int const metadata_pool_id = fsmap->get_filesystem(ns)->get_metadata_pool();
+    const auto fs = fsmap->get_filesystem(ns);
+    if (fs == nullptr) {
+      std::cerr << "Filesystem id " << ns << " does not exist" << std::endl;
+      return -ENOENT;
+    }
+    int const metadata_pool_id = fs->mds_map.get_metadata_pool();
 
     dout(4) << "resolving metadata pool " << metadata_pool_id << dendl;
     std::string metadata_pool_name;
@@ -255,7 +260,7 @@ int DataScan::main(const std::vector<const char*> &args)
   } else if (command == "scan_frags") {
     return scan_frags();
   } else if (command == "init") {
-    return driver->init_roots(fs->get_first_data_pool());
+    return driver->init_roots(fs->mds_map.get_first_data_pool());
   } else {
     std::cerr << "Unknown command '" << command << "'" << std::endl;
     return -EINVAL;
@@ -1522,7 +1527,7 @@ int MetadataDriver::init(
 {
   auto fs =  fsmap->get_filesystem(ns);
   assert(fs != nullptr);
-  int const metadata_pool_id = fs->get_metadata_pool();
+  int const metadata_pool_id = fs->mds_map.get_metadata_pool();
 
   dout(4) << "resolving metadata pool " << metadata_pool_id << dendl;
   std::string metadata_pool_name;

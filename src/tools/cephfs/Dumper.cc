@@ -43,7 +43,7 @@ int Dumper::init(mds_role_t role_)
   auto fs =  fsmap->get_filesystem(role.ns);
   assert(fs != nullptr);
 
-  JournalPointer jp(role.rank, fs->get_metadata_pool());
+  JournalPointer jp(role.rank, fs->mds_map.get_metadata_pool());
   int jp_load_result = jp.load(objecter);
   if (jp_load_result != 0) {
     std::cerr << "Error loading journal: " << cpp_strerror(jp_load_result) << std::endl;
@@ -80,8 +80,9 @@ int Dumper::dump(const char *dump_file)
   auto fs =  fsmap->get_filesystem(role.ns);
   assert(fs != nullptr);
 
-  Journaler journaler(ino, fs->get_metadata_pool(), CEPH_FS_ONDISK_MAGIC,
-                                       objecter, 0, 0, &timer, &finisher);
+  Journaler journaler(ino, fs->mds_map.get_metadata_pool(),
+                      CEPH_FS_ONDISK_MAGIC, objecter, 0, 0,
+                      &timer, &finisher);
   r = recover_journal(&journaler);
   if (r) {
     return r;
@@ -243,13 +244,13 @@ int Dumper::undump(const char *dump_file)
   h.magic = CEPH_FS_ONDISK_MAGIC;
 
   h.layout = g_default_file_layout;
-  h.layout.fl_pg_pool = fs->get_metadata_pool();
+  h.layout.fl_pg_pool = fs->mds_map.get_metadata_pool();
   
   bufferlist hbl;
   ::encode(h, hbl);
 
   object_t oid = file_object_t(ino, 0);
-  object_locator_t oloc(fs->get_metadata_pool());
+  object_locator_t oloc(fs->mds_map.get_metadata_pool());
   SnapContext snapc;
 
   cout << "writing header " << oid << std::endl;

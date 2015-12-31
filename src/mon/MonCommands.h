@@ -387,6 +387,17 @@ COMMAND("fs reset " \
 COMMAND("fs ls ", \
 	"list filesystems", \
 	"fs", "r", "cli,rest")
+COMMAND("fs get name=fs_name,type=CephString", \
+	"get info about one filesystem", \
+	"fs", "r", "cli,rest")
+COMMAND("fs set " \
+	"name=fs_name,type=CephString " \
+	"name=var,type=CephChoices,strings=max_mds|max_file_size"
+        "|allow_new_snaps|inline_data|cluster_down " \
+	"name=val,type=CephString "					\
+	"name=confirm,type=CephString,req=false",			\
+	"set mds parameter <var> to <val>", "mds", "rw", "cli,rest")
+
 /*
  * Monmap commands
  */
