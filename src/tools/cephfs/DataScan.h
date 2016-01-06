@@ -249,6 +249,11 @@ class DataScan : public MDSUtility, public MetadataTool
      */
     int scan_frags();
 
+    /**
+     * Invoke tmap_to_omap on all metadata pool objects
+     */
+    int tmap_upgrade();
+
     // Accept pools which are not in the MDSMap
     bool force_pool;
     // Respond to decode errors by overwriting
