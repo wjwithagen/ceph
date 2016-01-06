@@ -830,32 +830,6 @@ int DataScan::tmap_upgrade()
 
 int DataScan::scan_frags()
 {
-  librados::NObjectIterator i;
-  bool legacy_filtering = false;
-
-  bufferlist filter_bl;
-  ClsCephFSClient::build_tag_filter(filter_tag, &filter_bl);
-
-  // try/catch to deal with older OSDs that don't support
-  // the cephfs pgls filtering mode
-  try {
-    i = metadata_io.nobjects_begin(filter_bl);
-    dout(4) << "OSDs accepted cephfs object filtering" << dendl;
-  } catch (const std::runtime_error &e) {
-    // A little unfriendly, librados raises std::runtime_error
-    // on pretty much any unhandled I/O return value, such as
-    // the OSD saying -EINVAL because of our use of a filter
-    // mode that it doesn't know about.
-    std::cerr << "OSDs do not support cephfs object filtering: using "
-                 "(slower) fallback mode" << std::endl;
-    legacy_filtering = true;
-    i = metadata_io.nobjects_begin();
-  }
-}
-
-
-int DataScan::scan_frags()
-{
   bool roots_present;
   int r = driver->check_roots(&roots_present);
   if (r != 0) {
