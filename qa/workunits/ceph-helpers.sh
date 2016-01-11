@@ -296,21 +296,21 @@ function run_mon() {
     shift
     local data=$dir/$id
 
-    ceph-mon \
+    $CEPH_BIN/ceph-mon \
         --id $id \
         --mkfs \
         --mon-data=$data \
         --run-dir=$dir \
         "$@" || return 1
 
-    ceph-mon \
+    $CEPH_BIN/ceph-mon \
         --id $id \
         --mon-osd-full-ratio=.99 \
         --mon-data-avail-crit=1 \
         --paxos-propose-interval=0.1 \
         --osd-crush-chooseleaf-type=0 \
-        --erasure-code-dir=.libs \
-        --plugin-dir=.libs \
+        --erasure-code-dir=$CEPH_LIB \
+        --plugin-dir=$CEPH_LIB \
         --debug-mon 20 \
         --debug-ms 20 \
         --debug-paxos 20 \
@@ -329,8 +329,8 @@ fsid = $(get_config mon $id fsid)
 mon host = $(get_config mon $id mon_host)
 EOF
     if test -z "$(get_config mon $id mon_initial_members)" ; then
-        ceph osd pool delete rbd rbd --yes-i-really-really-mean-it || return 1
-        ceph osd pool create rbd $PG_NUM || return 1
+        $CEPH_BIN/ceph osd pool delete rbd rbd --yes-i-really-really-mean-it || return 1
+        $CEPH_BIN/ceph osd pool create rbd $PG_NUM || return 1
     fi
 }
 
@@ -418,7 +418,7 @@ function run_osd() {
     ceph_disk_args+=" --prepend-to-path="
 
     mkdir -p $osd_data
-    ceph-disk $ceph_disk_args \
+    $CEPH_ROOT/src/ceph-disk $ceph_disk_args \
         prepare $osd_data || return 1
 
     activate_osd $dir $id "$@"
@@ -542,9 +542,9 @@ function activate_osd() {
     ceph_args+=" --osd-scrub-load-threshold=2000"
     ceph_args+=" --osd-data=$osd_data"
     ceph_args+=" --chdir="
-    ceph_args+=" --erasure-code-dir=.libs"
-    ceph_args+=" --plugin-dir=.libs"
-    ceph_args+=" --osd-class-dir=.libs"
+    ceph_args+=" --erasure-code-dir=$CEPH_LIB"
+    ceph_args+=" --plugin-dir=$CEPH_LIB"
+    ceph_args+=" --osd-class-dir=$CEPH_LIB"
     ceph_args+=" --run-dir=$dir"
     ceph_args+=" --debug-osd=20"
     ceph_args+=" --log-file=$dir/\$name.log"
@@ -552,14 +552,14 @@ function activate_osd() {
     ceph_args+=" "
     ceph_args+="$@"
     mkdir -p $osd_data
-    CEPH_ARGS="$ceph_args " ceph-disk $ceph_disk_args \
+    CEPH_ARGS="$ceph_args " $CEPH_ROOT/src/ceph-disk $ceph_disk_args \
         activate \
         --mark-init=none \
         $osd_data || return 1
 
     [ "$id" = "$(cat $osd_data/whoami)" ] || return 1
 
-    ceph osd crush create-or-move "$id" 1 root=default host=localhost
+    $CEPH_BIN/ceph osd crush create-or-move "$id" 1 root=default host=localhost
 
     wait_for_osd up $id || return 1
 }
@@ -602,6 +602,7 @@ function wait_for_osd() {
 
     status=1
     for ((i=0; i < $TIMEOUT; i++)); do
+        echo $i
         if ! ceph osd dump | grep "osd.$id $state"; then
             sleep 1
         else
