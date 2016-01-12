@@ -14,7 +14,7 @@
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU Library Public License for more details.
 #
-source ../qa/workunits/ceph-helpers.sh
+source $CEPH_ROOT/qa/workunits/ceph-helpers.sh
 
 function run() {
     local dir=$1
@@ -38,12 +38,12 @@ function add_something() {
 
     wait_for_clean || return 1
 
-    ceph osd set noscrub || return 1
-    ceph osd set nodeep-scrub || return 1
+    $CEPH_BIN/ceph osd set noscrub || return 1
+    $CEPH_BIN/ceph osd set nodeep-scrub || return 1
 
     local payload=ABCDEF
     echo $payload > $dir/ORIGINAL
-    rados --pool $poolname put $obj $dir/ORIGINAL || return 1
+    $CEPH_BIN/rados --pool $poolname put $obj $dir/ORIGINAL || return 1
 }
 
 #
@@ -87,7 +87,7 @@ function corrupt_and_repair_two() {
     #
     objectstore_tool $dir $first SOMETHING list-attrs || return 1
     objectstore_tool $dir $second SOMETHING list-attrs || return 1
-    rados --pool $poolname get SOMETHING $dir/COPY || return 1
+    $CEPH_BIN/rados --pool $poolname get SOMETHING $dir/COPY || return 1
     diff $dir/ORIGINAL $dir/COPY || return 1
 }
 
@@ -115,7 +115,7 @@ function corrupt_and_repair_one() {
     # 3) The file must be back
     #
     objectstore_tool $dir $osd SOMETHING list-attrs || return 1
-    rados --pool $poolname get SOMETHING $dir/COPY || return 1
+    $CEPH_BIN/rados --pool $poolname get SOMETHING $dir/COPY || return 1
     diff $dir/ORIGINAL $dir/COPY || return 1
 
     wait_for_clean || return 1
@@ -126,7 +126,7 @@ function corrupt_and_repair_erasure_coded() {
     local poolname=$2
     local profile=$3
 
-    ceph osd pool create $poolname 1 1 erasure $profile \
+    $CEPH_BIN/ceph osd pool create $poolname 1 1 erasure $profile \
         || return 1
 
     add_something $dir $poolname
@@ -162,14 +162,14 @@ function TEST_auto_repair_erasure_coded() {
     done
 
     # Create an EC pool
-    ceph osd erasure-code-profile set myprofile \
+    $CEPH_BIN/ceph osd erasure-code-profile set myprofile \
         k=2 m=1 ruleset-failure-domain=osd || return 1
-    ceph osd pool create $poolname 8 8 erasure myprofile || return 1
+    $CEPH_BIN/ceph osd pool create $poolname 8 8 erasure myprofile || return 1
 
     # Put an object
     local payload=ABCDEF
     echo $payload > $dir/ORIGINAL
-    rados --pool $poolname put SOMETHING $dir/ORIGINAL || return 1
+    $CEPH_BIN/rados --pool $poolname put SOMETHING $dir/ORIGINAL || return 1
     wait_for_clean || return 1
 
     # Remove the object from one shard physically
@@ -180,7 +180,7 @@ function TEST_auto_repair_erasure_coded() {
     wait_for_clean || return 1
     # Verify - the file should be back
     objectstore_tool $dir $(get_not_primary $poolname SOMETHING) SOMETHING list-attrs || return 1
-    rados --pool $poolname get SOMETHING $dir/COPY || return 1
+    $CEPH_BIN/rados --pool $poolname get SOMETHING $dir/COPY || return 1
     diff $dir/ORIGINAL $dir/COPY || return 1
 
     # Tear down
@@ -199,7 +199,7 @@ function TEST_corrupt_and_repair_jerasure() {
     done
     wait_for_clean || return 1
 
-    ceph osd erasure-code-profile set $profile \
+    $CEPH_BIN/ceph osd erasure-code-profile set $profile \
         k=2 m=2 ruleset-failure-domain=osd || return 1
 
     corrupt_and_repair_erasure_coded $dir $poolname $profile || return 1
@@ -219,7 +219,7 @@ function TEST_corrupt_and_repair_lrc() {
     done
     wait_for_clean || return 1
 
-    ceph osd erasure-code-profile set $profile \
+    $CEPH_BIN/ceph osd erasure-code-profile set $profile \
         pluing=lrc \
         k=4 m=2 l=3 \
         ruleset-failure-domain=osd || return 1
@@ -242,9 +242,9 @@ function TEST_unfound_erasure_coded() {
     run_osd $dir 3 || return 1
     wait_for_clean || return 1
 
-    ceph osd erasure-code-profile set myprofile \
+    $CEPH_BIN/ceph osd erasure-code-profile set myprofile \
       k=2 m=2 ruleset-failure-domain=osd || return 1
-    ceph osd pool create $poolname 1 1 erasure myprofile \
+    $CEPH_BIN/ceph osd pool create $poolname 1 1 erasure myprofile \
       || return 1
 
     add_something $dir $poolname
@@ -269,8 +269,8 @@ function TEST_unfound_erasure_coded() {
     #
     # 3) check pg state
     #
-    ceph -s|grep "4 osds: 4 up, 4 in" || return 1
-    ceph -s|grep "1/1 unfound" || return 1
+    $CEPH_BIN/ceph -s|grep "4 osds: 4 up, 4 in" || return 1
+    $CEPH_BIN/ceph -s|grep "1/1 unfound" || return 1
 
     teardown $dir || return 1
 }
@@ -290,9 +290,9 @@ function TEST_list_missing_erasure_coded() {
     done
     wait_for_clean || return 1
 
-    ceph osd erasure-code-profile set $profile \
+    $CEPH_BIN/ceph osd erasure-code-profile set $profile \
         k=2 m=1 ruleset-failure-domain=osd || return 1
-    ceph osd pool create $poolname 1 1 erasure $profile \
+    $CEPH_BIN/ceph osd pool create $poolname 1 1 erasure $profile \
         || return 1
     wait_for_clean || return 1
 
@@ -313,11 +313,11 @@ function TEST_list_missing_erasure_coded() {
 
     # Repair the PG, which triggers the recovering,
     # and should mark the object as unfound
-    ceph pg repair $pg
+    $CEPH_BIN/ceph pg repair $pg
     
     for i in $(seq 0 120) ; do
         [ $i -lt 60 ] || return 1
-        matches=$(ceph pg $pg list_missing | egrep "OBJ0|OBJ1" | wc -l)
+        matches=$($CEPH_BIN/ceph pg $pg list_missing | egrep "OBJ0|OBJ1" | wc -l)
         [ $matches -eq 2 ] && break
     done
 

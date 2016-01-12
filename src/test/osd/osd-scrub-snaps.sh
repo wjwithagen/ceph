@@ -14,7 +14,7 @@
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU Library Public License for more details.
 #
-source ../qa/workunits/ceph-helpers.sh
+source $CEPH_ROOT/qa/workunits/ceph-helpers.sh
 
 function run() {
     local dir=$1
@@ -44,107 +44,107 @@ function TEST_scrub_snaps() {
     wait_for_clean || return 1
 
     # Create a pool with a single pg
-    ceph osd pool create $poolname 1 1
-    poolid=$(ceph osd dump | grep "^pool.*[']test[']" | awk '{ print $2 }')
+    $CEPH_BIN/ceph osd pool create $poolname 1 1
+    poolid=$($CEPH_BIN/ceph osd dump | grep "^pool.*[']test[']" | awk '{ print $2 }')
 
     dd if=/dev/urandom of=$TESTDATA bs=1032 count=1
     for i in `seq 1 14`
     do
-        rados -p $poolname put obj${i} $TESTDATA
+        $CEPH_BIN/rados -p $poolname put obj${i} $TESTDATA
     done
 
     SNAP=1
-    rados -p $poolname mksnap snap${SNAP}
+    $CEPH_BIN/rados -p $poolname mksnap snap${SNAP}
     dd if=/dev/urandom of=$TESTDATA bs=256 count=${SNAP}
-    rados -p $poolname put obj1 $TESTDATA
-    rados -p $poolname put obj5 $TESTDATA
-    rados -p $poolname put obj3 $TESTDATA
+    $CEPH_BIN/rados -p $poolname put obj1 $TESTDATA
+    $CEPH_BIN/rados -p $poolname put obj5 $TESTDATA
+    $CEPH_BIN/rados -p $poolname put obj3 $TESTDATA
     for i in `seq 6 14`
-     do rados -p $poolname put obj${i} $TESTDATA
+     do $CEPH_BIN/rados -p $poolname put obj${i} $TESTDATA
     done
 
     SNAP=2
-    rados -p $poolname mksnap snap${SNAP}
+    $CEPH_BIN/rados -p $poolname mksnap snap${SNAP}
     dd if=/dev/urandom of=$TESTDATA bs=256 count=${SNAP}
-    rados -p $poolname put obj5 $TESTDATA
+    $CEPH_BIN/rados -p $poolname put obj5 $TESTDATA
 
     SNAP=3
-    rados -p $poolname mksnap snap${SNAP}
+    $CEPH_BIN/rados -p $poolname mksnap snap${SNAP}
     dd if=/dev/urandom of=$TESTDATA bs=256 count=${SNAP}
-    rados -p $poolname put obj3 $TESTDATA
+    $CEPH_BIN/rados -p $poolname put obj3 $TESTDATA
 
     SNAP=4
-    rados -p $poolname mksnap snap${SNAP}
+    $CEPH_BIN/rados -p $poolname mksnap snap${SNAP}
     dd if=/dev/urandom of=$TESTDATA bs=256 count=${SNAP}
-    rados -p $poolname put obj5 $TESTDATA
-    rados -p $poolname put obj2 $TESTDATA
+    $CEPH_BIN/rados -p $poolname put obj5 $TESTDATA
+    $CEPH_BIN/rados -p $poolname put obj2 $TESTDATA
 
     SNAP=5
-    rados -p $poolname mksnap snap${SNAP}
+    $CEPH_BIN/rados -p $poolname mksnap snap${SNAP}
     SNAP=6
-    rados -p $poolname mksnap snap${SNAP}
+    $CEPH_BIN/rados -p $poolname mksnap snap${SNAP}
     dd if=/dev/urandom of=$TESTDATA bs=256 count=${SNAP}
-    rados -p $poolname put obj5 $TESTDATA
+    $CEPH_BIN/rados -p $poolname put obj5 $TESTDATA
 
     SNAP=7
-    rados -p $poolname mksnap snap${SNAP}
+    $CEPH_BIN/rados -p $poolname mksnap snap${SNAP}
 
-    rados -p $poolname rm obj4
-    rados -p $poolname rm obj2
+    $CEPH_BIN/rados -p $poolname rm obj4
+    $CEPH_BIN/rados -p $poolname rm obj2
 
     kill_daemons $dir TERM osd || return 1
 
     # Don't need to ceph_objectstore_tool function because osd stopped
 
-    JSON="$(ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal --op list obj1 | grep \"snapid\":-2)"
-    ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal "$JSON" remove
+    JSON="$($CEPH_BIN/ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal --op list obj1 | grep \"snapid\":-2)"
+    $CEPH_BIN/ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal "$JSON" remove
 
-    JSON="$(ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal --op list obj5 | grep \"snapid\":2)"
-    ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal "$JSON" remove
+    JSON="$($CEPH_BIN/ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal --op list obj5 | grep \"snapid\":2)"
+    $CEPH_BIN/ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal "$JSON" remove
 
-    JSON="$(ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal --op list obj5 | grep \"snapid\":1)"
+    JSON="$($CEPH_BIN/ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal --op list obj5 | grep \"snapid\":1)"
     OBJ5SAVE="$JSON"
-    ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal "$JSON" remove
+    $CEPH_BIN/ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal "$JSON" remove
 
-    JSON="$(ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal --op list obj5 | grep \"snapid\":4)"
+    JSON="$($CEPH_BIN/ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal --op list obj5 | grep \"snapid\":4)"
     dd if=/dev/urandom of=$TESTDATA bs=256 count=18
-    ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal "$JSON" set-bytes $TESTDATA
+    $CEPH_BIN/ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal "$JSON" set-bytes $TESTDATA
 
-    JSON="$(ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal --op list obj3 | grep \"snapid\":-2)"
+    JSON="$($CEPH_BIN/ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal --op list obj3 | grep \"snapid\":-2)"
     dd if=/dev/urandom of=$TESTDATA bs=256 count=15
-    ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal "$JSON" set-bytes $TESTDATA
+    $CEPH_BIN/ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal "$JSON" set-bytes $TESTDATA
 
-    JSON="$(ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal --op list obj4 | grep \"snapid\":7)"
-    ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal "$JSON" remove
+    JSON="$($CEPH_BIN/ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal --op list obj4 | grep \"snapid\":7)"
+    $CEPH_BIN/ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal "$JSON" remove
 
-    JSON="$(ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal --op list obj2 | grep \"snapid\":-1)"
-    ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal "$JSON" rm-attr snapset
+    JSON="$($CEPH_BIN/ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal --op list obj2 | grep \"snapid\":-1)"
+    $CEPH_BIN/ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal "$JSON" rm-attr snapset
 
     # Create a clone which isn't in snapset and doesn't have object info
     JSON="$(echo "$OBJ5SAVE" | sed s/snapid\":1/snapid\":7/)"
     dd if=/dev/urandom of=$TESTDATA bs=256 count=7
-    ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal "$JSON" set-bytes $TESTDATA
+    $CEPH_BIN/ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal "$JSON" set-bytes $TESTDATA
 
     rm -f $TESTDATA
 
-    JSON="$(ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal --op list obj6 | grep \"snapid\":-2)"
-    ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal "$JSON" clear-snapset
-    JSON="$(ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal --op list obj7 | grep \"snapid\":-2)"
-    ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal "$JSON" clear-snapset corrupt
-    JSON="$(ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal --op list obj8 | grep \"snapid\":-2)"
-    ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal "$JSON" clear-snapset seq
-    JSON="$(ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal --op list obj9 | grep \"snapid\":-2)"
-    ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal "$JSON" clear-snapset clone_size
-    JSON="$(ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal --op list obj10 | grep \"snapid\":-2)"
-    ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal "$JSON" clear-snapset clone_overlap
-    JSON="$(ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal --op list obj11 | grep \"snapid\":-2)"
-    ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal "$JSON" clear-snapset clones
-    JSON="$(ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal --op list obj12 | grep \"snapid\":-2)"
-    ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal "$JSON" clear-snapset head
-    JSON="$(ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal --op list obj13 | grep \"snapid\":-2)"
-    ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal "$JSON" clear-snapset snaps
-    JSON="$(ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal --op list obj14 | grep \"snapid\":-2)"
-    ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal "$JSON" clear-snapset size
+    JSON="$($CEPH_BIN/ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal --op list obj6 | grep \"snapid\":-2)"
+    $CEPH_BIN/ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal "$JSON" clear-snapset
+    JSON="$($CEPH_BIN/ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal --op list obj7 | grep \"snapid\":-2)"
+    $CEPH_BIN/ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal "$JSON" clear-snapset corrupt
+    JSON="$($CEPH_BIN/ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal --op list obj8 | grep \"snapid\":-2)"
+    $CEPH_BIN/ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal "$JSON" clear-snapset seq
+    JSON="$($CEPH_BIN/ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal --op list obj9 | grep \"snapid\":-2)"
+    $CEPH_BIN/ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal "$JSON" clear-snapset clone_size
+    JSON="$($CEPH_BIN/ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal --op list obj10 | grep \"snapid\":-2)"
+    $CEPH_BIN/ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal "$JSON" clear-snapset clone_overlap
+    JSON="$($CEPH_BIN/ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal --op list obj11 | grep \"snapid\":-2)"
+    $CEPH_BIN/ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal "$JSON" clear-snapset clones
+    JSON="$($CEPH_BIN/ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal --op list obj12 | grep \"snapid\":-2)"
+    $CEPH_BIN/ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal "$JSON" clear-snapset head
+    JSON="$($CEPH_BIN/ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal --op list obj13 | grep \"snapid\":-2)"
+    $CEPH_BIN/ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal "$JSON" clear-snapset snaps
+    JSON="$($CEPH_BIN/ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal --op list obj14 | grep \"snapid\":-2)"
+    $CEPH_BIN/ceph-objectstore-tool --data-path $dir/0 --journal-path $dir/0/journal "$JSON" clear-snapset size
 
     run_osd $dir 0 || return 1
     wait_for_clean || return 1
@@ -158,7 +158,7 @@ function TEST_scrub_snaps() {
 
     for i in `seq 1 7`
     do
-        rados -p $poolname rmsnap snap$i
+        $CEPH_BIN/rados -p $poolname rmsnap snap$i
     done
 
     ERRORS=0
