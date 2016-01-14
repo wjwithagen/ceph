@@ -16,7 +16,7 @@
 # GNU Library Public License for more details.
 #
 
-source ../qa/workunits/ceph-helpers.sh
+source $CEPH_ROOT/qa/workunits/ceph-helpers.sh
 
 export CEPH_VSTART_WRAPPER=1
 export CEPH_DIR="$PWD/testdir/test-$CEPH_PORT"
@@ -30,12 +30,12 @@ function vstart_setup()
     trap "teardown $CEPH_DIR" EXIT
     export LC_ALL=C # some tests are vulnerable to i18n
     export PATH="$(pwd):${PATH}"
-    ./vstart.sh \
+    $CEPH_ROOT/src/vstart.sh \
         -o 'paxos propose interval = 0.01' \
         -n -l $CEPH_START || return 1
     export CEPH_CONF=$CEPH_DIR/ceph.conf
 
-    crit=$(expr 100 - $(ceph-conf --show-config-value mon_data_avail_crit))
+    crit=$(expr 100 - $($CEPH_BIN/ceph-conf --show-config-value mon_data_avail_crit))
     if [ $(df . | perl -ne 'print if(s/.*\s(\d+)%.*/\1/)') -ge $crit ] ; then
         df . 
         cat <<EOF
