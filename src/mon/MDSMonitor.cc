@@ -387,27 +387,8 @@ bool MDSMonitor::preprocess_beacon(MonOpRequestRef op)
       goto reply;
     }
     
-
-#if 0
-    // FIXME: for standby-replay for rank we should be told know
-    // by the MDS daemon which filesystem it wants.  i.e. this shouldn't
-    // be standby-for-rank it should be standby-for-role
-    // ALSO: don't let someone go into standby replay if cluster DOWN flag set
-    if (info.state == MDSMap::STATE_STANDBY &&
-	(state == MDSMap::STATE_STANDBY_REPLAY ||
-	    state == MDSMap::STATE_ONESHOT_REPLAY)) {
-      if(
-	(pending_fsmap.is_degraded() ||
-	 ((m->get_standby_for_rank() >= 0) &&
-	     pending_fsmap.get_state(m->get_standby_for_rank()) < MDSMap::STATE_ACTIVE))) {
-      dout(10) << "mds_beacon can't standby-replay mds." << m->get_standby_for_rank() << " at this time (cluster degraded, or mds not active)" << dendl;
-      dout(10) << "pending_fsmap.is_degraded()==" << pending_fsmap.is_degraded()
-          << " rank state: " << ceph_mds_state_name(pending_fsmap.get_state(m->get_standby_for_rank())) << dendl;
-      goto reply;
-    }
-#endif
     _note_beacon(m);
-    return false;  // need to update map
+    return false;
   }
 
   // Comparing known daemon health with m->get_health()
@@ -1381,61 +1362,11 @@ int MDSMonitor::management_command(
 {
   op->mark_mdsmon_event(__func__);
   if (prefix == "mds newfs") {
-    // FIXME: reinstate (or not?) legacy newfs in a way
-    // that no longer wipes the FSMap entirely
-    return 0;
-#if 0
-    /* Legacy `newfs` command, takes pool numbers instead of
-     * names, assumes fs name to be MDS_FS_NAME_DEFAULT, and
-     * can overwrite existing filesystem settings */
-    FSMap newmap;
-    int64_t metadata, data;
-
-    if (!cmd_getval(g_ceph_context, cmdmap, "metadata", metadata)) {
-      ss << "error parsing 'metadata' value '"
-         << cmd_vartype_stringify(cmdmap["metadata"]) << "'";
-      return -EINVAL;
-    }
-    if (!cmd_getval(g_ceph_context, cmdmap, "data", data)) {
-      ss << "error parsing 'data' value '"
-         << cmd_vartype_stringify(cmdmap["data"]) << "'";
-      return -EINVAL;
-    }
- 
-    int r = _check_pool(data, &ss);
-    if (r < 0) {
-      return r;
-    }
-
-    r = _check_pool(metadata, &ss);
-    if (r < 0) {
-      return r;
-    }
-
-    // be idempotent.. success if it already exists and matches
-    if (fsmap.get_filesystem(MDS_FS_NAME_DEFAULT) != nullptr) {
-      auto fs = fsmap.get_filesystem(MDS_FS_NAME_DEFAULT);
-      if (fs->get_metadata_pool() == metadata &&
-          fs->get_first_data_pool() == data) {
-        ss << "filesystem '" << MDS_FS_NAME_DEFAULT << "' already exists";
-        return 0;
-      }
-    }
-
-    string sure;
-    cmd_getval(g_ceph_context, cmdmap, "sure", sure);
-    if (pending_fsmap.get_enabled() && sure != "--yes-i-really-mean-it") {
-      ss << "this is DANGEROUS and will wipe out the fsmap's fs, and may clobber data in the new pools you specify.  add --yes-i-really-mean-it if you do.";
-      return -EPERM;
-    } else {
-      newmap.inc = pending_fsmap.inc;
-      pending_fsmap = newmap;
-      pending_fsmap.epoch = fsmap.epoch + 1;
-      create_new_fs(pending_fsmap, MDS_FS_NAME_DEFAULT, metadata, data);
-      ss << "new fs with metadata pool " << metadata << " and data pool " << data;
-      return 0;
-    }
-#endif
+    // newfs is the legacy command that in single-filesystem times
+    // used to be equivalent to doing an "fs rm ; fs new".  We
+    // can't do this in a sane way in multi-filesystem world.
+    ss << "'newfs' no longer available.  Please use 'fs new'.";
+    return -EINVAL;
   } else if (prefix == "fs new") {
     string metadata_name;
     cmd_getval(g_ceph_context, cmdmap, "metadata", metadata_name);
@@ -2043,11 +1974,10 @@ int MDSMonitor::filesystem_command(
       }
     }
   } else if (prefix == "mds rmfailed") {
-#if 0
     std::string role_str;
     cmd_getval(g_ceph_context, cmdmap, "who", role_str);
     mds_role_t role;
-    int r = parse_role(role_str, &role);
+    int r = parse_role(role_str, &role, ss);
     if (r < 0) {
       ss << "invalid role '" << role_str << "'";
       return -EINVAL;
@@ -2056,11 +1986,10 @@ int MDSMonitor::filesystem_command(
     std::shared_ptr<Filesystem> fs = pending_fsmap.get_filesystem(role.ns);
     assert(fs != nullptr);
 
-    fs->failed.erase(role.rank);
+    fs->mds_map.failed.erase(role.rank);
     stringstream ss;
     ss << "removed failed mds." << role;
     return 0;
-#endif
   } else if (prefix == "mds compat rm_compat") {
     int64_t f;
     if (!cmd_getval(g_ceph_context, cmdmap, "feature", f)) {
@@ -2557,6 +2486,7 @@ void MDSMonitor::maybe_replace_gid(mds_gid_t gid,
   if (info.rank >= 0 &&
       info.state != MDSMap::STATE_STANDBY &&
       info.state != MDSMap::STATE_STANDBY_REPLAY &&
+      !pending_fsmap.get_filesystem(ns)->mds_map.test_flag(CEPH_MDSMAP_DOWN) &&
       (sgid = pending_fsmap.find_replacement_for({ns, info.rank}, info.name,
                 g_conf->mon_force_standby_active)) != MDS_GID_NONE) {
     
