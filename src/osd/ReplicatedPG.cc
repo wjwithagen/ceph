@@ -9824,7 +9824,16 @@ void ReplicatedPG::on_change(ObjectStore::Transaction *t)
   // we don't want to cache object_contexts through the interval change
   // NOTE: we actually assert that all currently live references are dead
   // by the time the flush for the next interval completes.
-  object_contexts.clear();
+  {
+    list<pair<hobject_t, ObjectContextRef> > were_cached;
+    object_contexts.clear(&were_cached);
+    for (auto &&i : were_cached) {
+      if (!i.second->rwstate.empty()) {
+	derr << "Object " << i.second->obs.oi.soid << " rwstate is not empty: "
+	     << i.second->rwstate << dendl;
+      }
+    }
+  }
 
   // should have been cleared above by finishing all of the degraded objects
   assert(objects_blocked_on_degraded_snap.empty());

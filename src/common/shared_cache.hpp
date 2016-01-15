@@ -148,15 +148,18 @@ public:
   }
 
   //clear all strong reference from the lru.
-  void clear() {
-    while (true) {
-      VPtr val; // release any ref we have after we drop the lock
+  void clear(list<pair<K, VPtr> > *_out = nullptr) {
+    list<pair<K, VPtr> > _to_release;
+    list<pair<K, VPtr> > *tmp = _out ? _out : &_to_release;
+    {
       Mutex::Locker l(lock);
-      if (size == 0)
-        break;
+      while (size > 0) {
+	if (size == 0)
+	  break;
 
-      val = lru.back().second;
-      lru_remove(lru.back().first);
+	tmp->push_back(lru.back());
+	lru_remove(lru.back().first);
+      }
     }
   }
 
