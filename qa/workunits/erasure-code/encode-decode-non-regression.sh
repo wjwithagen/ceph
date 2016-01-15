@@ -15,7 +15,7 @@
 # GNU Library Public License for more details.
 #
 : ${CORPUS:=https://github.com/ceph/ceph-erasure-code-corpus.git}
-: ${DIRECTORY:=../ceph-erasure-code-corpus}
+: ${DIRECTORY:=$CEPH_ROOT/ceph-erasure-code-corpus}
 
 # when running from sources, the current directory must have precedence
 export PATH=:$PATH
@@ -24,7 +24,7 @@ if ! test -d $DIRECTORY ; then
     git clone $CORPUS $DIRECTORY
 fi
 
-my_version=v$(ceph --version | cut -f3 -d ' ')
+my_version=v$($CEPH_BIN/ceph --version | cut -f3 -d ' ')
 
 all_versions=$((ls -d $DIRECTORY/v* ; echo $DIRECTORY/$my_version ) | sort)
 
