@@ -839,21 +839,18 @@ function test_mon_mds()
 
   fail_all_mds
 
+  # Check that `newfs` is no longer permitted
+  expect_false ceph mds newfs $metadata_poolnum $data_poolnum --yes-i-really-mean-it 2>$TMPFILE
+
   # Check that 'fs reset' runs
   ceph fs reset cephfs --yes-i-really-mean-it
 
   fail_all_mds
 
-  # Clean up to enable subsequent newfs tests
+  # Clean up to enable subsequent fs new tests
   ceph fs rm cephfs --yes-i-really-mean-it
 
   set +e
-  ceph mds newfs $metadata_poolnum $ec_poolnum --yes-i-really-mean-it 2>$TMPFILE
-  check_response 'erasure-code' $? 22
-  ceph mds newfs $ec_poolnum $data_poolnum --yes-i-really-mean-it 2>$TMPFILE
-  check_response 'erasure-code' $? 22
-  ceph mds newfs $ec_poolnum $ec_poolnum --yes-i-really-mean-it 2>$TMPFILE
-  check_response 'erasure-code' $? 22
   ceph fs new cephfs fs_metadata mds-ec-pool 2>$TMPFILE
   check_response 'erasure-code' $? 22
   ceph fs new cephfs mds-ec-pool fs_data 2>$TMPFILE
@@ -893,12 +890,6 @@ function test_mon_mds()
 
   # ... but we should be forbidden from using the cache pool in the FS directly.
   set +e
-  ceph mds newfs $metadata_poolnum $tier_poolnum --yes-i-really-mean-it 2>$TMPFILE
-  check_response 'in use as a cache tier' $? 22
-  ceph mds newfs $tier_poolnum $data_poolnum --yes-i-really-mean-it 2>$TMPFILE
-  check_response 'in use as a cache tier' $? 22
-  ceph mds newfs $tier_poolnum $tier_poolnum --yes-i-really-mean-it 2>$TMPFILE
-  check_response 'in use as a cache tier' $? 22
   ceph fs new cephfs fs_metadata mds-tier 2>$TMPFILE
   check_response 'in use as a cache tier' $? 22
   ceph fs new cephfs mds-tier fs_data 2>$TMPFILE
