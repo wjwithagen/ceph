@@ -1562,8 +1562,6 @@ int MDSMonitor::parse_role(
     mds_role_t *role,
     std::ostream &ss)
 {
-  auto colon_pos = role_str.find(":");
-
   const FSMap *relevant_fsmap = &fsmap;
   if (mon->is_leader()) {
     relevant_fsmap = &pending_fsmap;

@@ -4219,6 +4219,8 @@ void Monitor::handle_get_version(MonOpRequestRef op)
 
   if (m->what == "mdsmap") {
     svc = mdsmon();
+  } else if (m->what == "fsmap") {
+    svc = mdsmon();
   } else if (m->what == "osdmap") {
     svc = osdmon();
   } else if (m->what == "monmap") {
