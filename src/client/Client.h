@@ -56,7 +56,7 @@ using std::fstream;
 #include "InodeRef.h"
 #include "UserGroups.h"
 
-class MDSMap;
+class FSMap;
 class MonClient;
 
 class CephContext;
@@ -291,6 +291,10 @@ protected:
   // mds sessions
   map<mds_rank_t, MetaSession*> mds_sessions;  // mds -> push seq
   list<Cond*> waiting_for_mdsmap;
+
+  // FSMap, for when using mds_command
+  list<Cond*> waiting_for_fsmap;
+  FSMap *fsmap;
 
   // MDS command state
   std::map<ceph_tid_t, CommandOp> commands;
@@ -568,6 +572,7 @@ protected:
 
   // messaging
   void handle_mds_map(class MMDSMap *m);
+  void handle_fs_map(class MFSMap *m);
   void handle_osd_map(class MOSDMap *m);
 
   void handle_lease(MClientLease *m);
