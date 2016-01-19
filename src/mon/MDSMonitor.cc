@@ -1954,7 +1954,9 @@ int MDSMonitor::filesystem_command(
     }
     if (pending_fsmap.compat.incompat.contains(f)) {
       ss << "removing incompat feature " << f;
-      pending_fsmap.compat.incompat.remove(f);
+      CompatSet modified = pending_fsmap.compat;
+      modified.incompat.remove(f);
+      pending_fsmap.update_compat(modified);
     } else {
       ss << "incompat feature " << f << " not present in " << pending_fsmap.compat;
     }
