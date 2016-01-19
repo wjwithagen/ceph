@@ -359,6 +359,11 @@ public:
       std::shared_ptr<Filesystem> *result
       ) const;
 
+  int parse_role(
+      const std::string &role_str,
+      mds_role_t *role,
+      std::ostream &ss) const;
+
   /**
    * Return true if this pool is in use by any of the filesystems
    */

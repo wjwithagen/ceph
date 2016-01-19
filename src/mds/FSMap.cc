@@ -678,3 +678,81 @@ void FSMap::stop(mds_gid_t who)
   fs->mds_map.epoch = epoch;
 }
 
+
+/**
+ * Given one of the following forms:
+ *   <fs name>:<rank>
+ *   <fs id>:<rank>
+ *   <rank>
+ *
+ * Parse into a mds_role_t.  The rank-only form is only valid
+ * if legacy_client_ns is set.
+ */
+int FSMap::parse_role(
+    const std::string &role_str,
+    mds_role_t *role,
+    std::ostream &ss) const
+{
+  auto colon_pos = role_str.find(":");
+
+  if (colon_pos != std::string::npos && colon_pos != role_str.size()) {
+    auto fs_part = role_str.substr(0, colon_pos);
+    auto rank_part = role_str.substr(colon_pos + 1);
+
+    std::string err;
+    mds_namespace_t fs_id = MDS_NAMESPACE_NONE;
+    long fs_id_i = strict_strtol(fs_part.c_str(), 10, &err);
+    if (fs_id_i < 0 || !err.empty()) {
+      // Try resolving as name
+      auto fs = get_filesystem(fs_part);
+      if (fs == nullptr) {
+        ss << "Unknown filesystem name '" << fs_part << "'";
+        return -EINVAL;
+      } else {
+        fs_id = fs->ns;
+      }
+    } else {
+      fs_id = fs_id_i;
+    }
+
+    mds_rank_t rank;
+    long rank_i = strict_strtol(rank_part.c_str(), 10, &err);
+    if (rank_i < 0 || !err.empty()) {
+      ss << "Invalid rank '" << rank_part << "'";
+      return -EINVAL;
+    } else {
+      rank = rank_i;
+    }
+
+    *role = {fs_id, rank};
+  } else {
+    std::string err;
+    long who_i = strict_strtol(role_str.c_str(), 10, &err);
+    if (who_i < 0 || !err.empty()) {
+      ss << "Invalid rank '" << role_str << "'";
+      return -EINVAL;
+    }
+
+    if (legacy_client_namespace == MDS_NAMESPACE_NONE) {
+      ss << "No filesystem selected";
+      return -ENOENT;
+    } else {
+      *role = mds_role_t(legacy_client_namespace, who_i);
+    }
+  }
+
+  // Now check that the role actually exists
+  if (get_filesystem(role->ns) == nullptr) {
+    ss << "Filesystem with ID '" << role->ns << "' not found";
+    return -ENOENT;
+  }
+
+  auto fs = get_filesystem(role->ns);
+  if (fs->mds_map.in.count(role->rank) == 0) {
+    ss << "Rank '" << role->rank << "' not found";
+    return -ENOENT;
+  }
+
+  return 0;
+}
+
