@@ -92,7 +92,7 @@ extern int get_json_str_map(
 extern int get_str_map(
     const std::string &str,
     std::map<std::string,std::string> *str_map,
-    const char *delims);
+    const char *delims = CONST_DELIMS);
 
 /**
  * Returns the value of **key** in **str_map** if available.

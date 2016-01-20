@@ -76,7 +76,7 @@ string trim(const string& str) {
 int get_str_map(
     const string &str,
     map<string,string> *str_map,
-    const char *delims = CONST_DELIMS)
+    const char *delims)
 {
   list<string> pairs;
   get_str_list(str, delims, pairs);
