@@ -324,7 +324,7 @@ int BlueFS::_open_super()
 {
   dout(10) << __func__ << dendl;
 
-  bufferlist bl, t;
+  bufferlist bl;
   uint32_t expected_crc, crc;
   int r;
 
