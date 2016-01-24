@@ -1631,6 +1631,7 @@ class Prepare(object):
             PrepareData.parser(),
         ]
         parents.extend(PrepareDefault.parent_parsers())
+        parents.extend(PrepareBluestore.parent_parsers())
         parser = subparsers.add_parser(
             'prepare',
             parents=parents,
@@ -1648,7 +1649,10 @@ class Prepare(object):
 
     @staticmethod
     def factory(args):
-        return PrepareDefault(args)
+        if args.bluestore:
+            return PrepareBluestore(args)
+        else:
+            return PrepareDefault(args)
 
     @staticmethod
     def main(args):
@@ -1671,6 +1675,31 @@ class PrepareDefault(Prepare):
         self.data.prepare(self.journal)
 
 
+class PrepareBluestore(Prepare):
+
+    def __init__(self, args):
+        self.data = PrepareBluestoreData(args)
+        self.block = PrepareBluestoreBlock(args)
+
+    @staticmethod
+    def parser():
+        parser = argparse.ArgumentParser(add_help=False)
+        parser.add_argument(
+            '--bluestore',
+            action='store_true', default=None,
+            help='bluestore objectstore',
+        )
+        return parser
+
+    @staticmethod
+    def parent_parsers():
+        return [
+            PrepareBluestore.parser(),
+            PrepareBluestoreBlock.parser(),
+        ]
+
+    def prepare_locked(self):
+        self.data.prepare(self.block)
 
 
 class PrepareSpace(object):
@@ -1960,6 +1989,28 @@ class PrepareJournal(PrepareSpace):
         return PrepareSpace.parser('journal')
 
 
+class PrepareBluestoreBlock(PrepareSpace):
+
+    def __init__(self, args):
+        self.name = 'block'
+        super(PrepareBluestoreBlock, self).__init__(args)
+
+    def get_space_size(self):
+        return get_conf_with_default(
+            cluster=self.args.cluster,
+            variable='bluestore_block_size',
+        )
+
+    def desired_partition_number(self):
+        if self.args.block == self.args.data:
+            num = 3
+        else:
+            num = 0
+        return num
+
+    @staticmethod
+    def parser():
+        return PrepareSpace.parser('block')
 
 
 class CryptHelpers(object):
@@ -2266,6 +2317,10 @@ class PrepareData(object):
                                 '--action=add',
                                 '--sysname-match',
                                 os.path.basename(partition.rawdev)])
+
+
+class PrepareBluestoreData(PrepareData):
+    pass
 
 
 def mkfs(
@@ -3154,7 +3209,7 @@ def main_destroy(args):
         zap(base_dev)
 
 
-def get_journal_osd_uuid(path):
+def get_space_osd_uuid(name, path):
     if not os.path.exists(path):
         raise Error('%s does not exist' % path)
 
@@ -3163,7 +3218,8 @@ def get_journal_osd_uuid(path):
         raise Error('%s is not a block device' % path)
 
     if (is_partition(path) and
-            get_partition_type(path) == PTYPE['mpath']['journal']['ready'] and
+            get_partition_type(path) in (PTYPE['mpath']['journal']['ready'],
+                                         PTYPE['mpath']['block']['ready']) and
             not is_mpath(path)):
         raise Error('%s is not a multipath block device' %
                     path)
@@ -3179,15 +3235,15 @@ def get_journal_osd_uuid(path):
         )
     except subprocess.CalledProcessError as e:
         raise Error(
-            'failed to get osd uuid/fsid from journal',
+            'failed to get osd uuid/fsid from %s' % name,
             e,
         )
     value = str(out).split('\n', 1)[0]
-    LOG.debug('Journal %s has OSD UUID %s', path, value)
+    LOG.debug('%s %s has OSD UUID %s', name.capitalize(), path, value)
     return value
 
 
-def main_activate_journal(args):
+def main_activate_space(name, args):
     if not os.path.exists(args.dev):
         raise Error('%s does not exist' % args.dev)
 
@@ -3205,7 +3261,7 @@ def main_activate_journal(args):
         # cyphertext or plaintext dev uuid!? Also, if the journal is
         # encrypted, is the data partition also always encrypted, or
         # are mixed pairs supported!?
-        osd_uuid = get_journal_osd_uuid(dev)
+        osd_uuid = get_space_osd_uuid(name, dev)
         path = os.path.join('/dev/disk/by-partuuid/', osd_uuid.lower())
 
         if is_suppressed(path):
@@ -3818,6 +3874,81 @@ def main_trigger(args):
             ]
         )
 
+    elif parttype in (PTYPE['regular']['block']['ready'],
+                      PTYPE['mpath']['block']['ready']):
+        command(
+            [
+                'ceph-disk',
+                'activate-block',
+                args.dev,
+            ]
+        )
+
+        # blocks are easy: map, chown, activate-block
+    elif parttype == PTYPE['plain']['block']['ready']:
+        command(
+            [
+                '/sbin/cryptsetup',
+                '--key-file',
+                '/etc/ceph/dmcrypt-keys/{partid}'.format(partid=partid),
+                '--key-size',
+                '256',
+                'create',
+                partid,
+                args.dev,
+            ]
+        )
+        newdev = '/dev/mapper/' + partid
+        count = 0
+        while not os.path.exists(newdev) and count <= 10:
+            time.sleep(1)
+            count += 1
+        command(
+            [
+                '/bin/chown',
+                'ceph:ceph',
+                newdev,
+            ]
+        )
+        command(
+            [
+                '/usr/sbin/ceph-disk',
+                'activate-block',
+                newdev,
+            ]
+        )
+    elif parttype == PTYPE['luks']['block']['ready']:
+        command(
+            [
+                '/sbin/cryptsetup',
+                '--key-file',
+                '/etc/ceph/dmcrypt-keys/{partid}.luks.key'.format(
+                    partid=partid),
+                'luksOpen',
+                args.dev,
+                partid,
+            ]
+        )
+        newdev = '/dev/mapper/' + partid
+        count = 0
+        while not os.path.exists(newdev) and count <= 10:
+            time.sleep(1)
+            count += 1
+        command(
+            [
+                '/bin/chown',
+                'ceph:ceph',
+                newdev,
+            ]
+        )
+        command(
+            [
+                '/usr/sbin/ceph-disk',
+                'activate-block',
+                newdev,
+            ]
+        )
+
         # osd data: map, activate
     elif parttype == PTYPE['plain']['osd']['ready']:
         command(
@@ -3949,6 +4080,7 @@ def parse_args(argv):
 
     Prepare.set_subparser(subparsers)
     make_activate_parser(subparsers)
+    make_activate_block_parser(subparsers)
     make_activate_journal_parser(subparsers)
     make_activate_all_parser(subparsers)
     make_list_parser(subparsers)
@@ -4037,49 +4169,55 @@ def make_activate_parser(subparsers):
     return activate_parser
 
 
+def make_activate_block_parser(subparsers):
+    return make_activate_space_parser('block', subparsers)
+
 def make_activate_journal_parser(subparsers):
-    activate_journal_parser = subparsers.add_parser(
-        'activate-journal',
-        help='Activate an OSD via its journal device')
-    activate_journal_parser.add_argument(
+    return make_activate_space_parser('journal', subparsers)
+
+def make_activate_space_parser(name, subparsers):
+    activate_space_parser = subparsers.add_parser(
+        'activate-%s' % name,
+        help='Activate an OSD via its %s device' % name)
+    activate_space_parser.add_argument(
         'dev',
         metavar='DEV',
-        help='path to journal block device',
+        help='path to %s block device' % name,
     )
-    activate_journal_parser.add_argument(
+    activate_space_parser.add_argument(
         '--activate-key',
         metavar='PATH',
         help='bootstrap-osd keyring path template (%(default)s)',
         dest='activate_key_template',
     )
-    activate_journal_parser.add_argument(
+    activate_space_parser.add_argument(
         '--mark-init',
         metavar='INITSYSTEM',
         help='init system to manage this dir',
         default='auto',
         choices=INIT_SYSTEMS,
     )
-    activate_journal_parser.add_argument(
+    activate_space_parser.add_argument(
         '--dmcrypt',
         action='store_true', default=None,
-        help='map DATA and/or JOURNAL devices with dm-crypt',
+        help='map data and/or auxiliariy (journal, etc.) devices with dm-crypt',
     )
-    activate_journal_parser.add_argument(
+    activate_space_parser.add_argument(
         '--dmcrypt-key-dir',
         metavar='KEYDIR',
         default='/etc/ceph/dmcrypt-keys',
         help='directory where dm-crypt keys are stored',
     )
-    activate_journal_parser.add_argument(
+    activate_space_parser.add_argument(
         '--reactivate',
         action='store_true', default=False,
         help='activate the deactived OSD',
     )
-    activate_journal_parser.set_defaults(
+    activate_space_parser.set_defaults(
         activate_key_template='{statedir}/bootstrap-osd/{cluster}.keyring',
-        func=main_activate_journal,
+        func=lambda args: main_activate_space(name, args),
     )
-    return activate_journal_parser
+    return activate_space_parser
 
 
 def make_activate_all_parser(subparsers):
