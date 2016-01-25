@@ -132,6 +132,24 @@ public:
     }
   }
 
+  FSMap &operator=(const FSMap &rhs)
+  {
+    epoch = rhs.epoch;
+    next_filesystem_id = rhs.next_filesystem_id;
+    legacy_client_namespace = rhs.legacy_client_namespace;
+    compat = rhs.compat;
+    mds_roles = rhs.mds_roles;
+    standby_daemons = rhs.standby_daemons;
+    standby_epochs = rhs.standby_epochs;
+
+    for (auto &i : rhs.filesystems) {
+      auto fs = i.second;
+      filesystems[fs->ns] = std::make_shared<Filesystem>(*fs);
+    }
+
+    return *this;
+  }
+
   const CompatSet &get_compat() const {return compat;}
 
   /**
