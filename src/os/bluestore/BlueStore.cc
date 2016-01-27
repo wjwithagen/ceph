@@ -6040,6 +6040,8 @@ int BlueStore::_clone(TransContext *txc,
       goto out;
 
     r = _do_write(txc, c, newo, 0, oldo->onode.size, bl, 0);
+    if (r < 0)
+      goto out;
   }
 
   // attrs
