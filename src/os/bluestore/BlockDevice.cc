@@ -428,7 +428,6 @@ int BlockDevice::aio_write(
     }
   }
 
-  _aio_log_finish(ioc, off, bl.length());
   io_since_flush.set(1);
   return 0;
 }
@@ -452,6 +451,7 @@ int BlockDevice::aio_zero(
     len -= t.length();
     bl.claim_append(t);
   }
+  bufferlist foo;
   // note: this works with aio only becaues the actual buffer is
   // this->zeros, which is page-aligned and never freed.
   return aio_write(off, bl, ioc, false);
