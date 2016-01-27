@@ -348,9 +348,9 @@ bool MDSMonitor::preprocess_beacon(MonOpRequestRef op)
   {
     mds_namespace_t ns = pending_fsmap.mds_roles.at(gid);
     if (ns == MDS_NAMESPACE_NONE) {
-      effective_epoch = fsmap.standby_epochs.at(gid);
+      effective_epoch = pending_fsmap.standby_epochs.at(gid);
     } else {
-      effective_epoch = fsmap.get_filesystem(ns)->mds_map.epoch;
+      effective_epoch = pending_fsmap.get_filesystem(ns)->mds_map.epoch;
     }
     if (effective_epoch != m->get_last_epoch_seen()) {
       dout(10) << "mds_beacon " << *m
