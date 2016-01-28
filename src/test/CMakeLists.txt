@@ -1280,16 +1280,7 @@ add_subdirectory(erasure-code)
 add_ceph_test(test-erasure-code.sh ${CMAKE_SOURCE_DIR}/src/test/erasure-code/test-erasure-code.sh)
 add_ceph_test(test-erasure-eio.sh ${CMAKE_SOURCE_DIR}/src/test/erasure-code/test-erasure-eio.sh)
 
-# fs directory
 add_subdirectory(fs)
-
-# unittest_mds_types
-add_executable(unittest_mds_types EXCLUDE_FROM_ALL
-  fs/mds_types.cc
-  $<TARGET_OBJECTS:heap_profiler_objs>
-  )
-add_ceph_unittest(unittest_mds_types ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/unittest_mds_types)
-target_link_libraries(unittest_mds_types global)
 
 #libradosstriper directory
 add_subdirectory(libradosstriper)
