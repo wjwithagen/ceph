@@ -1281,11 +1281,7 @@ add_ceph_test(test-erasure-code.sh ${CMAKE_SOURCE_DIR}/src/test/erasure-code/tes
 add_ceph_test(test-erasure-eio.sh ${CMAKE_SOURCE_DIR}/src/test/erasure-code/test-erasure-eio.sh)
 
 add_subdirectory(fs)
-
-#libradosstriper directory
 add_subdirectory(libradosstriper)
-add_ceph_test(rados-striper.sh ${CMAKE_SOURCE_DIR}/src/test/libradosstriper/rados-striper.sh)
-
 add_subdirectory(librados)
 
 #mds directory
