@@ -2660,6 +2660,20 @@ void FileStore::_do_transaction(
       }
       break;
 
+    case Transaction::OP_TRY_COLL_MOVE_RENAME:
+      {
+        coll_t oldcid = i.get_cid(op->cid);
+        ghobject_t oldoid = i.get_oid(op->oid);
+        coll_t newcid = i.get_cid(op->dest_cid);
+        ghobject_t newoid = i.get_oid(op->dest_oid);
+	_kludge_temp_object_collection(oldcid, oldoid);
+	_kludge_temp_object_collection(newcid, newoid);
+        tracepoint(objectstore, coll_move_rename_enter);
+        r = _collection_move_rename(oldcid, oldoid, newcid, newoid, spos, true);
+        tracepoint(objectstore, coll_move_rename_exit, r);
+      }
+      break;
+
     case Transaction::OP_COLL_SETATTR:
       {
         coll_t cid = i.get_cid(op->cid);
@@ -5090,7 +5104,8 @@ int FileStore::_collection_add(coll_t c, coll_t oldcid, const ghobject_t& o,
 
 int FileStore::_collection_move_rename(coll_t oldcid, const ghobject_t& oldoid,
 				       coll_t c, const ghobject_t& o,
-				       const SequencerPosition& spos)
+				       const SequencerPosition& spos,
+				       bool allow_enoent)
 {
   dout(15) << __func__ << " " << c << "/" << o << " from " << oldcid << "/" << oldoid << dendl;
   int r = 0;
@@ -5122,9 +5137,16 @@ int FileStore::_collection_move_rename(coll_t oldcid, const ghobject_t& oldoid,
     if (r < 0) {
       // the source collection/object does not exist. If we are replaying, we
       // should be safe, so just return 0 and move on.
-      assert(replaying);
-      dout(10) << __func__ << " " << c << "/" << o << " from "
-	       << oldcid << "/" << oldoid << " (dne, continue replay) " << dendl;
+      if (replaying) {
+	dout(10) << __func__ << " " << c << "/" << o << " from "
+		 << oldcid << "/" << oldoid << " (dne, continue replay) " << dendl;
+      } else if (allow_enoent) {
+	dout(10) << __func__ << " " << c << "/" << o << " from "
+		 << oldcid << "/" << oldoid << " (dne, ignoring enoent)"
+		 << dendl;
+      } else {
+	assert(0 == "ERROR: source must exist");
+      }
       return 0;
     }
     if (dstcmp > 0) {      // if dstcmp == 0 the guard already says "in-progress"
