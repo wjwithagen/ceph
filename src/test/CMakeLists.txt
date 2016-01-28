@@ -1286,29 +1286,7 @@ add_subdirectory(fs)
 add_subdirectory(libradosstriper)
 add_ceph_test(rados-striper.sh ${CMAKE_SOURCE_DIR}/src/test/libradosstriper/rados-striper.sh)
 
-
-#libradosdirectory
 add_subdirectory(librados)
-# unittest_librados
-add_executable(unittest_librados EXCLUDE_FROM_ALL
-  librados/librados.cc
-  $<TARGET_OBJECTS:heap_profiler_objs>
-  )
-add_ceph_unittest(unittest_librados ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/unittest_librados)
-target_link_libraries(unittest_librados librados global ${BLKID_LIBRARIES})
-
-# unittest_librados_config
-set(unittest_librados_config_srcs librados/librados_config.cc)
-add_executable(unittest_librados_config EXCLUDE_FROM_ALL
-  ${unittest_librados_config_srcs}
-  $<TARGET_OBJECTS:heap_profiler_objs>
-  )
-add_ceph_unittest(unittest_librados_config ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/unittest_librados_config)
-target_link_libraries(unittest_librados_config
-  librados
-  global
-  ${BLKID_LIBRARIES}
-  )
 
 #mds directory
 add_subdirectory(mds)
