@@ -43,6 +43,7 @@
  protected:
    ObjectStore *store;
    const coll_t coll;
+   ObjectStore::CollectionHandle &ch;
  public:	
    /**
     * Provides interfaces for PGBackend callbacks
@@ -104,11 +105,11 @@
 
      virtual void send_message(int to_osd, Message *m) = 0;
      virtual void queue_transaction(
-       ObjectStore::Transaction *t,
+       ObjectStore::Transaction&& t,
        OpRequestRef op = OpRequestRef()
        ) = 0;
      virtual void queue_transactions(
-       list<ObjectStore::Transaction*>& tls,
+       vector<ObjectStore::Transaction>& tls,
        OpRequestRef op = OpRequestRef()
        ) = 0;
      virtual epoch_t get_epoch() const = 0;
@@ -180,7 +181,7 @@
        const eversion_t &trim_to,
        const eversion_t &trim_rollback_to,
        bool transaction_applied,
-       ObjectStore::Transaction *t) = 0;
+       ObjectStore::Transaction &t) = 0;
 
      virtual void update_peer_last_complete_ondisk(
        pg_shard_t fromosd,
@@ -232,9 +233,11 @@
    };
    Listener *parent;
    Listener *get_parent() const { return parent; }
-   PGBackend(Listener *l, ObjectStore *store, coll_t coll) :
+   PGBackend(Listener *l, ObjectStore *store, coll_t coll,
+	     ObjectStore::CollectionHandle &ch) :
      store(store),
      coll(coll),
+     ch(ch),
      parent(l) {}
    bool is_primary() const { return get_parent()->pgb_is_primary(); }
    OSDMapRef get_osdmap() const { return get_parent()->pgb_get_osdmap(); }
@@ -464,6 +467,8 @@
      virtual uint64_t get_bytes_written() const = 0;
      virtual ~PGTransaction() {}
    };
+   using PGTransactionUPtr = std::unique_ptr<PGTransaction>;
+
    /// Get implementation specific empty transaction
    virtual PGTransaction *get_transaction() = 0;
 
@@ -471,7 +476,7 @@
    virtual void submit_transaction(
      const hobject_t &hoid,               ///< [in] object
      const eversion_t &at_version,        ///< [in] version
-     PGTransaction *t,                    ///< [in] trans to execute
+     PGTransactionUPtr &&t,               ///< [in] trans to execute (move)
      const eversion_t &trim_to,           ///< [in] trim log to here
      const eversion_t &trim_rollback_to,  ///< [in] trim rollback info to here
      const vector<pg_log_entry_t> &log_entries, ///< [in] log entries for t
@@ -485,6 +490,11 @@
      OpRequestRef op                      ///< [in] op
      ) = 0;
 
+
+   void try_stash(
+     const hobject_t &hoid,
+     version_t v,
+     ObjectStore::Transaction *t);
 
    void rollback(
      const hobject_t &hoid,
@@ -505,6 +515,12 @@
 
    /// Unstash object to rollback stash
    void rollback_stash(
+     const hobject_t &hoid,
+     version_t old_version,
+     ObjectStore::Transaction *t);
+
+   /// Unstash object to rollback stash
+   void rollback_try_stash(
      const hobject_t &hoid,
      version_t old_version,
      ObjectStore::Transaction *t);
@@ -599,6 +615,7 @@
      const OSDMapRef curmap,
      Listener *l,
      coll_t coll,
+     ObjectStore::CollectionHandle &ch,
      ObjectStore *store,
      CephContext *cct);
  };

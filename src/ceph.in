@@ -19,6 +19,7 @@ License version 2, as published by the Free Software
 Foundation.  See file COPYING.
 """
 
+import codecs
 import os
 import sys
 import platform
@@ -108,6 +109,12 @@ from ceph_daemon import DaemonWatcher, admin_socket
 
 verbose = False
 cluster_handle = None
+
+# Always use Unicode (UTF-8) for stdout
+raw_stdout = sys.__stdout__
+raw_stderr = sys.__stderr__
+sys.stdout = codecs.getwriter('utf-8')(raw_stdout)
+sys.stderr = codecs.getwriter('utf-8')(raw_stderr)
 
 ############################################################################
 
@@ -711,6 +718,10 @@ def main():
     except KeyboardInterrupt:
         print >> sys.stderr, 'Cluster connection aborted'
         return 1
+    except rados.PermissionDeniedError as e:
+        print >> sys.stderr, 'Error connecting to cluster: {0}'.\
+            format(e.__class__.__name__)
+        return errno.EACCES
     except Exception as e:
         print >> sys.stderr, 'Error connecting to cluster: {0}'.\
             format(e.__class__.__name__)
@@ -803,9 +814,8 @@ def main():
             childargs = injectargs
         if not len(childargs):
             print >> sys.stderr, \
-                'Cannot use \'tell\' with interactive mode.', \
-                'For an interactive shell,', \
-                'please start "{0}" without non-option arguments.'.format(sys.argv[0])
+                '"{0} tell" requires additional arguments.'.format(sys.argv[0]), \
+                'Try "{0} tell <name> <command> [options...]" instead.'.format(sys.argv[0])
             return errno.EINVAL
 
     # fetch JSON sigs from command
@@ -888,6 +898,8 @@ def main():
             if outs:
                 print >> sys.stderr, prefix + outs
 
+        sys.stdout.flush()
+
         if (parsed_args.output_file):
             outf.write(outbuf)
         else:
@@ -898,13 +910,20 @@ def main():
             if parsed_args.output_format and \
                parsed_args.output_format.startswith('json') and \
                not compat:
-                sys.stdout.write('\n')
+                raw_stdout.write('\n')
 
             # if we are prettifying things, normalize newlines.  sigh.
             if suffix != '':
                 outbuf = outbuf.rstrip()
             if outbuf != '':
-                sys.stdout.write(prefix + outbuf + suffix)
+                try:
+                    # Write directly to binary stdout
+                    raw_stdout.write(prefix)
+                    raw_stdout.write(outbuf)
+                    raw_stdout.write(suffix)
+                except IOError as e:
+                    if e.errno != errno.EPIPE:
+                        raise e
 
         sys.stdout.flush()
 

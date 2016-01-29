@@ -934,6 +934,7 @@ int SyntheticClient::start_thread()
 
   pthread_create(&thread_id, NULL, synthetic_client_thread_entry, this);
   assert(thread_id);
+  pthread_setname_np(thread_id, "client");
   return 0;
 }
 
@@ -1347,7 +1348,7 @@ int SyntheticClient::play_trace(Trace& t, string& prefix, bool metadata_only)
       dir_result_t *dirp;
       if (ll_inos.count(i)) {
 	i1 = client->ll_get_inode(vinodeno_t(ll_inos[i],CEPH_NOSNAP));
-	if (client->ll_opendir(i1, &dirp) == 0)
+	if (client->ll_opendir(i1, O_RDONLY, &dirp) == 0)
 	  ll_dirs[r] = dirp;
 	client->ll_put(i1);
       }
@@ -1441,7 +1442,7 @@ int SyntheticClient::play_trace(Trace& t, string& prefix, bool metadata_only)
       lock.Lock();
       object_locator_t oloc(SYNCLIENT_FIRST_POOL);
       uint64_t size;
-      utime_t mtime;
+      ceph::real_time mtime;
       client->objecter->stat(oid, oloc, CEPH_NOSNAP, &size, &mtime, 0, new C_SafeCond(&lock, &cond, &ack));
       while (!ack) cond.Wait(lock);
       lock.Unlock();
@@ -1471,7 +1472,8 @@ int SyntheticClient::play_trace(Trace& t, string& prefix, bool metadata_only)
       bufferlist bl;
       bl.push_back(bp);
       SnapContext snapc;
-      client->objecter->write(oid, oloc, off, len, snapc, bl, ceph_clock_now(client->cct), 0,
+      client->objecter->write(oid, oloc, off, len, snapc, bl,
+			      ceph::real_clock::now(client->cct), 0,
 			      new C_SafeCond(&lock, &cond, &ack),
 			      safeg.new_sub());
       safeg.activate();
@@ -1487,7 +1489,8 @@ int SyntheticClient::play_trace(Trace& t, string& prefix, bool metadata_only)
       object_locator_t oloc(SYNCLIENT_FIRST_POOL);
       lock.Lock();
       SnapContext snapc;
-      client->objecter->zero(oid, oloc, off, len, snapc, ceph_clock_now(client->cct), 0,
+      client->objecter->zero(oid, oloc, off, len, snapc,
+			     ceph::real_clock::now(client->cct), 0,
 			     new C_SafeCond(&lock, &cond, &ack),
 			     safeg.new_sub());
       safeg.activate();
@@ -1636,7 +1639,7 @@ int SyntheticClient::full_walk(string& basedir)
 	actual.nsubdirs++;
       else
 	actual.nfiles++;
-      
+
       // print
       char *tm = ctime(&st.st_mtime);
       tm[strlen(tm)-1] = 0;
@@ -2264,10 +2267,11 @@ int SyntheticClient::create_objects(int nobj, int osize, int inflight)
       dout(6) << "create_objects " << i << "/" << (nobj+1) << dendl;
     }
     dout(10) << "writing " << oid << dendl;
-    
+
     starts.push_back(ceph_clock_now(client->cct));
     client->client_lock.Lock();
-    client->objecter->write(oid, oloc, 0, osize, snapc, bl, ceph_clock_now(client->cct), 0,
+    client->objecter->write(oid, oloc, 0, osize, snapc, bl,
+			    ceph::real_clock::now(client->cct), 0,
 			    new C_Ref(lock, cond, &unack),
 			    new C_Ref(lock, cond, &unsafe));
     client->client_lock.Unlock();
@@ -2370,7 +2374,8 @@ int SyntheticClient::object_rw(int nobj, int osize, int wrpc,
       op.op.extent.length = osize;
       op.indata = bl;
       m.ops.push_back(op);
-      client->objecter->mutate(oid, oloc, m, snapc, ceph_clock_now(client->cct), 0,
+      client->objecter->mutate(oid, oloc, m, snapc,
+			       ceph::real_clock::now(client->cct), 0,
 			       NULL, new C_Ref(lock, cond, &unack));
     } else {
       dout(10) << "read from " << oid << dendl;

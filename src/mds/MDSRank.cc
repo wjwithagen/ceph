@@ -19,8 +19,6 @@
 #include "messages/MMDSMap.h"
 
 #include "MDSMap.h"
-//#include "MDS.h"
-#include "mds_table_types.h"
 #include "SnapClient.h"
 #include "SnapServer.h"
 #include "MDBalancer.h"
@@ -30,6 +28,7 @@
 #include "InoTable.h"
 #include "mon/MonClient.h"
 #include "common/HeartbeatMap.h"
+#include "ScrubStack.h"
 
 
 #include "MDSRank.h"
@@ -56,7 +55,8 @@ MDSRank::MDSRank(
     mdsmap(mdsmap_),
     objecter(objecter_),
     server(NULL), mdcache(NULL), locker(NULL), mdlog(NULL),
-    balancer(NULL), inotable(NULL), snapserver(NULL), snapclient(NULL),
+    balancer(NULL), scrubstack(NULL),
+    inotable(NULL), snapserver(NULL), snapclient(NULL),
     sessionmap(this), logger(NULL), mlogger(NULL),
     op_tracker(g_ceph_context, g_conf->mds_enable_op_tracker, 
                g_conf->osd_num_op_tracker_shard),
@@ -79,6 +79,8 @@ MDSRank::MDSRank(
   mdlog = new MDLog(this);
   balancer = new MDBalancer(this, messenger, monc);
 
+  scrubstack = new ScrubStack(mdcache, finisher);
+
   inotable = new InoTable(this);
   snapserver = new SnapServer(this, monc);
   snapclient = new SnapClient(this);
@@ -98,6 +100,7 @@ MDSRank::~MDSRank()
     g_ceph_context->get_heartbeat_map()->remove_worker(hb);
   }
 
+  if (scrubstack) { delete scrubstack; scrubstack = NULL; }
   if (mdcache) { delete mdcache; mdcache = NULL; }
   if (mdlog) { delete mdlog; mdlog = NULL; }
   if (balancer) { delete balancer; balancer = NULL; }
@@ -139,7 +142,7 @@ void MDSRankDispatcher::init()
   // who is interested in it.
   handle_osd_map();
 
-  progress_thread.create();
+  progress_thread.create("mds_rank_progr");
 
   finisher->start();
 }
@@ -1233,6 +1236,19 @@ void MDSRank::clientreplay_start()
   queue_one_replay();
 }
 
+bool MDSRank::queue_one_replay()
+{
+  if (replay_queue.empty()) {
+    if (mdcache->get_num_client_requests() == 0) {
+      clientreplay_done();
+    }
+    return false;
+  }
+  queue_waiter(replay_queue.front());
+  replay_queue.pop_front();
+  return true;
+}
+
 void MDSRank::clientreplay_done()
 {
   dout(1) << "clientreplay_done" << dendl;
@@ -1651,12 +1667,14 @@ bool MDSRankDispatcher::handle_asok_command(
 {
   if (command == "dump_ops_in_flight" ||
              command == "ops") {
+    RWLock::RLocker l(op_tracker.lock);
     if (!op_tracker.tracking_enabled) {
       ss << "op_tracker tracking is not enabled";
     } else {
       op_tracker.dump_ops_in_flight(f);
     }
   } else if (command == "dump_historic_ops") {
+    RWLock::RLocker l(op_tracker.lock);
     if (!op_tracker.tracking_enabled) {
       ss << "op_tracker tracking is not enabled";
     } else {
@@ -1712,6 +1730,12 @@ bool MDSRankDispatcher::handle_asok_command(
     string path;
     cmd_getval(g_ceph_context, cmdmap, "path", path);
     command_scrub_path(f, path);
+  } else if (command == "tag path") {
+    string path;
+    cmd_getval(g_ceph_context, cmdmap, "path", path);
+    string tag;
+    cmd_getval(g_ceph_context, cmdmap, "tag", tag);
+    command_tag_path(f, path, tag);
   } else if (command == "flush_path") {
     string path;
     cmd_getval(g_ceph_context, cmdmap, "path", path);
@@ -1784,7 +1808,13 @@ std::vector<entity_name_t> MDSRankDispatcher::evict_sessions(
     }
   }
 
+  dout(20) << __func__ << " matched " << victims.size() << " sessions" << dendl;
+
   std::vector<entity_name_t> result;
+
+  if (victims.empty()) {
+    return result;
+  }
 
   C_SaferCond on_safe;
   C_GatherBuilder gather(g_ceph_context, &on_safe);
@@ -1849,6 +1879,17 @@ void MDSRank::command_scrub_path(Formatter *f, const string& path)
   }
   scond.wait();
   // scrub_dentry() finishers will dump the data for us; we're done!
+}
+
+void MDSRank::command_tag_path(Formatter *f,
+    const string& path, const std::string &tag)
+{
+  C_SaferCond scond;
+  {
+    Mutex::Locker l(mds_lock);
+    mdcache->enqueue_scrub(path, tag, f, &scond);
+  }
+  scond.wait();
 }
 
 void MDSRank::command_flush_path(Formatter *f, const string& path)
@@ -2206,6 +2247,30 @@ bool MDSRank::command_dirfrag_ls(
   f->close_section();
 
   return true;
+}
+
+void MDSRank::dump_status(Formatter *f) const
+{
+  if (state == MDSMap::STATE_REPLAY ||
+      state == MDSMap::STATE_STANDBY_REPLAY) {
+    mdlog->dump_replay_status(f);
+  } else if (state == MDSMap::STATE_RESOLVE) {
+    mdcache->dump_resolve_status(f);
+  } else if (state == MDSMap::STATE_RECONNECT) {
+    server->dump_reconnect_status(f);
+  } else if (state == MDSMap::STATE_REJOIN) {
+    mdcache->dump_rejoin_status(f);
+  } else if (state == MDSMap::STATE_CLIENTREPLAY) {
+    dump_clientreplay_status(f);
+  }
+}
+
+void MDSRank::dump_clientreplay_status(Formatter *f) const
+{
+  f->open_object_section("clientreplay_status");
+  f->dump_unsigned("clientreplay_queue", replay_queue.size());
+  f->dump_unsigned("active_replay", mdcache->get_num_client_requests());
+  f->close_section();
 }
 
 void MDSRankDispatcher::update_log_config()

@@ -50,18 +50,10 @@ bin_SCRIPTS += \
 	rbd-replay-many \
         rbdmap
 
-python_PYTHON += pybind/rbd.py
-
 libkrbd_la_SOURCES = krbd.cc
 libkrbd_la_LIBADD = $(LIBSECRET) $(LIBCOMMON) -lblkid -ludev
 if LINUX
 noinst_LTLIBRARIES += libkrbd.la
-endif # LINUX
-
-rbd_SOURCES = rbd.cc
-rbd_LDADD = $(LIBKRBD) $(LIBRBD) $(LIBRADOS) $(CEPH_GLOBAL)
-if LINUX
-bin_PROGRAMS += rbd
 endif # LINUX
 
 endif # WITH_RBD
@@ -88,6 +80,7 @@ cephfs_LDADD = $(LIBCOMMON)
 bin_PROGRAMS += cephfs
 
 python_PYTHON += pybind/cephfs.py
+python_PYTHON += pybind/ceph_volume_client.py
 
 # libcephfs (this should go somewhere else in the future)
 

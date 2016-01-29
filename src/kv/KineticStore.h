@@ -4,7 +4,7 @@
 #define KINETIC_STORE_H
 
 #include "include/types.h"
-#include "include/buffer.h"
+#include "include/buffer_fwd.h"
 #include "KeyValueDB.h"
 #include <set>
 #include <map>
@@ -106,6 +106,7 @@ public:
     const std::set<string> &key,
     std::map<string, bufferlist> *out
     );
+  using KeyValueDB::get;
 
   class KineticWholeSpaceIteratorImpl :
     public KeyValueDB::WholeSpaceIteratorImpl {
@@ -137,7 +138,7 @@ public:
 
   /// Utility
   static string combine_strings(const string &prefix, const string &value);
-  static int split_key(string in_prefix, string *prefix, string *key);
+  static int split_key(string &in_prefix, string *prefix, string *key);
   static bufferlist to_bufferlist(const kinetic::KineticRecord &record);
   virtual uint64_t get_estimated_size(map<string,uint64_t> &extra) {
     // not used by the osd

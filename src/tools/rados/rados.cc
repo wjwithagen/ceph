@@ -27,6 +27,7 @@ using namespace libradosstriper;
 #include "common/errno.h"
 #include "common/Formatter.h"
 #include "common/obj_bencher.h"
+#include "include/stringify.h"
 #include "mds/inode_backtrace.h"
 #include "auth/Crypto.h"
 #include <iostream>
@@ -84,7 +85,7 @@ void usage(ostream& out)
 "   put <obj-name> [infile]          write object\n"
 "   truncate <obj-name> length       truncate object\n"
 "   create <obj-name>                create object\n"
-"   rm <obj-name> ...                remove object(s)\n"
+"   rm <obj-name> ...[--force-full]  [force no matter full or not]remove object(s)\n"
 "   cp <obj-name> [target-obj]       copy object\n"
 "   clonedata <src-obj> <dst-obj>    clone object data\n"
 "   listxattr <obj-name>\n"
@@ -159,6 +160,10 @@ void usage(ostream& out)
 "        select target pool by name\n"
 "   -b op_size\n"
 "        set the block size for put/get ops and for write benchmarking\n"
+"   -o object_size\n"
+"        set the object size for put/get ops and for write benchmarking\n"
+"   --max-objects\n"
+"        set the max number of objects for write benchmarking\n"
 "   -s name\n"
 "   --snap name\n"
 "        select given snap name for (read) IO\n"
@@ -864,25 +869,29 @@ protected:
     completions[slot] = 0;
   }
 
-  int aio_read(const std::string& oid, int slot, bufferlist *pbl, size_t len) {
+  int aio_read(const std::string& oid, int slot, bufferlist *pbl, size_t len,
+	       size_t offset) {
     return io_ctx.aio_read(oid, completions[slot], pbl, len, 0);
   }
 
-  int aio_write(const std::string& oid, int slot, bufferlist& bl, size_t len) {
+  int aio_write(const std::string& oid, int slot, bufferlist& bl, size_t len,
+		size_t offset) {
     librados::ObjectWriteOperation op;
 
     if (write_destination & OP_WRITE_DEST_OBJ) {
-      op.write(0, bl);
+      op.write(offset, bl);
     }
 
     if (write_destination & OP_WRITE_DEST_OMAP) {
       std::map<std::string, librados::bufferlist> omap;
-      omap["bench-omap-key"] = bl;
+      omap[string("bench-omap-key-") + stringify(offset)] = bl;
       op.omap_set(omap);
     }
 
     if (write_destination & OP_WRITE_DEST_XATTR) {
-      op.setxattr("bench-xattr-key", bl);
+      char key[80];
+      snprintf(key, sizeof(key), "bench-xattr-key-%d", (int)offset);
+      op.setxattr(key, bl);
     }
 
     return io_ctx.aio_operate(oid, completions[slot], &op);
@@ -1214,6 +1223,8 @@ static int rados_tool_common(const std::map < std::string, std::string > &opts,
   string oloc, target_oloc, nspace, target_nspace;
   int concurrent_ios = 16;
   unsigned op_size = default_op_size;
+  unsigned object_size = 0;
+  unsigned max_objects = 0;
   bool block_size_specified = false;
   int bench_write_dest = 0;
   bool cleanup = true;
@@ -1239,7 +1250,7 @@ static int rados_tool_common(const std::map < std::string, std::string > &opts,
 
   std::string run_name;
   std::string prefix;
-
+  bool forcefull = false;
   Formatter *formatter = NULL;
   bool pretty_format = false;
   const char *output = NULL;
@@ -1282,6 +1293,11 @@ static int rados_tool_common(const std::map < std::string, std::string > &opts,
   if (i != opts.end()) {
     run_name = i->second;
   }
+
+  i = opts.find("force-full");
+  if (i != opts.end()) {
+    forcefull = true;
+  }
   i = opts.find("prefix");
   if (i != opts.end()) {
     prefix = i->second;
@@ -1292,6 +1308,19 @@ static int rados_tool_common(const std::map < std::string, std::string > &opts,
       return -EINVAL;
     }
     block_size_specified = true;
+  }
+  i = opts.find("object-size");
+  if (i != opts.end()) {
+    if (rados_sistrtoll(i, &object_size)) {
+      return -EINVAL;
+    }
+    block_size_specified = true;
+  }
+  i = opts.find("max-objects");
+  if (i != opts.end()) {
+    if (rados_sistrtoll(i, &max_objects)) {
+      return -EINVAL;
+    }
   }
   i = opts.find("snap");
   if (i != opts.end()) {
@@ -1450,14 +1479,31 @@ static int rados_tool_common(const std::map < std::string, std::string > &opts,
       goto out;
     }
 
-    // align op_size
-    if (io_ctx.pool_requires_alignment()) {
-      const uint64_t align = io_ctx.pool_required_alignment();
-      const uint64_t prev_op_size = op_size;
-      op_size = uint64_t((op_size + align - 1) / align) * align;
-      // Warn: if user specified and it was rounded
-      if (prev_op_size != default_op_size && prev_op_size != op_size)
-	cerr << "INFO: op_size has been rounded to " << op_size << std::endl;
+   // align op_size
+   {
+      bool requires;
+      ret = io_ctx.pool_requires_alignment2(&requires);
+      if (ret < 0) {
+        cerr << "error checking pool alignment requirement"
+          << cpp_strerror(ret) << std::endl;
+        goto out;	
+      }
+
+      if (requires) {
+        uint64_t align = 0;
+        ret = io_ctx.pool_required_alignment2(&align);
+        if (ret < 0) {
+          cerr << "error getting pool alignment"
+            << cpp_strerror(ret) << std::endl;
+          goto out;	
+        }
+
+        const uint64_t prev_op_size = op_size;
+        op_size = uint64_t((op_size + align - 1) / align) * align;
+        // Warn: if user specified and it was rounded
+        if (prev_op_size != default_op_size && prev_op_size != op_size)
+          cerr << "INFO: op_size has been rounded to " << op_size << std::endl;
+      }
     }
 
     // create striper interface
@@ -1621,9 +1667,9 @@ static int rados_tool_common(const std::map < std::string, std::string > &opts,
 
     if (wildcard)
       io_ctx.set_namespace(all_nspaces);
-    bool stdout = (nargs.size() < 2) || (strcmp(nargs[1], "-") == 0);
+    bool use_stdout = (nargs.size() < 2) || (strcmp(nargs[1], "-") == 0);
     ostream *outstream;
-    if(stdout)
+    if(use_stdout)
       outstream = &cout;
     else
       outstream = new ofstream(nargs[1]);
@@ -1975,11 +2021,11 @@ static int rados_tool_common(const std::map < std::string, std::string > &opts,
     }
 
     if (values.size() && values.begin()->first == key) {
-      cout << " (length " << values.begin()->second.length() << ") : ";
       if (!outfile.empty()) {
 	cerr << "Writing to " << outfile << std::endl;
 	dump_data(outfile, values.begin()->second);
       } else {
+        cout << "value (" << values.begin()->second.length() << " bytes) :\n";
 	values.begin()->second.hexdump(cout);
 	cout << std::endl;
       }
@@ -2029,7 +2075,7 @@ static int rados_tool_common(const std::map < std::string, std::string > &opts,
 	// dump key in hex if it contains nonprintable characters
 	if (std::count_if(it->first.begin(), it->first.end(),
 	    (int (*)(int))isprint) < (int)it->first.length()) {
-	  cout << "key: (" << it->first.length() << " bytes):\n";
+	  cout << "key (" << it->first.length() << " bytes):\n";
 	  bufferlist keybl;
 	  keybl.append(it->first);
 	  keybl.hexdump(cout);
@@ -2037,7 +2083,7 @@ static int rados_tool_common(const std::map < std::string, std::string > &opts,
 	  cout << it->first;
 	}
 	cout << std::endl;
-	cout << "value: (" << it->second.length() << " bytes) :\n";
+	cout << "value (" << it->second.length() << " bytes) :\n";
 	it->second.hexdump(cout);
 	cout << std::endl;
       }
@@ -2144,9 +2190,17 @@ static int rados_tool_common(const std::map < std::string, std::string > &opts,
     for (; iter != nargs.end(); ++iter) {
       const string & oid = *iter;
       if (use_striper) {
-	ret = striper.remove(oid);
+	if (forcefull) {
+	  ret = striper.remove(oid, CEPH_OSD_FLAG_FULL_FORCE);
+	} else {
+	  ret = striper.remove(oid);
+	}
       } else {
-	ret = io_ctx.remove(oid);
+	if (forcefull) {
+	  ret = io_ctx.remove(oid, CEPH_OSD_FLAG_FULL_FORCE);
+	} else {
+	  ret = io_ctx.remove(oid);
+	}
       }
       if (ret < 0) {
         string name = (nspace.size() ? nspace + "/" : "" ) + oid;
@@ -2488,8 +2542,11 @@ static int rados_tool_common(const std::map < std::string, std::string > &opts,
         outstream = &cout;
       bencher.set_outstream(*outstream);
     }
+    if (!object_size)
+      object_size = op_size;
     ret = bencher.aio_bench(operation, seconds,
-			    concurrent_ios, op_size, cleanup, run_name, no_verify);
+			    concurrent_ios, op_size, object_size,
+			    max_objects, cleanup, run_name, no_verify);
     if (ret != 0)
       cerr << "error during benchmark: " << ret << std::endl;
     if (formatter && output)
@@ -2929,6 +2986,8 @@ int main(int argc, const char **argv)
       exit(0);
     } else if (ceph_argparse_flag(args, i, "-f", "--force", (char*)NULL)) {
       opts["force"] = "true";
+    } else if (ceph_argparse_flag(args, i, "--force-full", (char*)NULL)) {
+      opts["force-full"] = "true";
     } else if (ceph_argparse_flag(args, i, "-d", "--delete-after", (char*)NULL)) {
       opts["delete-after"] = "true";
     } else if (ceph_argparse_flag(args, i, "-C", "--create", "--create-pool",
@@ -2964,6 +3023,12 @@ int main(int argc, const char **argv)
       opts["block-size"] = val;
     } else if (ceph_argparse_witharg(args, i, &val, "-b", (char*)NULL)) {
       opts["block-size"] = val;
+    } else if (ceph_argparse_witharg(args, i, &val, "--object-size", (char*)NULL)) {
+      opts["object-size"] = val;
+    } else if (ceph_argparse_witharg(args, i, &val, "--max-objects", (char*)NULL)) {
+      opts["max-objects"] = val;
+    } else if (ceph_argparse_witharg(args, i, &val, "-o", (char*)NULL)) {
+      opts["object-size"] = val;
     } else if (ceph_argparse_witharg(args, i, &val, "-s", "--snap", (char*)NULL)) {
       opts["snap"] = val;
     } else if (ceph_argparse_witharg(args, i, &val, "-S", "--snapid", (char*)NULL)) {

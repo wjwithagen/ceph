@@ -107,6 +107,7 @@ class Objecter;
 class MonClient;
 class Finisher;
 class MMDSMap;
+class ScrubStack;
 
 /**
  * The public part of this class's interface is what's exposed to all
@@ -151,6 +152,7 @@ class MDSRank {
     Locker       *locker;
     MDLog        *mdlog;
     MDBalancer   *balancer;
+    ScrubStack   *scrubstack;
 
     InoTable     *inotable;
 
@@ -345,13 +347,7 @@ class MDSRank {
       replay_queue.push_back(c);
     }
 
-    bool queue_one_replay() {
-      if (replay_queue.empty())
-        return false;
-      queue_waiter(replay_queue.front());
-      replay_queue.pop_front();
-      return true;
-    }
+    bool queue_one_replay();
 
     void set_osd_epoch_barrier(epoch_t e);
     epoch_t get_osd_epoch_barrier() const {return osd_epoch_barrier;}
@@ -364,8 +360,13 @@ class MDSRank {
 
     int get_req_rate() { return logger->get(l_mds_request); }
 
+    void dump_status(Formatter *f) const;
+
   protected:
+    void dump_clientreplay_status(Formatter *f) const;
     void command_scrub_path(Formatter *f, const string& path);
+    void command_tag_path(Formatter *f, const string& path,
+                          const string &tag);
     void command_flush_path(Formatter *f, const string& path);
     void command_flush_journal(Formatter *f);
     void command_get_subtrees(Formatter *f);
@@ -386,7 +387,6 @@ class MDSRank {
     CDir *_command_dirfrag_get(
         const cmdmap_t &cmdmap,
         std::ostream &ss);
-    // <<<
 
   protected:
     Messenger    *messenger;

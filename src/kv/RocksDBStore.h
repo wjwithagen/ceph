@@ -4,7 +4,7 @@
 #define ROCKS_DB_STORE_H
 
 #include "include/types.h"
-#include "include/buffer.h"
+#include "include/buffer_fwd.h"
 #include "KeyValueDB.h"
 #include <set>
 #include <map>
@@ -38,14 +38,19 @@ enum {
 
 namespace rocksdb{
   class DB;
+  class Env;
   class Cache;
   class FilterPolicy;
   class Snapshot;
   class Slice;
   class WriteBatch;
   class Iterator;
+  class Logger;
   struct Options;
 }
+
+extern rocksdb::Logger *create_rocksdb_ceph_logger();
+
 /**
  * Uses RocksDB to implement the KeyValueDB interface
  */
@@ -53,7 +58,9 @@ class RocksDBStore : public KeyValueDB {
   CephContext *cct;
   PerfCounters *logger;
   string path;
+  void *priv;
   rocksdb::DB *db;
+  rocksdb::Env *env;
   string options_str;
   int do_open(ostream &out, bool create_if_missing);
 
@@ -104,11 +111,13 @@ public:
   }
   int get_info_log_level(string info_log_level);
 
-  RocksDBStore(CephContext *c, const string &path) :
+  RocksDBStore(CephContext *c, const string &path, void *p) :
     cct(c),
     logger(NULL),
     path(path),
+    priv(p),
     db(NULL),
+    env(static_cast<rocksdb::Env*>(p)),
     compact_queue_lock("RocksDBStore::compact_thread_lock"),
     compact_queue_stop(false),
     compact_thread(this),
@@ -124,9 +133,7 @@ public:
     return do_open(out, false);
   }
   /// Creates underlying db if missing and opens it
-  int create_and_open(ostream &out) {
-    return do_open(out, true);
-  }
+  int create_and_open(ostream &out);
 
   void close();
 
@@ -190,6 +197,7 @@ public:
     pair<string,string> raw_key();
     bool raw_key_is_prefixed(const string &prefix);
     bufferlist value();
+    bufferptr value_as_ptr();
     int status();
   };
 

@@ -6,6 +6,9 @@
 #include <string>
 #include <memory>
 #include <errno.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 
 #include "rocksdb/db.h"
 #include "rocksdb/table.h"
@@ -18,9 +21,50 @@
 using std::string;
 #include "common/perf_counters.h"
 #include "common/debug.h"
+#include "include/str_list.h"
 #include "include/str_map.h"
 #include "KeyValueDB.h"
 #include "RocksDBStore.h"
+
+#include "common/debug.h"
+
+#define dout_subsys ceph_subsys_rocksdb
+#undef dout_prefix
+#define dout_prefix *_dout << "rocksdb: "
+
+class CephRocksdbLogger : public rocksdb::Logger {
+  CephContext *cct;
+public:
+  CephRocksdbLogger(CephContext *c) : cct(c) {
+    cct->get();
+  }
+  ~CephRocksdbLogger() {
+    cct->put();
+  }
+
+  // Write an entry to the log file with the specified format.
+  void Logv(const char* format, va_list ap) {
+    Logv(rocksdb::INFO_LEVEL, format, ap);
+  }
+
+  // Write an entry to the log file with the specified log level
+  // and format.  Any log with level under the internal log level
+  // of *this (see @SetInfoLogLevel and @GetInfoLogLevel) will not be
+  // printed.
+  void Logv(const rocksdb::InfoLogLevel log_level, const char* format,
+	    va_list ap) {
+    int v = rocksdb::NUM_INFO_LOG_LEVELS - log_level - 1;
+    dout(v);
+    char buf[65536];
+    vsnprintf(buf, sizeof(buf), format, ap);
+    *_dout << buf << dendl;
+  }
+};
+
+rocksdb::Logger *create_rocksdb_ceph_logger()
+{
+  return new CephRocksdbLogger(g_ceph_context);
+}
 
 int string2bool(string val, bool &b_val)
 {
@@ -100,11 +144,31 @@ int RocksDBStore::init(string _options_str)
   options_str = _options_str;
   rocksdb::Options opt;
   //try parse options
-  int r = ParseOptionsFromString(options_str, opt); 
-  if (r != 0) {
-    return -EINVAL;
+  if (options_str.length()) {
+    int r = ParseOptionsFromString(options_str, opt);
+    if (r != 0) {
+      return -EINVAL;
+    }
   }
   return 0;
+}
+
+int RocksDBStore::create_and_open(ostream &out)
+{
+  if (env) {
+    unique_ptr<rocksdb::Directory> dir;
+    env->NewDirectory(path, &dir);
+  } else {
+    int r = ::mkdir(path.c_str(), 0755);
+    if (r < 0)
+      r = -errno;
+    if (r < 0 && r != -EEXIST) {
+      derr << __func__ << " failed to create " << path << ": " << cpp_strerror(r)
+	   << dendl;
+      return r;
+    }
+  }
+  return do_open(out, true);
 }
 
 int RocksDBStore::do_open(ostream &out, bool create_if_missing)
@@ -112,11 +176,47 @@ int RocksDBStore::do_open(ostream &out, bool create_if_missing)
   rocksdb::Options opt;
   rocksdb::Status status;
 
-  int r = ParseOptionsFromString(options_str, opt); 
-  if (r != 0) {
-    return -EINVAL;
+  if (options_str.length()) {
+    int r = ParseOptionsFromString(options_str, opt);
+    if (r != 0) {
+      return -EINVAL;
+    }
   }
   opt.create_if_missing = create_if_missing;
+  if (g_conf->rocksdb_separate_wal_dir) {
+    opt.wal_dir = path + ".wal";
+  }
+  if (g_conf->rocksdb_db_paths.length()) {
+    list<string> paths;
+    get_str_list(g_conf->rocksdb_db_paths, "; \t", paths);
+    for (auto& p : paths) {
+      size_t pos = p.find(',');
+      if (pos == std::string::npos) {
+	derr << __func__ << " invalid db path item " << p << " in "
+	     << g_conf->rocksdb_db_paths << dendl;
+	return -EINVAL;
+      }
+      string path = p.substr(0, pos);
+      string size_str = p.substr(pos + 1);
+      uint64_t size = atoll(size_str.c_str());
+      if (!size) {
+	derr << __func__ << " invalid db path item " << p << " in "
+	     << g_conf->rocksdb_db_paths << dendl;
+	return -EINVAL;
+      }
+      opt.db_paths.push_back(rocksdb::DbPath(path, size));
+      dout(10) << __func__ << " db_path " << path << " size " << size << dendl;
+    }
+  }
+
+  if (g_conf->rocksdb_log_to_ceph_log) {
+    opt.info_log.reset(new CephRocksdbLogger(g_ceph_context));
+  }
+
+  if (priv) {
+    dout(10) << __func__ << " using custom Env " << priv << dendl;
+    opt.env = static_cast<rocksdb::Env*>(priv);
+  }
 
   status = rocksdb::DB::Open(opt, path, &db);
   if (!status.ok()) {
@@ -162,6 +262,10 @@ RocksDBStore::~RocksDBStore()
 
   // Ensure db is destroyed before dependent db_cache and filterpolicy
   delete db;
+
+  if (priv) {
+    delete static_cast<rocksdb::Env*>(priv);
+  }
 }
 
 void RocksDBStore::close()
@@ -298,12 +402,13 @@ int RocksDBStore::get(
     const string &key,
     bufferlist *out)
 {
+  assert(out && (out->length() == 0));
   utime_t start = ceph_clock_now(g_ceph_context);
   int r = 0;
   KeyValueDB::Iterator it = get_iterator(prefix);
   it->lower_bound(key);
   if (it->valid() && it->key() == key) {
-    *out = it->value();
+    out->append(it->value_as_ptr());
   } else {
     r = -ENOENT;
   }
@@ -351,7 +456,8 @@ int RocksDBStore::split_key(rocksdb::Slice in, string *prefix, string *key)
 void RocksDBStore::compact()
 {
   logger->inc(l_rocksdb_compact);
-  db->CompactRange(NULL, NULL);
+  rocksdb::CompactRangeOptions options;
+  db->CompactRange(options, nullptr, nullptr);
 }
 
 
@@ -410,7 +516,7 @@ void RocksDBStore::compact_range_async(const string& start, const string& end)
   }
   compact_queue_cond.Signal();
   if (!compact_thread.is_started()) {
-    compact_thread.create();
+    compact_thread.create("rstore_commpact");
   }
 }
 bool RocksDBStore::check_omap_dir(string &omap_dir)
@@ -424,9 +530,10 @@ bool RocksDBStore::check_omap_dir(string &omap_dir)
 }
 void RocksDBStore::compact_range(const string& start, const string& end)
 {
-    rocksdb::Slice cstart(start);
-    rocksdb::Slice cend(end);
-    db->CompactRange(&cstart, &cend);
+  rocksdb::CompactRangeOptions options;
+  rocksdb::Slice cstart(start);
+  rocksdb::Slice cend(end);
+  db->CompactRange(options, &cstart, &cend);
 }
 RocksDBStore::RocksDBWholeSpaceIteratorImpl::~RocksDBWholeSpaceIteratorImpl()
 {
@@ -521,6 +628,13 @@ bufferlist RocksDBStore::RocksDBWholeSpaceIteratorImpl::value()
 {
   return to_bufferlist(dbiter->value());
 }
+
+bufferptr RocksDBStore::RocksDBWholeSpaceIteratorImpl::value_as_ptr()
+{
+  rocksdb::Slice val = dbiter->value();
+  return bufferptr(val.data(), val.size());
+}
+
 int RocksDBStore::RocksDBWholeSpaceIteratorImpl::status()
 {
   return dbiter->status().ok() ? 0 : -1;
@@ -532,7 +646,6 @@ string RocksDBStore::past_prefix(const string &prefix)
   limit.push_back(1);
   return limit;
 }
-
 
 RocksDBStore::WholeSpaceIterator RocksDBStore::_get_iterator()
 {

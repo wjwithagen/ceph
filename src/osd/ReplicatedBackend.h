@@ -33,6 +33,7 @@ public:
   ReplicatedBackend(
     PGBackend::Listener *pg,
     coll_t coll,
+    ObjectStore::CollectionHandle &ch,
     ObjectStore *store,
     CephContext *cct);
 
@@ -298,7 +299,8 @@ private:
     PushOp *pop, bool cache_dont_need = true);
   void prep_push(ObjectContextRef obc,
 		 const hobject_t& oid, pg_shard_t dest,
-		 PushOp *op);
+		 PushOp *op,
+		 bool cache_dont_need);
   void prep_push(ObjectContextRef obc,
 		 const hobject_t& soid, pg_shard_t peer,
 		 eversion_t version,
@@ -345,7 +347,7 @@ public:
   void submit_transaction(
     const hobject_t &hoid,
     const eversion_t &at_version,
-    PGTransaction *t,
+    PGTransactionUPtr &&t,
     const eversion_t &trim_to,
     const eversion_t &trim_rollback_to,
     const vector<pg_log_entry_t> &log_entries,
@@ -372,7 +374,7 @@ private:
     const vector<pg_log_entry_t> &log_entries,
     boost::optional<pg_hit_set_history_t> &hset_history,
     InProgressOp *op,
-    ObjectStore::Transaction *op_t,
+    ObjectStore::Transaction &op_t,
     pg_shard_t peer,
     const pg_info_t &pinfo);
   void issue_op(
@@ -387,7 +389,7 @@ private:
     const vector<pg_log_entry_t> &log_entries,
     boost::optional<pg_hit_set_history_t> &hset_history,
     InProgressOp *op,
-    ObjectStore::Transaction *op_t);
+    ObjectStore::Transaction &op_t);
   void op_applied(InProgressOp *op);
   void op_commit(InProgressOp *op);
   template<typename T, int MSGTYPE>
@@ -403,12 +405,10 @@ private:
     eversion_t last_complete;
     epoch_t epoch_started;
 
-    uint64_t bytes_written;
-
     ObjectStore::Transaction opt, localt;
     
     RepModify() : applied(false), committed(false), ackerosd(-1),
-		  epoch_started(0), bytes_written(0) {}
+		  epoch_started(0) {}
   };
   typedef ceph::shared_ptr<RepModify> RepModifyRef;
 

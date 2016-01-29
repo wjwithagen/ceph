@@ -31,7 +31,7 @@
 #include "include/types.h"
 #include "include/stringify.h"
 #include "osd_types.h"
-#include "include/buffer.h"
+#include "include/buffer_fwd.h"
 #include "include/xlist.h"
 #include "include/atomic.h"
 #include "SnapMapper.h"
@@ -181,11 +181,7 @@ struct PGPool {
  *
  */
 
-class PG {
-public:
-  std::string gen_prefix() const;
-
-  /*** PG ****/
+class PG : DoutPrefixProvider {
 protected:
   OSDService *osd;
   CephContext *cct;
@@ -194,6 +190,11 @@ protected:
 
   virtual PGBackend *get_pgbackend() = 0;
 public:
+  std::string gen_prefix() const;
+  CephContext *get_cct() const { return cct; }
+  unsigned get_subsys() const { return ceph_subsys_osd; }
+
+  /*** PG ****/
   void update_snap_mapper_bits(uint32_t bits) {
     snap_mapper.update_bits(bits);
   }
@@ -206,7 +207,6 @@ protected:
   Mutex map_lock;
   list<OpRequestRef> waiting_for_map;
   OSDMapRef osdmap_ref;
-  OSDMapRef last_persisted_osdmap_ref;
   PGPool pool;
 
   void queue_op(OpRequestRef& op);
@@ -274,8 +274,8 @@ public:
   void put_with_id(uint64_t);
   void dump_live_ids();
 #endif
-  void get(const string &tag);
-  void put(const string &tag);
+  void get(const char* tag);
+  void put(const char* tag);
 
   bool dirty_info, dirty_big_info;
 
@@ -299,6 +299,7 @@ public:
   void upgrade(ObjectStore *store);
 
   const coll_t coll;
+  ObjectStore::CollectionHandle ch;
   PGLog  pg_log;
   static string get_info_key(spg_t pgid) {
     return stringify(pgid) + "_info";
@@ -418,6 +419,54 @@ public:
       missing_loc.erase(hoid);
     }
 
+    /// Call to update structures for hoid after a change
+    void rebuild(
+      const hobject_t &hoid,
+      bool sort_bitwise,
+      pg_shard_t self,
+      const set<pg_shard_t> to_recover,
+      const pg_info_t &info,
+      const pg_missing_t &missing,
+      const map<pg_shard_t, pg_missing_t> &pmissing,
+      const map<pg_shard_t, pg_info_t> &pinfo) {
+      recovered(hoid);
+      boost::optional<pg_missing_t::item> item;
+      set<pg_shard_t> have;
+      auto miter = missing.missing.find(hoid);
+      if (miter != missing.missing.end()) {
+	item = miter->second;
+      } else {
+	for (auto &&i: to_recover) {
+	  if (i == self)
+	    continue;
+	  auto pmiter = pmissing.find(i);
+	  assert(pmiter != pmissing.end());
+	  miter = pmiter->second.missing.find(hoid);
+	  if (miter != pmiter->second.missing.end()) {
+	    item = miter->second;
+	  }
+	}
+      }
+      if (!item)
+	return; // recovered!
+
+      needs_recovery_map[hoid] = *item;
+      auto mliter =
+	missing_loc.insert(make_pair(hoid, set<pg_shard_t>())).first;
+      assert(info.last_backfill == hobject_t::get_max());
+      assert(info.last_update >= item->need);
+      if (!missing.is_missing(hoid))
+	mliter->second.insert(self);
+      for (auto &&i: pmissing) {
+	auto pinfoiter = pinfo.find(i.first);
+	assert(pinfoiter != pinfo.end());
+	if (item->need <= pinfoiter->second.last_update &&
+	    cmp(hoid, pinfoiter->second.last_backfill, sort_bitwise) <= 0 &&
+	    !i.second.is_missing(hoid))
+	  mliter->second.insert(i.first);
+      }
+    }
+
     const set<pg_shard_t> &get_locations(const hobject_t &hoid) const {
       return missing_loc.count(hoid) ?
 	missing_loc.find(hoid)->second : empty_set;
@@ -531,6 +580,7 @@ public:
     map<int, map<spg_t, pg_query_t> > *query_map;
     map<int, vector<pair<pg_notify_t, pg_interval_map_t> > > *info_map;
     map<int, vector<pair<pg_notify_t, pg_interval_map_t> > > *notify_list;
+    set<PGRef> created_pgs;
     C_Contexts *on_applied;
     C_Contexts *on_safe;
     ObjectStore::Transaction *transaction;
@@ -848,7 +898,6 @@ public:
   bool adjust_need_up_thru(const OSDMapRef osdmap);
 
   bool all_unfound_are_queried_or_lost(const OSDMapRef osdmap) const;
-  virtual void mark_all_unfound_lost(int how) = 0;
   virtual void dump_recovery_info(Formatter *f) const = 0;
 
   bool calc_min_last_complete_ondisk() {
@@ -914,10 +963,14 @@ public:
     list<pg_log_entry_t> to_rollback;
     set<hobject_t, hobject_t::BitwiseComparator> to_remove;
     list<pg_log_entry_t> to_trim;
+    list<pair<hobject_t, version_t> > to_stash;
     
     // LogEntryHandler
     void remove(const hobject_t &hoid) {
       to_remove.insert(hoid);
+    }
+    void try_stash(const hobject_t &hoid, version_t v) {
+      to_stash.push_back(make_pair(hoid, v));
     }
     void rollback(const pg_log_entry_t &entry) {
       to_rollback.push_back(entry);
@@ -934,6 +987,11 @@ public:
 	pg->get_pgbackend()->rollback(j->soid, j->mod_desc, t);
 	SnapRollBacker rollbacker(j->soid, pg, t);
 	j->mod_desc.visit(&rollbacker);
+      }
+      for (list<pair<hobject_t, version_t> >::iterator i = to_stash.begin();
+	   i != to_stash.end();
+	   ++i) {
+	pg->get_pgbackend()->try_stash(i->first, i->second, t);
       }
       for (set<hobject_t, hobject_t::BitwiseComparator>::iterator i = to_remove.begin();
 	   i != to_remove.end();
@@ -2055,6 +2113,8 @@ public:
   uint64_t upacting_features;
 
   bool do_sort_bitwise;
+  epoch_t last_epoch;
+  epoch_t last_persisted_epoch;
 
  public:
   const spg_t&      get_pgid() const { return pg_id; }
@@ -2173,7 +2233,8 @@ public:
     pg_info_t &info, coll_t coll,
     map<epoch_t,pg_interval_t> &past_intervals,
     ghobject_t &pgmeta_oid,
-    bool dirty_big_info);
+    bool dirty_big_info,
+    bool dirty_epoch);
   void write_if_dirty(ObjectStore::Transaction& t);
 
   eversion_t get_next_version() const {
@@ -2217,8 +2278,19 @@ public:
 
   /// share pg info after a pg is active
   void share_pg_info();
-  /// share new pg log entries after a pg is active
-  void share_pg_log();
+
+
+  void append_log_entries_update_missing(
+    const list<pg_log_entry_t> &entries,
+    ObjectStore::Transaction &t);
+
+  /**
+   * Merge entries updating missing as necessary on all
+   * actingbackfill logs and missings (also missing_loc)
+   */
+  void merge_new_log_entries(
+    const list<pg_log_entry_t> &entries,
+    ObjectStore::Transaction &t);
 
   void reset_interval_flush();
   void start_peering_interval(
@@ -2314,8 +2386,13 @@ public:
   virtual void do_backfill(OpRequestRef op) = 0;
   virtual void snap_trimmer(epoch_t epoch_queued) = 0;
 
-  virtual int do_command(cmdmap_t cmdmap, ostream& ss,
-			 bufferlist& idata, bufferlist& odata) = 0;
+  virtual int do_command(
+    cmdmap_t cmdmap,
+    ostream& ss,
+    bufferlist& idata,
+    bufferlist& odata,
+    ConnectionRef conn,
+    ceph_tid_t tid) = 0;
 
   virtual void on_role_change() = 0;
   virtual void on_pool_change() = 0;
