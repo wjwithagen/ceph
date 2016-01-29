@@ -178,7 +178,6 @@ public:
 
 void ReplicatedPG::on_local_recover(
   const hobject_t &hoid,
-  const object_stat_sum_t &stat_diff,
   const ObjectRecoveryInfo &_recovery_info,
   ObjectContextRef obc,
   ObjectStore::Transaction *t
@@ -227,8 +226,6 @@ void ReplicatedPG::on_local_recover(
   recover_got(recovery_info.soid, recovery_info.version);
 
   if (is_primary()) {
-    info.stats.stats.sum.add(stat_diff);
-
     assert(obc);
     obc->obs.exists = true;
     obc->ondisk_write_lock();
@@ -276,8 +273,10 @@ void ReplicatedPG::on_local_recover(
 }
 
 void ReplicatedPG::on_global_recover(
-  const hobject_t &soid)
+  const hobject_t &soid,
+  const object_stat_sum_t &stat_diff)
 {
+  info.stats.stats.sum.add(stat_diff);
   missing_loc.recovered(soid);
   publish_stats_to_osd();
   dout(10) << "pushed " << soid << " to all replicas" << dendl;
@@ -7169,15 +7168,19 @@ void ReplicatedPG::process_copy_chunk(hobject_t oid, ceph_tid_t tid, int r)
   // cancel and requeue proxy ops on this object
   if (!r) {
     for (map<ceph_tid_t, ProxyReadOpRef>::iterator it = proxyread_ops.begin();
-	it != proxyread_ops.end(); ++it) {
+	it != proxyread_ops.end();) {
       if (it->second->soid == cobc->obs.oi.soid) {
-	cancel_proxy_read(it->second);
+	cancel_proxy_read((it++)->second);
+      } else {
+	++it;
       }
     }
     for (map<ceph_tid_t, ProxyWriteOpRef>::iterator it = proxywrite_ops.begin();
-	 it != proxywrite_ops.end(); ++it) {
+	 it != proxywrite_ops.end();) {
       if (it->second->soid == cobc->obs.oi.soid) {
-	cancel_proxy_write(it->second);
+	cancel_proxy_write((it++)->second);
+      } else {
+	++it;
       }
     }
     kick_proxy_ops_blocked(cobc->obs.oi.soid);
