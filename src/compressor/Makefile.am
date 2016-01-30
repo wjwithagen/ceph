@@ -1,7 +1,6 @@
 compressorlibdir = $(pkglibdir)/compressor
 compressorlib_LTLIBRARIES =  
 
-include compressor/zlib/Makefile.am
 include compressor/snappy/Makefile.am
 
 libcompressor_la_SOURCES = \
