@@ -544,6 +544,9 @@ int KStore::OnodeHashLRU::trim(int max)
 	   << " size " << onode_map.size() << dendl;
   int trimmed = 0;
   int num = onode_map.size() - max;
+  if (onode_map.size() == 0 || num <= 0)
+    return 0; // don't even try
+
   lru_list_t::iterator p = lru.end();
   if (num)
     --p;
@@ -891,10 +894,15 @@ int KStore::_open_collections(int *errors)
     coll_t cid;
     if (cid.parse(it->key())) {
       CollectionRef c(new Collection(this, cid));
-      bufferlist bl;
-      db->get(PREFIX_COLL, it->key(), &bl);
+      bufferlist bl = it->value();
       bufferlist::iterator p = bl.begin();
-      ::decode(c->cnode, p);
+      try {
+        ::decode(c->cnode, p);
+      } catch (buffer::error& e) {
+        derr << __func__ << " failed to decode cnode, key:"
+             << pretty_binary_string(it->key()) << dendl;
+        return -EIO;
+      } 
       dout(20) << __func__ << " opened " << cid << dendl;
       coll_map[cid] = c;
     } else {
@@ -1439,7 +1447,7 @@ void KStore::_reap_collections()
 // ---------------
 // read operations
 
-bool KStore::exists(coll_t cid, const ghobject_t& oid)
+bool KStore::exists(const coll_t& cid, const ghobject_t& oid)
 {
   dout(10) << __func__ << " " << cid << " " << oid << dendl;
   CollectionRef c = _get_collection(cid);
@@ -1453,7 +1461,7 @@ bool KStore::exists(coll_t cid, const ghobject_t& oid)
 }
 
 int KStore::stat(
-    coll_t cid,
+    const coll_t& cid,
     const ghobject_t& oid,
     struct stat *st,
     bool allow_eio)
@@ -1474,7 +1482,7 @@ int KStore::stat(
 }
 
 int KStore::read(
-  coll_t cid,
+  const coll_t& cid,
   const ghobject_t& oid,
   uint64_t offset,
   size_t length,
@@ -1589,7 +1597,7 @@ int KStore::_do_read(
 }
 
 int KStore::fiemap(
-  coll_t cid,
+  const coll_t& cid,
   const ghobject_t& oid,
   uint64_t offset,
   size_t len,
@@ -1627,7 +1635,7 @@ int KStore::fiemap(
 }
 
 int KStore::getattr(
-  coll_t cid,
+  const coll_t& cid,
   const ghobject_t& oid,
   const char *name,
   bufferptr& value)
@@ -1659,7 +1667,7 @@ int KStore::getattr(
 }
 
 int KStore::getattrs(
-  coll_t cid,
+  const coll_t& cid,
   const ghobject_t& oid,
   map<string,bufferptr>& aset)
 {
@@ -1693,13 +1701,13 @@ int KStore::list_collections(vector<coll_t>& ls)
   return 0;
 }
 
-bool KStore::collection_exists(coll_t c)
+bool KStore::collection_exists(const coll_t& c)
 {
   RWLock::RLocker l(coll_lock);
   return coll_map.count(c);
 }
 
-bool KStore::collection_empty(coll_t cid)
+bool KStore::collection_empty(const coll_t& cid)
 {
   dout(15) << __func__ << " " << cid << dendl;
   vector<ghobject_t> ls;
@@ -1714,7 +1722,7 @@ bool KStore::collection_empty(coll_t cid)
 }
 
 int KStore::collection_list(
-  coll_t cid, ghobject_t start, ghobject_t end,
+  const coll_t& cid, ghobject_t start, ghobject_t end,
   bool sort_bitwise, int max,
   vector<ghobject_t> *ls, ghobject_t *pnext)
 {
@@ -1914,7 +1922,7 @@ bufferlist KStore::OmapIteratorImpl::value()
 }
 
 int KStore::omap_get(
-  coll_t cid,                ///< [in] Collection containing oid
+  const coll_t& cid,                ///< [in] Collection containing oid
   const ghobject_t &oid,   ///< [in] Object containing omap
   bufferlist *header,      ///< [out] omap header
   map<string, bufferlist> *out /// < [out] Key to value map
@@ -1964,7 +1972,7 @@ int KStore::omap_get(
 }
 
 int KStore::omap_get_header(
-  coll_t cid,                ///< [in] Collection containing oid
+  const coll_t& cid,                ///< [in] Collection containing oid
   const ghobject_t &oid,   ///< [in] Object containing omap
   bufferlist *header,      ///< [out] omap header
   bool allow_eio ///< [in] don't assert on eio
@@ -1999,7 +2007,7 @@ int KStore::omap_get_header(
 }
 
 int KStore::omap_get_keys(
-  coll_t cid,              ///< [in] Collection containing oid
+  const coll_t& cid,              ///< [in] Collection containing oid
   const ghobject_t &oid, ///< [in] Object containing omap
   set<string> *keys      ///< [out] Keys defined on oid
   )
@@ -2044,7 +2052,7 @@ int KStore::omap_get_keys(
 }
 
 int KStore::omap_get_values(
-  coll_t cid,                    ///< [in] Collection containing oid
+  const coll_t& cid,                    ///< [in] Collection containing oid
   const ghobject_t &oid,       ///< [in] Object containing omap
   const set<string> &keys,     ///< [in] Keys to get
   map<string, bufferlist> *out ///< [out] Returned keys and values
@@ -2080,7 +2088,7 @@ int KStore::omap_get_values(
 }
 
 int KStore::omap_check_keys(
-  coll_t cid,                ///< [in] Collection containing oid
+  const coll_t& cid,                ///< [in] Collection containing oid
   const ghobject_t &oid,   ///< [in] Object containing omap
   const set<string> &keys, ///< [in] Keys to check
   set<string> *out         ///< [out] Subset of keys defined on oid
@@ -2119,7 +2127,7 @@ int KStore::omap_check_keys(
 }
 
 ObjectMap::ObjectMapIterator KStore::get_omap_iterator(
-  coll_t cid,              ///< [in] collection
+  const coll_t& cid,              ///< [in] collection
   const ghobject_t &oid  ///< [in] object
   )
 {
@@ -2153,8 +2161,9 @@ int KStore::_open_super_meta()
     nid_max = 0;
     bufferlist bl;
     db->get(PREFIX_SUPER, "nid_max", &bl);
+    bufferlist::iterator p = bl.begin();
     try {
-      ::decode(nid_max, bl);
+      ::decode(nid_max, p);
     } catch (buffer::error& e) {
     }
     dout(10) << __func__ << " old nid_max " << nid_max << dendl;
@@ -3075,6 +3084,8 @@ int KStore::_do_truncate(TransContext *txc, OnodeRef o, uint64_t offset)
 {
   uint64_t stripe_size = o->onode.stripe_size;
 
+  o->flush();
+
   // trim down stripes
   if (stripe_size) {
     uint64_t pos = offset;
@@ -3528,6 +3539,8 @@ int KStore::_clone(TransContext *txc,
     newo = c->get_onode(new_oid, true);
     _assign_nid(txc, newo);
   }
+
+  oldo->flush();
 
   r = _do_read(oldo, 0, oldo->onode.size, bl, 0);
   if (r < 0)
