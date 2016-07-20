@@ -38,7 +38,7 @@ if(WITH_RBD)
   install(TARGETS
     ceph_smalliobenchrbd
     DESTINATION bin)
-endif(WITH_RBD)
+endif (${WITH_RBD})
 
 # ceph_smalliobenchfs
 set(ceph_smalliobenchfs_srcs
