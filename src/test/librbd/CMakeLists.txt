@@ -96,6 +96,7 @@ target_link_libraries(unittest_librbd
 add_executable(ceph_test_librbd
   test_main.cc
   $<TARGET_OBJECTS:common_texttable_obj>)
+  $<TARGET_OBJECTS:common_texttable_obj>
 target_link_libraries(ceph_test_librbd
   rbd_test
   rbd_api
