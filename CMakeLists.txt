@@ -206,10 +206,6 @@ if(LINUX)
   find_package(udev REQUIRED)
   set(HAVE_UDEV ${UDEV_FOUND})
 
-if(LINUX)
-  find_package(udev REQUIRED)
-  set(HAVE_UDEV ${UDEV_FOUND})
-
   find_package(aio REQUIRED)
   set(HAVE_LIBAIO ${AIO_FOUND})
   message(STATUS "${AIO_LIBS}")
