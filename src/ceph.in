@@ -1,4 +1,4 @@
-#!@PYTHON_EXECUTABLE@
+#!/usr/local/bin/python
 # -*- mode:python -*-
 # vim: ts=4 sw=4 smarttab expandtab
 #
@@ -45,7 +45,7 @@ FLAG_DEPRECATED = (1 << 2)
 
 MYPATH = os.path.abspath(__file__)
 MYDIR = os.path.dirname(MYPATH)
-DEVMODEMSG = '*** DEVELOPER MODE: setting PATH, PYTHONPATH and LD_LIBRARY_PATH ***'
+DEVMODEMSG = '' # '*** DEVELOPER MODE: setting PATH, PYTHONPATH and LD_LIBRARY_PATH ***'
 
 def respawn_in_path(lib_path, pybind_path, pythonlib_path):
     execv_cmd = ['python']
@@ -82,23 +82,47 @@ if os.path.exists(os.path.join(os.getcwd(), "CMakeCache.txt")) \
         if l.startswith("ceph_SOURCE_DIR:STATIC="):
             src_path = l.split("=")[1].strip()
 
+if MYDIR.endswith('src') and \
+   os.path.exists(os.path.join(MYDIR, '.libs')) and \
+   os.path.exists(os.path.join(MYDIR, 'pybind')) and \
+   os.path.exists(os.path.join(MYDIR, 'build')):
+
+    python_libpath = os.path.join(MYDIR, 'build')
+    respawn_in_path(os.path.join(MYDIR, '.libs'), 'pybind', python_libpath)
+    if 'PATH' in os.environ and MYDIR not in os.environ['PATH']:
+        os.environ['PATH'] += ':' + MYDIR
+
+elif os.path.exists(os.path.join(os.getcwd(), "CMakeCache.txt")) \
+     and os.path.exists(os.path.join(os.getcwd(), "bin/init-ceph")):
+    src_path = None
+    for l in open("./CMakeCache.txt"):
+        if l.startswith("ceph_SOURCE_DIR:STATIC="):
+            src_path = l.split("=")[1].strip()
+
 
     if src_path is None:
         # Huh, maybe we're not really in a cmake environment?
         pass
     else:
-        # Developer mode, but in a cmake build dir instead of the src dir
-        lib_path = os.path.join(os.getcwd(), "lib")
-        bin_path = os.path.join(os.getcwd(), "bin")
-        pybind_path = os.path.join(src_path, "src", "pybind")
-        pythonlib_path = os.path.join(lib_path,
-                                      "cython_modules",
-                                      get_pythonlib_dir())
+        src_path = None
+        DEVMODEMSG = ''
+        for l in open(cmakecachepath):
+            if l.startswith("ceph_SOURCE_DIR:STATIC="):
+                src_path = l.split("=")[1].strip()
 
-        respawn_in_path(lib_path, pybind_path, pythonlib_path)
+        if src_path is None:
+            # Huh, maybe we're not really in a cmake environment?
+            pass
+        else:
+            lib_path = os.path.join(mybase, "lib")
+            bin_path = os.path.join(mybase, "bin")
+            pybind_path = os.path.join(src_path, "src", "pybind")
+            pythonlib_path = os.path.join(lib_path, "cython_modules")
 
-        if 'PATH' in os.environ and bin_path not in os.environ['PATH']:
-            os.environ['PATH'] += ':' + bin_path
+            respawn_in_path(lib_path, pybind_path, pythonlib_path)
+
+            if 'PATH' in os.environ and bin_path not in os.environ['PATH']:
+                os.environ['PATH'] += ':' + bin_path
 
 import argparse
 import errno
