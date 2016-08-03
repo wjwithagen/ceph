@@ -138,17 +138,6 @@ if(HAVE_LIBAIO)
   target_link_libraries(unittest_bluestore_types os global)
 endif(HAVE_LIBAIO)
 
-<<<<<<< 51f89ad0e950fbb0e4cd548fc58a9e45462ff813
-=======
-# unittest_bluestore_types
-add_executable(unittest_bluestore_types
-  test_bluestore_types.cc
-  )
-add_ceph_unittest(unittest_bluestore_types ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/unittest_bluestore_types)
-target_link_libraries(unittest_bluestore_types os global)
-endif(HAVE_LIBAIO)
-  
->>>>>>> src/test/*/CMakeLists.txt: Accomodate WITH_RBD|KVS|CEPHFS|AIO|BLKID
 # unittest_transaction
 add_executable(unittest_transaction
   test_transaction.cc)
