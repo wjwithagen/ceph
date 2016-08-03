@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/bash -xv
 #
 # Copyright (C) 2013,2014 Cloudwatt <libre.licensing@cloudwatt.com>
 # Copyright (C) 2014,2015 Red Hat <contact@redhat.com>
@@ -17,9 +17,21 @@
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU Library Public License for more details.
 #
+
 TIMEOUT=300
 PG_NUM=4
 : ${CEPH_BUILD_VIRTUALENV:=/tmp}
+if [ -z "$CEPH_ROOT" ] || [ -z "$CEPH_BIN" ] || [ -z "$CEPH_LIB" ]; then
+    CEPH_ROOT=`readlink -f $(dirname $0)/../..`
+    if [ -d $CEPH_ROOT/build ] ; then
+	# asume we are in Cmake build environment
+        CEPH_BIN=$CEPH_ROOT/build/bin
+        CEPH_LIB=$CEPH_ROOT/build/lib
+    else
+        CEPH_BIN=$CEPH_ROOT/src
+        CEPH_LIB=$CEPH_ROOT/.libs/src
+    fi 
+fi
 
 if type xmlstarlet > /dev/null 2>&1; then
     XMLSTARLET=xmlstarlet
@@ -124,6 +136,16 @@ function teardown() {
     rm -fr $dir
 }
 
+function teardown_error() {
+    local dir=$1
+    kill_daemons $dir KILL
+    if [ `uname` != FreeBSD ] \
+        && [ $(stat -f -c '%T' .) == "btrfs" ]; then
+        __teardown_btrfs $dir
+    fi
+    echo Keeping $dir for post-mortum analysis
+}
+
 function __teardown_btrfs() {
     local btrfs_base_dir=$1
     local btrfs_root=$(df -P . | tail -1 | awk '{print $NF}')
@@ -180,7 +202,7 @@ function kill_daemon() {
             exit_code=0
             break
          fi
-         send_signal=0
+         [ `uname` = FreeBSD ] || send_signal=0
          sleep $try
     done;
     return $exit_code
@@ -250,8 +272,8 @@ function test_kill_daemon() {
 # @return 0 on success, 1 on error
 #
 function kill_daemons() {
-    local trace=$(shopt -q -o xtrace && echo true || echo false)
-    $trace && shopt -u -o xtrace
+    # local trace=$(shopt -q -o xtrace && echo true || echo false)
+    # $trace && shopt -u -o xtrace
     local dir=$1
     local signal=${2:-TERM}
     local name_prefix=$3 # optional, osd, mon, osd.1
@@ -266,7 +288,7 @@ function kill_daemons() {
     wait_background pids
     status=$?
 
-    $trace && shopt -s -o xtrace
+    # $trace && shopt -s -o xtrace
     return $status
 }
 
@@ -344,6 +366,8 @@ function run_mon() {
     shift
     local data=$dir/$id
 
+    pwd
+    echo $PATH
     ceph-mon \
         --id $id \
         --mkfs \
@@ -481,17 +505,17 @@ function test_run_osd() {
     run_mon $dir a || return 1
 
     run_osd $dir 0 || return 1
-    local backfills=$(CEPH_ARGS='' ceph --format=json daemon $dir//ceph-osd.0.asok \
+    local backfills=$(CEPH_ARGS='' timeout 60 ceph --format=json daemon $dir//ceph-osd.0.asok \
         config get osd_max_backfills)
     echo "$backfills" | grep --quiet 'osd_max_backfills' || return 1
 
     run_osd $dir 1 --osd-max-backfills 20 || return 1
-    local backfills=$(CEPH_ARGS='' ceph --format=json daemon $dir//ceph-osd.1.asok \
+    local backfills=$(CEPH_ARGS='' timeout 60 ceph --format=json daemon $dir//ceph-osd.1.asok \
         config get osd_max_backfills)
     test "$backfills" = '{"osd_max_backfills":"20"}' || return 1
 
     CEPH_ARGS="$CEPH_ARGS --osd-max-backfills 30" run_osd $dir 2 || return 1
-    local backfills=$(CEPH_ARGS='' ceph --format=json daemon $dir//ceph-osd.2.asok \
+    local backfills=$(CEPH_ARGS='' timeout 60 ceph --format=json daemon $dir//ceph-osd.2.asok \
         config get osd_max_backfills)
     test "$backfills" = '{"osd_max_backfills":"30"}' || return 1
 
@@ -515,6 +539,9 @@ function destroy_osd() {
     local dir=$1
     local id=$2
 
+    # First mask osd down, otherwise it cannot be deleted later on
+    # is status has not propagated to monitor.
+    ceph osd down osd.$id || return 1
     kill_daemons $dir TERM osd.$id || return 1
     ceph osd out osd.$id || return 1
     ceph auth del osd.$id || return 1
@@ -597,6 +624,7 @@ function activate_osd() {
     ceph_args+=" --osd-class-dir=$CEPH_LIB"
     ceph_args+=" --run-dir=$dir"
     ceph_args+=" --debug-osd=20"
+    ceph_args+=" --debug-ms=20"
     ceph_args+=" --log-file=$dir/\$name.log"
     ceph_args+=" --pid-file=$dir/\$name.pid"
     ceph_args+=" --osd-max-object-name-len 460"
@@ -609,7 +637,7 @@ function activate_osd() {
         --mark-init=none \
         $osd_data || return 1
 
-    [ "$id" = "$(cat $osd_data/whoami)" ] || return 1
+    [ "$id" -eq "$(cat $osd_data/whoami)" ] || return 1
 
     wait_for_osd up $id || return 1
 }
@@ -757,7 +785,7 @@ function get_config() {
 
     CEPH_ARGS='' \
         ceph --format xml daemon $dir/ceph-$daemon.$id.asok \
-        config get $config 2> /dev/null | \
+        config get $config 2> /dev/null | tee /tmp/ceph.out | \
         $XMLSTARLET sel -t -m "//$config" -v . -n
 }
 
@@ -1032,7 +1060,6 @@ function get_last_scrub_stamp() {
     local sname=${2:-last_scrub_stamp}
     ceph --format xml pg dump pgs 2>/dev/null | \
         $XMLSTARLET sel -t -m "//pg_stat[pgid='$pgid']/$sname" -v .
-}
 
 function test_get_last_scrub_stamp() {
     local dir=$1
@@ -1056,7 +1083,7 @@ function test_get_last_scrub_stamp() {
 #
 function is_clean() {
     num_pgs=$(get_num_pgs)
-    test $num_pgs != 0 || return 1
+    test $num_pgs -ne 0 || return 1
     test $(get_num_active_clean) = $num_pgs || return 1
 }
 
@@ -1349,8 +1376,11 @@ function erasure_code_plugin_exists() {
 
     if ceph osd erasure-code-profile set TESTPROFILE plugin=$plugin 2>&1 |
         grep "$grepstr" ; then
+<<<<<<< 329cb29772675b0e4098988ade5178d2ddefc59b
         # display why the string was rejected.
         ceph osd erasure-code-profile set TESTPROFILE plugin=$plugin
+=======
+>>>>>>> qa/workunits/ceph-helpers.sh: FreeBSD and Testing fixes
         status=1
     else
         status=0
@@ -1504,34 +1534,34 @@ function main() {
     local dir=td/$1
     shift
 
-    shopt -s -o xtrace
+    # shopt -s -o xtrace
     PS4='${BASH_SOURCE[0]}:$LINENO: ${FUNCNAME[0]}:  '
 
-    export PATH=${CEPH_BUILD_VIRTUALENV}/ceph-disk-virtualenv/bin:${CEPH_BUILD_VIRTUALENV}/ceph-detect-init-virtualenv/bin:.:$PATH # make sure program from sources are preferred
-    #export PATH=$CEPH_ROOT/src/ceph-disk/virtualenv/bin:$CEPH_ROOT/src/ceph-detect-init/virtualenv/bin:.:$PATH # make sure program from sources are preferred
+    # make sure program from sources are preferred
+    export PATH=${CEPH_BUILD_VIRTUALENV}/ceph-disk-virtualenv/bin:${CEPH_BUILD_VIRTUALENV}/ceph-detect-init-virtualenv/bin:.:../build/bin:$PATH 
 
     export CEPH_CONF=/dev/null
     unset CEPH_ARGS
 
     local code
     if run $dir "$@" ; then
-        code=0
+        teardown $dir || return 1
+        return 0
     else
         display_logs $dir
-        code=1
+        teardown_error $dir
+        return 1
     fi
-    teardown $dir || return 1
-    return $code
 }
 
 #######################################################################
 
 function run_tests() {
-    shopt -s -o xtrace
+    # shopt -s -o xtrace
     PS4='${BASH_SOURCE[0]}:$LINENO: ${FUNCNAME[0]}:  '
 
-    export PATH=${CEPH_BUILD_VIRTUALENV}/ceph-disk-virtualenv/bin:${CEPH_BUILD_VIRTUALENV}/ceph-detect-init-virtualenv/bin:.:$PATH # make sure program from sources are preferred
-    #export PATH=$CEPH_ROOT/src/ceph-disk/virtualenv/bin:$CEPH_ROOT/src/ceph-detect-init/virtualenv/bin:.:$PATH # make sure program from sources are preferred
+    # make sure program from sources are preferred
+    export PATH=${CEPH_BUILD_VIRTUALENV}/ceph-disk-virtualenv/bin:${CEPH_BUILD_VIRTUALENV}/ceph-detect-init-virtualenv/bin:.:../build/bin:$PATH
 
     export CEPH_MON="127.0.0.1:7109" # git grep '\<7109\>' : there must be only one
     export CEPH_ARGS
@@ -1541,9 +1571,19 @@ function run_tests() {
 
     local funcs=${@:-$(set | sed -n -e 's/^\(test_[0-9a-z_]*\) .*/\1/p')}
     local dir=td/ceph-helpers
+    local status
 
     for func in $funcs ; do
-        $func $dir || return 1
+	echo Running test: $func
+	$func $dir
+	echo Completed test: $func
+	status=$?
+	if [ $status -eq 0 ] ; then
+	    echo test: $func completed OKE
+	else
+	    echo test: $func has FAILed
+	    return 1
+	fi 
     done
 }
 
