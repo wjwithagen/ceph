@@ -23,6 +23,7 @@ except ImportError:
 
 import filecmp
 import os
+import platform
 import subprocess
 import math
 import time
@@ -152,7 +153,7 @@ def cat_file(level, filename):
 def vstart(new, opt=""):
     print("vstarting....", end="")
     NEW = new and "-n" or ""
-    call("MON=1 OSD=4 CEPH_PORT=7400 {path}/src/vstart.sh --short -l {new} -d mon osd {opt} > /dev/null 2>&1".format(new=NEW, opt=opt, path=CEPH_ROOT), shell=True)
+    call("MON=1 OSD=4 CEPH_PORT=7400 {path}/src/vstart.sh --short -l {new} -d mon osd {opt}".format(new=NEW, opt=opt, path=CEPH_ROOT), shell=True)
     print("DONE")
 
 
@@ -204,6 +205,11 @@ def verify(DATADIR, POOL, NAME_PREFIX, db):
         clone = rawnsfile.split("__")[1]
         nspace = nsfile.split("-")[0]
         file = nsfile.split("-")[1]
+	print("rawnsfile", rawnsfile)
+	print("nsfile", nsfile)
+	print("clone", clone)
+	print("nspace", nspace)
+	print("file", file)
         # Skip clones
         if clone != "head":
             continue
@@ -214,7 +220,8 @@ def verify(DATADIR, POOL, NAME_PREFIX, db):
             pass
         cmd = "{path}/rados -p {pool} -N '{nspace}' get {file} {out}".format(pool=POOL, file=file, out=TMPFILE, nspace=nspace, path=CEPH_BIN)
         logging.debug(cmd)
-        call(cmd, shell=True, stdout=DEVNULL, stderr=DEVNULL)
+        call("ps axuwww| grep ceph-", shell=True)
+        call(cmd, shell=True)
         cmd = "diff -q {src} {result}".format(src=path, result=TMPFILE)
         logging.debug(cmd)
         ret = call(cmd, shell=True)
@@ -226,7 +233,7 @@ def verify(DATADIR, POOL, NAME_PREFIX, db):
         except:
             pass
         for key, val in db[nspace][file]["xattr"].items():
-            cmd = "{path}/rados -p {pool} -N '{nspace}' getxattr {name} {key}".format(pool=POOL, name=file, key=key, nspace=nspace, path=CEPH_BIN)
+            cmd = "{path}/rados -c {conf} -p {pool} -N '{nspace}' getxattr {name} {key}".format(conf=CEPH_CONF, pool=POOL, name=file, key=key, nspace=nspace, path=CEPH_BIN)
             logging.debug(cmd)
             getval = check_output(cmd, shell=True, stderr=DEVNULL)
             logging.debug("getxattr {key} {val}".format(key=key, val=getval))
@@ -666,7 +673,7 @@ def main(argv):
     if len(argv) > 1 and argv[1] == "debug":
         nullfd = stdout
     else:
-        nullfd = DEVNULL
+        nullfd = stdout
 
     call("rm -fr {dir}; mkdir {dir}".format(dir=CEPH_DIR), shell=True)
     os.environ["CEPH_DIR"] = CEPH_DIR
@@ -760,7 +767,7 @@ def main(argv):
                 fd.write(data)
             fd.close()
 
-            cmd = "{path}/rados -p {pool} -N '{nspace}' put {name} {ddname}".format(pool=REP_POOL, name=NAME, ddname=DDNAME, nspace=nspace, path=CEPH_BIN)
+            cmd = "{path}/rados -c {conf} -p {pool} -N '{nspace}' put {name} {ddname}".format(conf=CEPH_CONF, pool=REP_POOL, name=NAME, ddname=DDNAME, nspace=nspace, path=CEPH_BIN)
             logging.debug(cmd)
             ret = call(cmd, shell=True, stderr=nullfd)
             if ret != 0:
@@ -1826,8 +1833,8 @@ def main(argv):
         logging.warning("SKIPPING IMPORT-RADOS TESTS DUE TO PREVIOUS FAILURES")
 
     # Clear directories of previous portion
-    call("/bin/rm -rf {dir}".format(dir=TESTDIR), shell=True)
-    call("/bin/rm -rf {dir}".format(dir=DATADIR), shell=True)
+    call("echo /bin/rm -rf {dir}".format(dir=TESTDIR), shell=True)
+    call("echo /bin/rm -rf {dir}".format(dir=DATADIR), shell=True)
     os.mkdir(TESTDIR)
     os.mkdir(DATADIR)
 
@@ -1949,8 +1956,8 @@ def main(argv):
             vstart(new=False)
             wait_for_health()
 
-    call("/bin/rm -rf {dir}".format(dir=TESTDIR), shell=True)
-    call("/bin/rm -rf {dir}".format(dir=DATADIR), shell=True)
+    call("echo /bin/rm -rf {dir}".format(dir=TESTDIR), shell=True)
+    call("echo /bin/rm -rf {dir}".format(dir=DATADIR), shell=True)
 
     ERRORS += test_removeall(CFSD_PREFIX, db, OBJREPPGS, REP_POOL, CEPH_BIN, OSDDIR, REP_NAME, NUM_CLONED_REP_OBJECTS)
 
@@ -1988,6 +1995,7 @@ if __name__ == "__main__":
         status = main(sys.argv[1:])
     finally:
         kill_daemons()
-        remove_btrfs_subvolumes(CEPH_DIR)
-        call("/bin/rm -fr {dir}".format(dir=CEPH_DIR), shell=True)
+	if platform.system() != "FreeBSD":
+        	remove_btrfs_subvolumes(CEPH_DIR)
+        call("echo /bin/rm -fr {dir}".format(dir=CEPH_DIR), shell=True)
     sys.exit(status)
