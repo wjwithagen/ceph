@@ -712,6 +712,8 @@ int FileStore::statfs(struct store_statfs_t *buf0)
   buf0->reset();
   if (::statfs(basedir.c_str(), &buf) < 0) {
     int r = -errno;
+    derr << "statfs failed to statfs base dir " << basedir << ": " 
+	<< cpp_strerror(-r) << dendl;
     assert(!m_filestore_fail_eio || r != -EIO);
     assert(r != -ENOENT);
     return r;
