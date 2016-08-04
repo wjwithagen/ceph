@@ -123,11 +123,11 @@ int lockdep_dump_locks()
   for (ceph::unordered_map<pthread_t, map<int,BackTrace*> >::iterator p = held.begin();
        p != held.end();
        ++p) {
-    lockdep_dout(0) << "--- thread " << p->first << " ---" << dendl;
+    lockdep_dout(1) << "--- thread " << p->first << " ---" << dendl;
     for (map<int,BackTrace*>::iterator q = p->second.begin();
 	 q != p->second.end();
 	 ++q) {
-      lockdep_dout(0) << "  * " << lock_names[q->first] << "\n";
+      lockdep_dout(1) << "  * " << lock_names[q->first] << "\n";
       if (q->second)
 	*_dout << *(q->second);
       *_dout << dendl;
