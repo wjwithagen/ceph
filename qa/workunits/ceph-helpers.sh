@@ -148,6 +148,16 @@ function teardown_error() {
     echo Keeping $dir for post-mortum analysis
 }
 
+function teardown_error() {
+    local dir=$1
+    kill_daemons $dir KILL
+    if [ `uname` != FreeBSD ] \
+        && [ $(stat -f -c '%T' .) == "btrfs" ]; then
+        __teardown_btrfs $dir
+    fi
+    echo Keeping $dir for post-mortum analysis
+}
+
 function __teardown_btrfs() {
     local btrfs_base_dir=$1
     local btrfs_root=$(df -P . | tail -1 | awk '{print $NF}')
@@ -1388,11 +1398,8 @@ function erasure_code_plugin_exists() {
 
     if ceph osd erasure-code-profile set TESTPROFILE plugin=$plugin 2>&1 |
         grep "$grepstr" ; then
-<<<<<<< 329cb29772675b0e4098988ade5178d2ddefc59b
         # display why the string was rejected.
         ceph osd erasure-code-profile set TESTPROFILE plugin=$plugin
-=======
->>>>>>> qa/workunits/ceph-helpers.sh: FreeBSD and Testing fixes
         status=1
     else
         status=0
