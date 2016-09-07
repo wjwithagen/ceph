@@ -30,7 +30,7 @@
 #undef dout_prefix
 #define dout_prefix _prefix(_dout, this)
 static ostream& _prefix(std::ostream *_dout, SimpleMessenger *msgr) {
-  return *_dout << "-- " << msgr->get_myaddr() << " ";
+  return *_dout << "-- " << msgr->get_myaddr() << " SM::";
 }
 
 
@@ -558,10 +558,10 @@ void SimpleMessenger::wait()
 
   // done!  clean up.
   if (did_bind) {
-    ldout(cct,20) << "wait: stopping accepter thread" << dendl;
+    ldout(cct,20) << __func__ << ": stopping accepter thread" << dendl;
     accepter.stop();
     did_bind = false;
-    ldout(cct,20) << "wait: stopped accepter thread" << dendl;
+    ldout(cct,20) << __func__ << ": stopped accepter thread" << dendl;
   }
 
   dispatch_queue.shutdown();
@@ -573,20 +573,20 @@ void SimpleMessenger::wait()
   }
 
   if (reaper_started) {
-    ldout(cct,20) << "wait: stopping reaper thread" << dendl;
+    ldout(cct,20) << __func__ << ": stopping reaper thread" << dendl;
     lock.Lock();
     reaper_cond.Signal();
     reaper_stop = true;
     lock.Unlock();
     reaper_thread.join();
     reaper_started = false;
-    ldout(cct,20) << "wait: stopped reaper thread" << dendl;
+    ldout(cct,20) << __func__ << ": stopped reaper thread" << dendl;
   }
 
   // close+reap all pipes
   lock.Lock();
   {
-    ldout(cct,10) << "wait: closing pipes" << dendl;
+    ldout(cct,10) << __func__ << ": closing pipes" << dendl;
 
     while (!rank_pipe.empty()) {
       Pipe *p = rank_pipe.begin()->second;
@@ -601,7 +601,7 @@ void SimpleMessenger::wait()
     }
 
     reaper();
-    ldout(cct,10) << "wait: waiting for pipes " << pipes << " to close" << dendl;
+    ldout(cct,10) << __func__ << ": waiting for pipes " << pipes << " to close" << dendl;
     while (!pipes.empty()) {
       reaper_cond.Wait(lock);
       reaper();
@@ -609,19 +609,19 @@ void SimpleMessenger::wait()
   }
   lock.Unlock();
 
-  ldout(cct,10) << "wait: done." << dendl;
-  ldout(cct,1) << "shutdown complete." << dendl;
+  ldout(cct,10) << __func__ << ": done." << dendl;
+  ldout(cct,1) << __func__ << ": shutdown complete." << dendl;
   started = false;
 }
 
 
 void SimpleMessenger::mark_down_all()
 {
-  ldout(cct,1) << "mark_down_all" << dendl;
+  ldout(cct,1) << __func__ << dendl;
   lock.Lock();
   for (set<Pipe*>::iterator q = accepting_pipes.begin(); q != accepting_pipes.end(); ++q) {
     Pipe *p = *q;
-    ldout(cct,5) << "mark_down_all accepting_pipe " << p << dendl;
+    ldout(cct,5) << __func__ << " accepting_pipe " << p << dendl;
     p->pipe_lock.Lock();
     p->stop();
     PipeConnectionRef con = p->connection_state;
@@ -634,7 +634,7 @@ void SimpleMessenger::mark_down_all()
   while (!rank_pipe.empty()) {
     ceph::unordered_map<entity_addr_t,Pipe*>::iterator it = rank_pipe.begin();
     Pipe *p = it->second;
-    ldout(cct,5) << "mark_down_all " << it->first << " " << p << dendl;
+    ldout(cct,5) << __func__ << " rank_pipe " << it->first << " " << p << dendl;
     rank_pipe.erase(it);
     p->unregister_pipe();
     p->pipe_lock.Lock();
@@ -652,7 +652,7 @@ void SimpleMessenger::mark_down(const entity_addr_t& addr)
   lock.Lock();
   Pipe *p = _lookup_pipe(addr);
   if (p) {
-    ldout(cct,1) << "mark_down " << addr << " -- " << p << dendl;
+    ldout(cct,1) << __func__ << "(&addr) " << addr << " -- " << p << dendl;
     p->unregister_pipe();
     p->pipe_lock.Lock();
     p->stop();
@@ -666,7 +666,7 @@ void SimpleMessenger::mark_down(const entity_addr_t& addr)
     }
     p->pipe_lock.Unlock();
   } else {
-    ldout(cct,1) << "mark_down " << addr << " -- pipe dne" << dendl;
+    ldout(cct,1) << __func__ << "(&addr) " << addr << " -- pipe dne" << dendl;
   }
   lock.Unlock();
 }
@@ -678,7 +678,7 @@ void SimpleMessenger::mark_down(Connection *con)
   lock.Lock();
   Pipe *p = static_cast<Pipe *>(static_cast<PipeConnection*>(con)->get_pipe());
   if (p) {
-    ldout(cct,1) << "mark_down " << con << " -- " << p << dendl;
+    ldout(cct,1) << __func__ << "(*con) " << con << " -- " << p << dendl;
     assert(p->msgr == this);
     p->unregister_pipe();
     p->pipe_lock.Lock();
@@ -691,7 +691,7 @@ void SimpleMessenger::mark_down(Connection *con)
     p->pipe_lock.Unlock();
     p->put();
   } else {
-    ldout(cct,1) << "mark_down " << con << " -- pipe dne" << dendl;
+    ldout(cct,1) << __func__ << "(*con) " << con << " -- pipe dne" << dendl;
   }
   lock.Unlock();
 }
@@ -708,7 +708,7 @@ void SimpleMessenger::mark_disposable(Connection *con)
     p->pipe_lock.Unlock();
     p->put();
   } else {
-    ldout(cct,1) << "mark_disposable " << con << " -- pipe dne" << dendl;
+    ldout(cct,1) << __func__ << " " << con << " -- pipe dne" << dendl;
   }
   lock.Unlock();
 }
