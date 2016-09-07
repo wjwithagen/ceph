@@ -153,6 +153,7 @@ static void file_values_parse(const map<string, string>& kvm, FILE *fp, map<stri
 
 static bool os_release_parse(map<string, string> *m, CephContext *cct)
 {
+#if defined(__linux__)
   static const map<string, string> kvm = {
     { "distro", "ID=" },
     { "distro_description", "PRETTY_NAME=" },
@@ -171,10 +172,14 @@ static bool os_release_parse(map<string, string> *m, CephContext *cct)
   fclose(fp);
 
   return true;
+#else
+  return false;
+#endif
 }
 
 static void distro_detect(map<string, string> *m, CephContext *cct)
 {
+#if defined(__linux__)
   if (!os_release_parse(m, cct)) {
     lderr(cct) << "distro_detect - /etc/os-release is required" << dendl;
   }
@@ -183,8 +188,14 @@ static void distro_detect(map<string, string> *m, CephContext *cct)
     if (m->find(rk) == m->end())
       lderr(cct) << "distro_detect - can't detect " << rk << dendl;
   }
+#endif
 }
 
+#if defined(__FreeBSD__)
+#define PROCPREF "/compat/linux/proc"
+#else
+#define PROCPREF "/proc"
+#endif
 void collect_sys_info(map<string, string> *m, CephContext *cct)
 {
   // version
@@ -202,7 +213,7 @@ void collect_sys_info(map<string, string> *m, CephContext *cct)
   }
 
   // memory
-  FILE *f = fopen("/proc/meminfo", "r");
+  FILE *f = fopen(PROCPREF "/meminfo", "r");
   if (f) {
     char buf[100];
     while (!feof(f)) {
@@ -223,7 +234,7 @@ void collect_sys_info(map<string, string> *m, CephContext *cct)
   }
 
   // processor
-  f = fopen("/proc/cpuinfo", "r");
+  f = fopen(PROCPREF "/cpuinfo", "r");
   if (f) {
     char buf[100];
     while (!feof(f)) {
