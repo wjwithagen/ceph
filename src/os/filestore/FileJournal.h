@@ -400,7 +400,14 @@ private:
     fn(f),
     zero_buf(NULL),
     max_size(0), block_size(0),
-    directio(dio), aio(ai), force_aio(faio),
+    directio(dio), 
+#ifdef HAVE_LIBAIO
+    aio(ai),
+    force_aio(faio),
+#else
+    aio(false),
+    force_aio(false),
+#endif
     must_write_header(false),
     write_pos(0), read_pos(0),
     discard(false),
@@ -423,11 +430,11 @@ private:
     write_thread(this),
     write_finish_thread(this) {
 
+#ifndef HAVE_LIBAIO
       if (aio && !directio) {
 	lderr(cct) << "FileJournal::_open_any: aio not supported without directio; disabling aio" << dendl;
         aio = false;
       }
-#ifndef HAVE_LIBAIO
       if (aio) {
 	lderr(cct) << "FileJournal::_open_any: libaio not compiled in; disabling aio" << dendl;
         aio = false;
