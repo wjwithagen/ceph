@@ -7193,7 +7193,11 @@ void OSD::_committed_osd_maps(epoch_t first, epoch_t last, MOSDMap *m)
 	  do_shutdown = true;
 	}
 
+	dout(10) << __func__ 
+	   << " start_waiting_for_healthy()" << dendl;
 	start_waiting_for_healthy();
+	dout(10) << __func__ 
+	   << " start_waiting_for_healthy() done" << dendl;
 
 	set<int> avoid_ports;
 #if defined(__FreeBSD__)
@@ -7208,6 +7212,8 @@ void OSD::_committed_osd_maps(epoch_t first, epoch_t last, MOSDMap *m)
 
 	int r = cluster_messenger->rebind(avoid_ports);
 	if (r != 0) {
+	  dout(10) << __func__ 
+	     << " cluster_messenger rebind did not work, starting shutdown" << dendl;
 	  do_shutdown = true;  // FIXME: do_restart?
           network_error = true;
           dout(0) << __func__ << " marked down:"
@@ -7216,6 +7222,8 @@ void OSD::_committed_osd_maps(epoch_t first, epoch_t last, MOSDMap *m)
 
 	r = hb_back_server_messenger->rebind(avoid_ports);
 	if (r != 0) {
+	  dout(10) << __func__ 
+	     << "  hb_back_server_messenger rebind did not work, starting shutdown" << dendl;
 	  do_shutdown = true;  // FIXME: do_restart?
           network_error = true;
           dout(0) << __func__ << " marked down:"
@@ -7224,6 +7232,8 @@ void OSD::_committed_osd_maps(epoch_t first, epoch_t last, MOSDMap *m)
 
 	r = hb_front_server_messenger->rebind(avoid_ports);
 	if (r != 0) {
+	  dout(10) << __func__ 
+	     << "  hb_back_server_messenger rebind did not work, starting shutdown" << dendl;
 	  do_shutdown = true;  // FIXME: do_restart?
           network_error = true;
           dout(0) << __func__ << " marked down:" 
