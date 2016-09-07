@@ -63,9 +63,6 @@ if(NOT CMAKE_BUILD_TYPE STREQUAL Debug)
       CMAKE_C_FLAGS_${build_type_upper})
     string(REGEX REPLACE "(^| )[/-]D *NDEBUG($| )" " " "${flags}" "${${flags}}")
   endforeach()
-else()
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_DEBUG} -O0 -g" )
-  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${CMAKE_C_FLAGS_DEBUG} -O0 -g" )
 endif()
 
 include(CheckCCompilerFlag)
@@ -508,9 +505,6 @@ set(libcommon_files
   common/Graylog.cc
   common/fs_types.cc
   common/dns_resolve.cc
-  common/armor.c
-  common/safe_io.c
-  common/addr_parsing.c
   ${arch_files}
   ${auth_files}
   ${mds_files})
@@ -533,15 +527,13 @@ set(mon_common_files
   auth/cephx/CephxSessionHandler.cc
   erasure-code/ErasureCodePlugin.cc)
 add_library(mon_common_objs OBJECT ${mon_common_files})
-
-if(LINUX)
-  list(APPEND libcommon_files
-    common/module.c )
-  set(common_mountcephfs_files
-  common/module.c)
-  add_library(common_mountcephfs_objs OBJECT
-    ${common_mountcephfs_files})
-endif(LINUX)
+set(common_mountcephfs_files
+  common/armor.c
+  common/safe_io.c
+  common/module.c
+  common/addr_parsing.c)
+add_library(common_mountcephfs_objs OBJECT
+  ${common_mountcephfs_files})
 
 if(WITH_PROFILER)
   list(APPEND libcommon_files
