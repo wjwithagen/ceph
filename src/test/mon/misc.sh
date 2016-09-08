@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/bash -vx
 #
 # Copyright (C) 2014 Cloudwatt <libre.licensing@cloudwatt.com>
 # Copyright (C) 2014, 2015 Red Hat <contact@redhat.com>
@@ -29,7 +29,8 @@ function run() {
 
     local funcs=${@:-$(set | sed -n -e 's/^\(TEST_[0-9a-z_]*\) .*/\1/p')}
     for func in $funcs ; do
-        $func $dir || return 1
+	echo Testing: $func
+	$func $dir || return 1
     done
 }
 
