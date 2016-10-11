@@ -4921,10 +4921,13 @@ bool OSD::ms_handle_refused(Connection *con)
     return false;
 
   OSD::Session *session = (OSD::Session *)con->get_priv();
-  dout(1) << "ms_handle_refused con " << con << " session " << session << dendl;
+  dout(1) << __func__ << ":" << __LINE__ << " con " << con << " session " << session << dendl;
   if (!session)
     return false;
   int type = con->get_peer_type();
+  dout(10) << __func__ << ":" << __LINE__ << " con " << con << " session " << session 
+ 	   << " type " << type 
+	   << dendl;
   // handle only OSD failures here
   if (monc && (type == CEPH_ENTITY_TYPE_OSD)) {
     OSDMapRef osdmap = get_osdmap();
@@ -5131,7 +5134,7 @@ void OSD::_collect_metadata(map<string,string> *pm)
 
   collect_sys_info(pm, cct);
 
-  dout(10) << __func__ << " " << *pm << dendl;
+  dout(10) << __func__ << " collected: " << *pm << dendl;
 }
 
 void OSD::queue_want_up_thru(epoch_t want)
