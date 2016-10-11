@@ -1081,6 +1081,7 @@ function get_last_scrub_stamp() {
     local sname=${2:-last_scrub_stamp}
     ceph --format xml pg dump pgs 2>/dev/null | \
         $XMLSTARLET sel -t -m "//pg_stat[pgid='$pgid']/$sname" -v .
+}
 
 function test_get_last_scrub_stamp() {
     local dir=$1
