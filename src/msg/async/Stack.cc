@@ -41,15 +41,16 @@ std::function<void ()> NetworkStack::add_thread(unsigned i)
       w->initialize();
       w->init_done();
       while (!w->done) {
-        ldout(cct, 30) << __func__ << " calling event process" << dendl;
+        ldout(cct, 30) << " add_thread " << __func__ << " calling event process" << dendl;
 
         int r = w->center.process_events(EventMaxWaitUs);
         if (r < 0) {
-          ldout(cct, 20) << __func__ << " process events failed: "
+          ldout(cct, 20) << " add_thread " << __func__ << " process events failed: "
                          << cpp_strerror(errno) << dendl;
           // TODO do something?
         }
       }
+      ldout(cct, 10) << " add_thread " << __func__ << " reset." << dendl;
       w->reset();
       w->destroy();
   };
@@ -115,6 +116,7 @@ NetworkStack::NetworkStack(CephContext *c, const string &t): type(t), started(fa
 
 void NetworkStack::start()
 {
+  ldout(cct, 10) << __func__ << " Started." << dendl;
   pool_spin.lock();
   if (started) {
     pool_spin.unlock();
@@ -132,6 +134,7 @@ void NetworkStack::start()
 
   for (unsigned i = 0; i < num_workers; ++i)
     workers[i]->wait_for_init();
+  ldout(cct, 10) << __func__ << " end." << dendl;
 }
 
 Worker* NetworkStack::get_worker()
@@ -157,11 +160,13 @@ Worker* NetworkStack::get_worker()
   pool_spin.unlock();
   assert(current_best);
   ++current_best->references;
+  ldout(cct, 10) << __func__ << " selected: " << hex << current_best << dendl;
   return current_best;
 }
 
 void NetworkStack::stop()
 {
+  ldout(cct, 10) << __func__ << " started." << dendl;
   Spinlock::Locker l(pool_spin);
   for (unsigned i = 0; i < num_workers; ++i) {
     workers[i]->done = true;
@@ -169,6 +174,7 @@ void NetworkStack::stop()
     join_worker(i);
   }
   started = false;
+  ldout(cct, 10) << __func__ << " ended." << dendl;
 }
 
 class C_drain : public EventCallback {
