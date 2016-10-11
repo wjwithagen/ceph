@@ -101,6 +101,7 @@ ostream& EventCenter::_event_prefix(std::ostream *_dout)
 
 int EventCenter::init(int n, unsigned i)
 {
+  ldout(cct, 10) << __func__ << " started, n = " << n << " i = " << i << dendl;
   // can't init multi times
   assert(nevent == 0);
 
