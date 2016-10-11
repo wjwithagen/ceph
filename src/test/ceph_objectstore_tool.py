@@ -1833,8 +1833,8 @@ def main(argv):
         logging.warning("SKIPPING IMPORT-RADOS TESTS DUE TO PREVIOUS FAILURES")
 
     # Clear directories of previous portion
-    call("echo /bin/rm -rf {dir}".format(dir=TESTDIR), shell=True)
-    call("echo /bin/rm -rf {dir}".format(dir=DATADIR), shell=True)
+    call("/bin/rm -rf {dir}".format(dir=TESTDIR), shell=True)
+    call("/bin/rm -rf {dir}".format(dir=DATADIR), shell=True)
     os.mkdir(TESTDIR)
     os.mkdir(DATADIR)
 
