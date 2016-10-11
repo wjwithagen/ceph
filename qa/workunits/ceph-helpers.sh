@@ -632,6 +632,7 @@ function activate_osd() {
     ceph_args+=" "
     ceph_args+="$@"
     mkdir -p $osd_data
+    which ceph-disk
     CEPH_ARGS="$ceph_args " ceph-disk $ceph_disk_args \
         activate \
         --mark-init=none \
@@ -680,8 +681,10 @@ function wait_for_osd() {
 
     status=1
     for ((i=0; i < $TIMEOUT; i++)); do
-        echo $i
+        echo -n "$i "; date "+%H:%M:%S"
         if ! ceph osd dump | grep "osd.$id $state"; then
+	    ceph osd dump
+	    ceph -s
             sleep 1
         else
             status=0
@@ -1576,8 +1579,8 @@ function run_tests() {
     for func in $funcs ; do
 	echo Running test: $func
 	$func $dir
-	echo Completed test: $func
 	status=$?
+	echo Completed test: $func
 	if [ $status -eq 0 ] ; then
 	    echo test: $func completed OKE
 	else
