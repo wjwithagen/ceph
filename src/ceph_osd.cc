@@ -440,6 +440,7 @@ int main(int argc, const char **argv)
 	 << TEXT_NORMAL << dendl;
   }
 
+  dout(10) << "OSD:" << __func__ << "Creating Messengers" <<  dendl;
   Messenger *ms_public = Messenger::create(g_ceph_context, g_conf->ms_type,
 					   entity_name_t::OSD(whoami), "client",
 					   getpid(),
@@ -479,7 +480,14 @@ int main(int argc, const char **argv)
        << " " << ((g_conf->osd_journal.empty()) ?
 		  "(no journal)" : g_conf->osd_journal)
        << std::endl;
+  dout(0) << "OSD:" << __func__ << " starting osd." << whoami
+       << " at " << ms_public->get_myaddr()
+       << " osd_data " << g_conf->osd_data
+       << " " << ((g_conf->osd_journal.empty()) ?
+		  "(no journal)" : g_conf->osd_journal)
+       << dendl;
 
+  dout(10) << "OSD:" << __func__ << "Creating Throttles" <<  dendl;
   boost::scoped_ptr<Throttle> client_byte_throttler(
     new Throttle(g_ceph_context, "osd_client_bytes",
 		 g_conf->osd_client_message_size_cap));
@@ -538,9 +546,11 @@ int main(int argc, const char **argv)
 
   ms_objecter->set_default_policy(Messenger::Policy::lossy_client(0, CEPH_FEATURE_OSDREPLYMUX));
 
+  dout(10) << "OSD:" << __func__ << " bind to public addr" <<  dendl;
   r = ms_public->bind(g_conf->public_addr);
   if (r < 0)
     exit(1);
+  dout(10) << "OSD:" << __func__ << " bind to cluser addr" <<  dendl;
   r = ms_cluster->bind(g_conf->cluster_addr);
   if (r < 0)
     exit(1);
@@ -559,6 +569,7 @@ int main(int argc, const char **argv)
     if (hb_back_addr.is_ip())
       hb_back_addr.set_port(0);
   }
+  dout(10) << "OSD:" << __func__ << " bind to heartbeat back addr" <<  dendl;
   r = ms_hb_back_server->bind(hb_back_addr);
   if (r < 0)
     exit(1);
@@ -570,6 +581,7 @@ int main(int argc, const char **argv)
   entity_addr_t hb_front_addr = g_conf->public_addr;
   if (hb_front_addr.is_ip())
     hb_front_addr.set_port(0);
+  dout(10) << "OSD:" << __func__ << " bind to heartbeat front addr" <<  dendl;
   r = ms_hb_front_server->bind(hb_front_addr);
   if (r < 0)
     exit(1);
@@ -594,6 +606,7 @@ int main(int argc, const char **argv)
     return -1;
 #endif
 
+  dout(10) << "OSD:" << __func__ << " Create OSD" <<  dendl;
   osd = new OSD(g_ceph_context,
                 store,
                 whoami,
@@ -615,6 +628,7 @@ int main(int argc, const char **argv)
     return 1;
   }
 
+  dout(10) << "OSD:" << __func__ << " Start Messengers" <<  dendl;
   ms_public->start();
   ms_hb_front_client->start();
   ms_hb_back_client->start();
@@ -624,6 +638,7 @@ int main(int argc, const char **argv)
   ms_objecter->start();
 
   // start osd
+  dout(10) << "OSD:" << __func__ << " Start OSD" <<  dendl;
   err = osd->init();
   if (err < 0) {
     derr << TEXT_RED << " ** ERROR: osd init failed: " << cpp_strerror(-err)
@@ -636,13 +651,16 @@ int main(int argc, const char **argv)
 #endif
 
   // install signal handlers
+  dout(10) << "OSD:" << __func__ << " Install signal_handlers" <<  dendl;
   init_async_signal_handler();
   register_async_signal_handler(SIGHUP, sighup_handler);
   register_async_signal_handler_oneshot(SIGINT, handle_osd_signal);
   register_async_signal_handler_oneshot(SIGTERM, handle_osd_signal);
 
+  dout(10) << "OSD:" << __func__ << " Start osd_final_init" << dendl;
   osd->final_init();
 
+  dout(10) << "OSD:" << __func__ << " selfinect SIGTERM"<< dendl;
   if (g_conf->inject_early_sigterm)
     kill(getpid(), SIGTERM);
 
