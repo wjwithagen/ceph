@@ -65,7 +65,9 @@ int Processor::bind(const entity_addr_t &bind_addr,
 {
   const md_config_t *conf = msgr->cct->_conf;
   // bind to a socket
-  ldout(msgr->cct, 10) << __func__ << dendl;
+  ldout(msgr->cct, 10) << __func__ << " start," 
+	<< " avoid: " << avoid_ports
+	<< dendl;
 
   int family;
   switch (bind_addr.get_family()) {
@@ -95,7 +97,7 @@ int Processor::bind(const entity_addr_t &bind_addr,
 
   for (int i = 0; i < conf->ms_bind_retry_count; i++) {
     if (i > 0) {
-      lderr(msgr->cct) << __func__ << " was unable to bind. Trying again in "
+      lderr(msgr->cct) << __func__ << ":" << __LINE__ << " was unable to bind. Trying again in "
                        << conf->ms_bind_retry_delay << " seconds " << dendl;
       sleep(conf->ms_bind_retry_delay);
     }
@@ -105,7 +107,7 @@ int Processor::bind(const entity_addr_t &bind_addr,
         r = worker->listen(listen_addr, opts, &listen_socket);
       }, false);
       if (r < 0) {
-        lderr(msgr->cct) << __func__ << " unable to bind to " << listen_addr
+        lderr(msgr->cct) << __func__ << ":" << __LINE__ << " unable to bind to " << listen_addr
                          << ": " << cpp_strerror(r) << dendl;
         continue;
       }
@@ -123,21 +125,21 @@ int Processor::bind(const entity_addr_t &bind_addr,
           break;
       }
       if (r < 0) {
-        lderr(msgr->cct) << __func__ << " unable to bind to " << listen_addr
+        lderr(msgr->cct) << __func__ << ":" << __LINE__ << " unable to bind to " << listen_addr
                          << " on any port in range " << msgr->cct->_conf->ms_bind_port_min
                          << "-" << msgr->cct->_conf->ms_bind_port_max << ": "
                          << cpp_strerror(r) << dendl;
         listen_addr.set_port(0); // Clear port before retry, otherwise we shall fail again.
         continue;
       }
-      ldout(msgr->cct, 10) << __func__ << " bound on random port " << listen_addr << dendl;
+      ldout(msgr->cct, 10) << __func__ << ":" << __LINE__ << " bound on random port " << listen_addr << dendl;
     }
     if (r == 0)
       break;
   }
   // It seems that binding completely failed, return with that exit status
   if (r < 0) {
-    lderr(msgr->cct) << __func__ << " was unable to bind after " << conf->ms_bind_retry_count
+    lderr(msgr->cct) << __func__ << ":" << __LINE__ << " was unable to bind after " << conf->ms_bind_retry_count
                      << " attempts: " << cpp_strerror(r) << dendl;
     return r;
   }
@@ -345,7 +347,7 @@ int AsyncMessenger::bind(const entity_addr_t &bind_addr)
 
 int AsyncMessenger::rebind(const set<int>& avoid_ports)
 {
-  ldout(cct,1) << __func__ << " rebind avoid " << avoid_ports << dendl;
+  ldout(cct,1) << __func__ << " Async rebind avoid " << avoid_ports << dendl;
   assert(did_bind);
 
   for (auto &&p : processors)
