@@ -599,7 +599,7 @@ add_custom_target(tests
 enable_testing()
 set(CMAKE_CTEST_COMMAND ctest)
 add_custom_target(check
-  COMMAND ${CMAKE_CTEST_COMMAND}
+  COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
   DEPENDS tests)
 
 add_subdirectory(src)
