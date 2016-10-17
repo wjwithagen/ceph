@@ -32,7 +32,6 @@ function vstart_setup()
     export PATH="$(pwd):${PATH}"
     $CEPH_ROOT/src/vstart.sh \
         --short \
-        -d \
         -o 'paxos propose interval = 0.01' \
         -n -l $CEPH_START || return 1
     export CEPH_CONF=$CEPH_DIR/ceph.conf
