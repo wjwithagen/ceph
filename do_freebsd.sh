@@ -37,6 +37,9 @@ fi
 #	-D CMAKE_CXX_COMPILER="/usr/local/bin/clang++-devel" \
 #	-D CMAKE_C_COMPILER="/usr/local/bin/clang-devel" \
 
+if [ x"$CEPHDEV"x != xx ]; then
+    BUILDOPTS="$BUILDOPTS V=1 VERBOSE=1"
+fi
 rm -rf build && ./do_cmake.sh "$*" \
 	-D CMAKE_BUILD_TYPE=Debug \
 	-D CMAKE_CXX_FLAGS_DEBUG="$CXX_FLAGS_DEBUG -O0 -g" \
