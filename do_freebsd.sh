@@ -46,6 +46,7 @@ rm -rf build && ./do_cmake.sh "$*" \
 	-D CMAKE_C_FLAGS_DEBUG="$C_FLAGS_DEBUG -O0 -g" \
 	-D ENABLE_GIT_VERSION=OFF \
 	-D WITH_SYSTEM_BOOST=ON \
+	-D WITH_CCACHE=ON \
 	-D WITH_LTTNG=OFF \
 	-D WITH_BLKID=OFF \
 	-D WITH_FUSE=OFF \
