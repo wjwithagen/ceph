@@ -14,7 +14,7 @@ static void test_encode_and_decode(const T& src)
   T dst;
   bufferlist::iterator i(bl.begin());
   decode(dst, i);
-  ASSERT_EQ(src, dst) << "Encoding roundtrip changed the string: orig=" << src << ", but new=" << dst;
+  ASSERT_EQ(src, dst) ;// << "Encoding roundtrip changed the string: orig=" << src << ", but new=" << dst;
 }
 
 TEST(EncodingRoundTrip, StringSimple) {
