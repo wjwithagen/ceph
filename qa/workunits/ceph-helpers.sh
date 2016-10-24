@@ -229,6 +229,8 @@ function test_kill_daemon() {
         kill_daemon $pidfile TERM || return 1
     done
 
+    # Wait a bit to get things reported down.
+    sleep 3
     ceph osd dump | grep "osd.0 down" || return 1
 
     name_prefix=mon
