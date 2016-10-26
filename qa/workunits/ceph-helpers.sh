@@ -310,7 +310,11 @@ function test_kill_daemons() {
     # killing just the osd and verify the mon still is responsive
     #
     kill_daemons $dir TERM osd || return 1
+
+    # wait for the results to propagate.
+    sleep 3
     ceph osd dump | grep "osd.0 down" || return 1
+
     #
     # kill the mon and verify it cannot be reached
     #
