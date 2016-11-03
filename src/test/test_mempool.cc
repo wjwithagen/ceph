@@ -229,20 +229,20 @@ TEST(mempool, set)
   set_obj.insert(obj(1, 2));
 }
 
-TEST(mempool, map)
-{
-  {
-    mempool::unittest_1::map<int,int> v;
-    v[1] = 2;
-    v[3] = 4;
-  }
-  {
-    mempool::unittest_2::map<int,obj> v;
-    v[1] = obj();
-    v[2] = obj(2);
-    v[3] = obj(2, 3);
-  }
-}
+// TEST(mempool, map)
+// {
+//   {
+//     mempool::unittest_1::map<int,int> v;
+//     v[1] = 2;
+//     v[3] = 4;
+//   }
+//   {
+//     mempool::unittest_2::map<int,obj> v;
+//     v[1] = obj();
+//     v[2] = obj(2);
+//     v[3] = obj(2, 3);
+//   }
+// }
 
 TEST(mempool, list)
 {
@@ -258,12 +258,12 @@ TEST(mempool, list)
   }
 }
 
-TEST(mempool, unordered_map)
-{
-  mempool::unittest_2::unordered_map<int,obj> h;
-  h[1] = obj();
-  h[2] = obj(1);
-}
+// TEST(mempool, unordered_map)
+// {
+//   mempool::unittest_2::unordered_map<int,obj> h;
+//   h[1] = obj();
+//   h[2] = obj(1);
+// }
 
 TEST(mempool, bufferlist)
 {
