@@ -806,7 +806,7 @@ function get_config() {
 
     CEPH_ARGS='' \
         ceph --format xml daemon $dir/ceph-$daemon.$id.asok \
-        config get $config | \
+        config get $config 2> /dev/null | \
         $XMLSTARLET sel -t -m "//$config" -v . -n
 }
 
