@@ -18,6 +18,8 @@
 # GNU Library Public License for more details.
 #
 
+PS4='${BASH_SOURCE[0]}:$LINENO: ${FUNCNAME[0]}:  '
+
 TIMEOUT=300
 PG_NUM=4
 : ${CEPH_BUILD_VIRTUALENV:=/tmp}
@@ -1175,6 +1177,7 @@ function wait_for_clean() {
         # Comparing get_num_active_clean & get_num_pgs is used to determine
         # if the cluster is clean. That's almost an inline of is_clean() to
         # get more performance by avoiding multiple calls of get_num_active_clean.
+	ceph pg dump pgs
         cur_active_clean=$(get_num_active_clean)
         test $cur_active_clean = $(get_num_pgs) && break
         if test $cur_active_clean != $num_active_clean ; then
@@ -1557,7 +1560,7 @@ function main() {
         teardown $dir || return 1
         return 0
     else
-        display_logs $dir
+        # display_logs $dir
         teardown_error $dir
         return 1
     fi
