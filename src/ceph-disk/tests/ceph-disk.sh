@@ -27,7 +27,7 @@ if [ -z "$CEPH_ROOT" ] || [ -z "$CEPH_BIN" ] || [ -z "$CEPH_LIB" ]; then
 fi
 source $CEPH_ROOT/qa/workunits/ceph-helpers.sh
 
-set -x
+set -xv
 
 PS4='${BASH_SOURCE[0]}:$LINENO: ${FUNCNAME[0]}:  '
 
@@ -38,6 +38,11 @@ CEPH_DISK_ARGS=
 CEPH_DISK_ARGS+=" --verbose"
 CEPH_DISK_ARGS+=" --prepend-to-path="
 TIMEOUT=360
+if [ `uname` != FreeBSD ]; then
+    PROCDIR=""
+else
+    PROCDIR="/compat/linux"
+fi
 
 cat=$(which cat)
 timeout=$(which timeout)
@@ -59,11 +64,12 @@ function teardown() {
         return
     fi
     kill_daemons $dir
-    if [ $(stat -f -c '%T' .) == "btrfs" ]; then
+    if [ `uname` != FreeBSD ] && \
+       [ $(stat -f -c '%T' .) == "btrfs" ]; then
         rm -fr $dir/*/*db
         __teardown_btrfs $dir
     fi
-    grep " $(pwd)/$dir/" < /proc/mounts | while read mounted rest ; do
+    grep " $(pwd)/$dir/" < ${PROCDIR}/proc/mounts | while read mounted rest ; do
         umount $mounted
     done
     rm -fr $dir
@@ -169,7 +175,7 @@ function test_mark_init() {
     ${CEPH_DISK} $CEPH_DISK_ARGS \
         prepare --osd-uuid $osd_uuid $osd_data || return 1
 
-    $timeout $TIMEOUT ${CEPH_DISK} $CEPH_DISK_ARGS \
+    ${CEPH_DISK} $CEPH_DISK_ARGS \
         --verbose \
         activate \
         --mark-init=auto \
@@ -381,8 +387,10 @@ function run() {
     default_actions+="test_activate_dir_magic "
     default_actions+="test_activate_dir "
     default_actions+="test_keyring_path "
+    [ `uname` != FreeBSD ] && \
     default_actions+="test_mark_init "
     default_actions+="test_zap "
+    [ `uname` != FreeBSD ] && \
     default_actions+="test_activate_dir_bluestore "
     default_actions+="test_ceph_osd_mkfs "
     local actions=${@:-$default_actions}
