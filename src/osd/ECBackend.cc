@@ -968,11 +968,12 @@ void ECBackend::handle_sub_read(
 	true); // Allow EIO return
       if (r < 0) {
 	get_parent()->clog_error() << __func__
-				   << ": Error " << r
-				   << " reading "
+                                   << ": Error " << cpp_strerror(r) << " ("  << r
+				   << ") reading "
 				   << i->first;
-	dout(5) << __func__ << ": Error " << r
-		<< " reading " << i->first << dendl;
+	dout(5) << __func__ 
+                << ": Error " << cpp_strerror(r) << " ("  << r
+		<< ") reading " << i->first << dendl;
 	goto error;
       } else {
         dout(20) << __func__ << " read request=" << j->get<1>() << " r=" << r << " len=" << bl.length() << dendl;
