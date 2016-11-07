@@ -1585,6 +1585,8 @@ function run_tests() {
     local dir=td/ceph-helpers
     local status
 
+    echo Testing functions: $funcs
+
     for func in $funcs ; do
 	echo Running test: $func
 	$func $dir
