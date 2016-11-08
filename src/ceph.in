@@ -106,7 +106,7 @@ elif os.path.exists(os.path.join(os.getcwd(), "CMakeCache.txt")) \
     else:
         src_path = None
         DEVMODEMSG = ''
-        for l in open(cmakecachepath):
+        for l in open("./CMakeCache.txt"):
             if l.startswith("ceph_SOURCE_DIR:STATIC="):
                 src_path = l.split("=")[1].strip()
 
