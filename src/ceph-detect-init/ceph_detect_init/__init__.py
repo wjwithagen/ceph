@@ -104,7 +104,6 @@ def platform_information():
         distro = 'freebsd'
         release = platform.release()
         codename = platform.version().split(' ')[3].split(':')[0]
-        logging.debug(
             'platform_information: release = {}, version = {}'.format(
                 platform.release(), platform.version()))
     else:
