@@ -178,19 +178,19 @@ class TestCephDetectInit(testtools.TestCase):
             self.assertEqual('squeeze', distro.codename)
             self.assertEqual('sysvinit', distro.init)
 
-        with mock.patch.multiple('platform',
-                                 system=lambda: 'FreeBSD',
-                                 release=lambda: '12.0-CURRENT',
-                                 version=lambda: 'FreeBSD 12.0 #1 r306554M:'):
-            distro = ceph_detect_init.get()
-            self.assertEqual(freebsd, distro)
-            self.assertEqual('freebsd', distro.name)
-            self.assertEqual('freebsd', distro.normalized_name)
-            self.assertEqual('freebsd', distro.distro)
-            self.assertFalse(distro.is_el)
-            self.assertEqual('12.0-CURRENT', distro.release)
-            self.assertEqual('r306554M', distro.codename)
-            self.assertEqual('bsdrc', distro.init)
+        with mock.patch('platform.system', lambda: 'FreeBSD'):
+            with mock.patch.multiple('platform',
+                                     release=lambda: '12.0-CURRENT',
+                                     version=lambda: 'FreeBSD 12 1 r306554M:'):
+                distro = ceph_detect_init.get()
+                self.assertEqual(freebsd, distro)
+                self.assertEqual('freebsd', distro.name)
+                self.assertEqual('freebsd', distro.normalized_name)
+                self.assertEqual('freebsd', distro.distro)
+                self.assertFalse(distro.is_el)
+                self.assertEqual('12.0-CURRENT', distro.release)
+                self.assertEqual('r306554M', distro.codename)
+                self.assertEqual('bsdrc', distro.init)
 
         with mock.patch('platform.system',
                         lambda: 'cephix'):
