@@ -242,25 +242,25 @@ class TestCephDetectInit(testtools.TestCase):
             self.assertEqual(('debian', '6.0', 'squeeze'),
                              ceph_detect_init.platform_information())
 
-        with mock.patch('platform.linux_distribution',
-                        lambda **kwargs: (('debian', '7.0', ''))):
-            self.assertEqual(('debian', '7.0', 'wheezy'),
-                             ceph_detect_init.platform_information())
+            with mock.patch('platform.linux_distribution',
+                            lambda **kwargs: (('debian', '7.0', ''))):
+                self.assertEqual(('debian', '7.0', 'wheezy'),
+                                 ceph_detect_init.platform_information())
 
-        with mock.patch('platform.linux_distribution',
-                        lambda **kwargs: (('debian', '8.0', ''))):
-            self.assertEqual(('debian', '8.0', 'jessie'),
-                             ceph_detect_init.platform_information())
+            with mock.patch('platform.linux_distribution',
+                            lambda **kwargs: (('debian', '8.0', ''))):
+                self.assertEqual(('debian', '8.0', 'jessie'),
+                                 ceph_detect_init.platform_information())
 
-        with mock.patch('platform.linux_distribution',
-                        lambda **kwargs: (('debian', 'jessie/sid', ''))):
-            self.assertEqual(('debian', 'jessie/sid', 'sid'),
-                             ceph_detect_init.platform_information())
+            with mock.patch('platform.linux_distribution',
+                            lambda **kwargs: (('debian', 'jessie/sid', ''))):
+                self.assertEqual(('debian', 'jessie/sid', 'sid'),
+                                 ceph_detect_init.platform_information())
 
-        with mock.patch('platform.linux_distribution',
-                        lambda **kwargs: (('debian', 'sid/jessie', ''))):
-            self.assertEqual(('debian', 'sid/jessie', 'sid'),
-                             ceph_detect_init.platform_information())
+            with mock.patch('platform.linux_distribution',
+                            lambda **kwargs: (('debian', 'sid/jessie', ''))):
+                self.assertEqual(('debian', 'sid/jessie', 'sid'),
+                                 ceph_detect_init.platform_information())
 
     @mock.patch('platform.system', lambda: 'FreeBSD')
     def test_platform_information_freebsd(self):
