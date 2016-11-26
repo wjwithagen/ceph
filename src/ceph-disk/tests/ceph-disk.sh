@@ -75,6 +75,40 @@ function teardown() {
     rm -fr $dir
 }
 
+function timeout_diagnose() {
+    local duration=$1
+    shift
+    local cmnd=$1
+    shift
+    local status
+
+    $timeout $duration $cmnd $@ 
+    status=$?
+    if [ $status -ge 128 ]; then
+	echo "Command received signal: $status"
+	return 1
+    else
+        case $status in
+        125)
+	    echo "Using an invalid parameter with timout"
+	    return 1
+	    ;;
+        126)
+	    echo "Command: $cmnd is an invalid command"
+	    return 1
+	    ;;
+        127)
+	    echo "Command: $cmnd is a non existing command"
+	    return 1
+	    ;;
+	 *)
+	    echo "timeout not expired, status: $status"
+	    return $status
+	    ;;
+         esac
+     fi
+}
+
 function command_fixture() {
     local dir=$1
     shift
@@ -156,7 +190,7 @@ function test_path() {
 function test_no_path() {
     local dir=$1
     shift
-    ( export PATH=../ceph-detect-init/virtualenv/bin:virtualenv/bin:$CEPH_BIN:/usr/bin:/bin ; test_activate_dir $dir) || return 1
+    ( export PATH=../ceph-detect-init/virtualenv/bin:virtualenv/bin:$CEPH_BIN:/usr/bin:/bin:/usr/local/bin ; test_activate_dir $dir) || return 1
 }
 
 function test_mark_init() {
@@ -246,14 +280,17 @@ function test_pool_read_write() {
     local osd_uuid=$1
     local TEST_POOL=rbd
 
-    $timeout $TIMEOUT ceph osd pool set $TEST_POOL size 1 || return 1
+    # $timeout $TIMEOUT ceph osd pool set $TEST_POOL size 1 || return 1
+    timeout_diagnose $TIMEOUT ceph osd pool set $TEST_POOL size 1 || return 1
 
     local id=$(ceph osd create $osd_uuid)
     local weight=1
     ceph osd crush add osd.$id $weight root=default host=localhost || return 1
     echo FOO > $dir/BAR
-    $timeout $TIMEOUT rados --pool $TEST_POOL put BAR $dir/BAR || return 1
-    $timeout $TIMEOUT rados --pool $TEST_POOL get BAR $dir/BAR.copy || return 1
+    # $timeout $TIMEOUT rados --pool $TEST_POOL put BAR $dir/BAR || return 1
+    timeout_diagnose $TIMEOUT rados --pool $TEST_POOL put BAR $dir/BAR || return 1
+    # $timeout $TIMEOUT rados --pool $TEST_POOL get BAR $dir/BAR.copy || return 1
+    timeout_diagnose $TIMEOUT rados --pool $TEST_POOL get BAR $dir/BAR.copy || return 1
     $diff $dir/BAR $dir/BAR.copy || return 1
 }
 
@@ -261,11 +298,18 @@ function test_activate() {
     local to_prepare=$1
     local to_activate=$2
     local osd_uuid=$($uuidgen)
+    local timeoutcmd="timeout_diagnose $TIMEOUT"
+
+    if [ `uname` = FreeBSD ]; then
+        # for unknown reasons FreeBSD timeout does not return here
+        # So we run without timeout
+        timeoutcmd=""
+    fi
 
     ${CEPH_DISK} $CEPH_DISK_ARGS \
         prepare --osd-uuid $osd_uuid $to_prepare || return 1
 
-    $timeout $TIMEOUT ${CEPH_DISK} $CEPH_DISK_ARGS \
+    $timeoutcmd ${CEPH_DISK} $CEPH_DISK_ARGS \
         activate \
         --mark-init=none \
         $to_activate || return 1
