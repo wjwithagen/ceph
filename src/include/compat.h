@@ -157,4 +157,7 @@
     0; })
 #endif
 
+#define IGNORE_UNUSED_VAR(v) \
+    do { (void)v; } while(0)
+
 #endif /* !CEPH_COMPAT_H */

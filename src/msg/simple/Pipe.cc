@@ -12,6 +12,7 @@
  * 
  */
 
+#include "include/compat.h"
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -943,6 +944,7 @@ void Pipe::set_socket_options()
   int prio = msgr->get_socket_priority();
   if (prio >= 0) {
     int r = -1;
+    IGNORE_UNUSED_VAR(r);
 #ifdef IPTOS_CLASS_CS6
     int iptos = IPTOS_CLASS_CS6;
     r = ::setsockopt(sd, IPPROTO_IP, IP_TOS, &iptos, sizeof(iptos));
@@ -1854,7 +1856,7 @@ void Pipe::writer()
       if (sd >= 0) {
 	// we can ignore return value, actually; we don't care if this succeeds.
 	int r = ::write(sd, &tag, 1);
-	(void)r;
+	IGNORE_UNUSED_VAR(r);
       }
       pipe_lock.Lock();
       continue;

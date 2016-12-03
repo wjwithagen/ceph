@@ -3577,7 +3577,7 @@ int BlueStore::_open_db(bool create)
 	  path + "/db.slow " +
 	  path + "/db.wal";
 	int r = system(cmd.c_str());
-	(void)r;
+	IGNORE_UNUSED_VAR(r);
       }
       env = new rocksdb::EnvMirror(b, a, false, true);
     } else {

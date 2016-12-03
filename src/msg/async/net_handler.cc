@@ -14,6 +14,7 @@
  *
  */
 
+#include "include/compat.h"
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -127,6 +128,7 @@ void NetHandler::set_priority(int sd, int prio)
 {
   if (prio >= 0) {
     int r = -1;
+    IGNORE_UNUSED_VAR(r);
 #ifdef IPTOS_CLASS_CS6
     int iptos = IPTOS_CLASS_CS6;
     r = ::setsockopt(sd, IPPROTO_IP, IP_TOS, &iptos, sizeof(iptos));

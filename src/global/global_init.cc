@@ -319,7 +319,7 @@ global_init(std::vector < const char * > *alt_def_args,
   if (g_conf->debug_deliberately_leak_memory) {
     derr << "deliberately leaking some memory" << dendl;
     char *s = new char[1234567];
-    (void)s;
+    IGNORE_UNUSED_VAR(s);
     // cppcheck-suppress memleak
   }
 
