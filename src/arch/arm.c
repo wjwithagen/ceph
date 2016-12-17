@@ -51,8 +51,10 @@ int ceph_arch_arm_probe(void)
 	ceph_arch_aarch64_crc32 = 0;  // sorry!
 # endif
 #else
+#if !defined(__FreeBSD__)
 	if (0)
 		get_hwcap();  // make compiler shut up
+#endif
 #endif
 	return 0;
 }
