@@ -135,17 +135,11 @@ function teardown() {
         && [ $(stat -f -c '%T' .) == "btrfs" ]; then
         __teardown_btrfs $dir
     fi
-    rm -fr $dir
-}
-
-function teardown_error() {
-    local dir=$1
-    kill_daemons $dir KILL
-    if [ `uname` != FreeBSD ] \
-        && [ $(stat -f -c '%T' .) == "btrfs" ]; then
-        __teardown_btrfs $dir
+    if [ x${CEPH_DEBUG}x != xx ]; then 
+        echo should remove: rm -fr $dir
+    else
+        rm -fr $dir
     fi
-    echo Keeping $dir for post-mortum analysis
 }
 
 function teardown_error() {
@@ -564,6 +558,7 @@ function destroy_osd() {
     ceph osd out osd.$id || return 1
     ceph auth del osd.$id || return 1
     ceph osd crush remove osd.$id || return 1
+    sleep 3
     ceph osd rm $id || return 1
     teardown $dir/$id || return 1
     rm -fr $dir/$id
