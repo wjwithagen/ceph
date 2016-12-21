@@ -36,7 +36,7 @@ fi
 #   To test with a new release Clang, use with cmake:
 #	-D CMAKE_CXX_COMPILER="/usr/local/bin/clang++-devel" \
 #	-D CMAKE_C_COMPILER="/usr/local/bin/clang-devel" \
-
+CXX_FLAGS_DEBUG="-Wno-null-dereference"
 rm -rf build && ./do_cmake.sh "$*" \
 	-D CMAKE_BUILD_TYPE=Debug \
 	-D CMAKE_CXX_FLAGS_DEBUG="$CXX_FLAGS_DEBUG -O0 -g" \
