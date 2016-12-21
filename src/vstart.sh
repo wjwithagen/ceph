@@ -369,9 +369,9 @@ else
 	debug mon = 20
         debug paxos = 20
         debug auth = 20
-        debug ms = 1'
+        debug ms = 19'
     COSDDEBUG='
-        debug ms = 1
+        debug ms = 19
         debug osd = 25
         debug objecter = 20
         debug monc = 20

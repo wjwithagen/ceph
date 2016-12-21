@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/bash -xv
 #
 # Copyright (C) 2013 Cloudwatt <libre.licensing@cloudwatt.com>
 # Copyright (C) 2015 Red Hat <contact@redhat.com>
@@ -31,6 +31,7 @@ function vstart_setup()
     export LC_ALL=C # some tests are vulnerable to i18n
     export PATH="$(pwd):${PATH}"
     $CEPH_ROOT/src/vstart.sh \
+	--debug \
         --short \
         -o 'paxos propose interval = 0.01' \
         -n -l $CEPH_START || return 1
