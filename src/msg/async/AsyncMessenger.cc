@@ -103,6 +103,8 @@ int Processor::bind(const entity_addr_t &bind_addr,
     }
 
     if (listen_addr.get_port()) {
+      lderr(msgr->cct) << __func__ << ":" << __LINE__ << " trying to bind to " << listen_addr
+                       << dendl;
       worker->center.submit_to(worker->center.get_id(), [this, &listen_addr, &opts, &r]() {
         r = worker->listen(listen_addr, opts, &listen_socket);
       }, false);
@@ -118,6 +120,8 @@ int Processor::bind(const entity_addr_t &bind_addr,
           continue;
 
         listen_addr.set_port(port);
+        lderr(msgr->cct) << __func__ << ":" << __LINE__ << " trying to bind to " << listen_addr
+                       << dendl;
         worker->center.submit_to(worker->center.get_id(), [this, &listen_addr, &opts, &r]() {
           r = worker->listen(listen_addr, opts, &listen_socket);
         }, false);
