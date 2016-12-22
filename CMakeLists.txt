@@ -599,7 +599,10 @@ add_custom_target(tests
 enable_testing()
 set(CMAKE_CTEST_COMMAND ctest)
 add_custom_target(check
-  COMMAND ${CMAKE_CTEST_COMMAND} --timeout 1200 --output-on-failure
+  COMMAND ${CMAKE_CTEST_COMMAND} --timeout 1200 
+  DEPENDS tests)
+add_custom_target(recheck
+  COMMAND ${CMAKE_CTEST_COMMAND} --timeout 1200 --run-failed --output-on-failure
   DEPENDS tests)
 
 add_subdirectory(src)
