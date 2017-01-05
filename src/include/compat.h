@@ -38,6 +38,10 @@
 #undef ENODATA
 #define ENODATA ENOATTR
 #endif
+#ifndef EREMOTEIO
+#define EREMOTEIO 121
+#endif
+
 #ifndef MSG_MORE
 #define	MSG_MORE 0
 #endif
