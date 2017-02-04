@@ -255,6 +255,7 @@ INIT_SYSTEMS = [
     'sysvinit',
     'systemd',
     'openrc',
+    'bsdrc',
     'auto',
     'none',
 ]
@@ -3133,9 +3134,21 @@ def start_daemon(
                     'start',
                 ],
             )
+        elif os.path.exists(os.path.join(path, 'bsdrc')):
+            base_script = '/usr/local/etc/rc.d/ceph'
+            osd_script = '{base} start osd.{osd_id}'.format(
+                base=base_script,
+                osd_id=osd_id
+            )
+            command_check_call(
+                [
+                    osd_script,
+                ],
+            )
         else:
-            raise Error('{cluster} osd.{osd_id} is not tagged '
-                        'with an init system'.format(
+            raise Error('{cluster} osd.{osd_id} '
+                        'is not tagged with an init system'
+                        .format(
                             cluster=cluster,
                             osd_id=osd_id,
                         ))
@@ -3198,9 +3211,17 @@ def stop_daemon(
                     'stop',
                 ],
             )
+        elif os.path.exists(os.path.join(path, 'bsdrc')):
+            command_check_call(
+                [
+                    '/usr/local/etc/rc.d/ceph stop osd.{osd_id}'.format(osd_id=osd_id),
+                    'stop',
+                ],
+            )
         else:
-            raise Error('{cluster} osd.{osd_id} is not tagged with an init '
-                        ' system'.format(cluster=cluster, osd_id=osd_id))
+            raise Error('{cluster} osd.{osd_id} '
+                        'is not tagged with an init system'
+                        .format(cluster=cluster, osd_id=osd_id))
     except subprocess.CalledProcessError as e:
         raise Error('ceph osd stop failed', e)
 
