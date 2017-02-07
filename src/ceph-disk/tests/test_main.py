@@ -267,6 +267,8 @@ class TestCephDisk(object):
                     'state': 'prepared'} == desc
 
     def test_list_all_partitions(self):
+        if platform.system() == "FreeBSD":
+            return
         disk = "Xda"
         partition = "Xda1"
 

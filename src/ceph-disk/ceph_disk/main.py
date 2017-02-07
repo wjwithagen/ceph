@@ -709,13 +709,14 @@ def list_all_partitions():
     """
     Return a list of devices and partitions
     """
-    names = os.listdir('/sys/block')
     dev_part_list = {}
-    for name in names:
-        # /dev/fd0 may hang http://tracker.ceph.com/issues/6827
-        if re.match(r'^fd\d$', name):
-            continue
-        dev_part_list[name] = list_partitions(get_dev_path(name))
+    if not FREEBSD:
+        names = os.listdir('/sys/block')
+        for name in names:
+            # /dev/fd0 may hang http://tracker.ceph.com/issues/6827
+            if re.match(r'^fd\d$', name):
+                continue
+            dev_part_list[name] = list_partitions(get_dev_path(name))
     return dev_part_list
 
 
