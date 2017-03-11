@@ -87,6 +87,7 @@ enum MirrorImageState {
 
 struct MirrorImage {
   MirrorImage() {}
+  ~MirrorImage() {}
   MirrorImage(const std::string &global_image_id, MirrorImageState state)
     : global_image_id(global_image_id), state(state) {}
 
@@ -133,6 +134,7 @@ inline void decode(MirrorImageStatusState &state, bufferlist::iterator& it)
 
 struct MirrorImageStatus {
   MirrorImageStatus() {}
+  ~MirrorImageStatus() {}
   MirrorImageStatus(MirrorImageStatusState state,
 		    const std::string &description = "")
     : state(state), description(description) {}
