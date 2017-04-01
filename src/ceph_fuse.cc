@@ -228,6 +228,7 @@ int main(int argc, const char **argv, const char *envp[]) {
 
     cerr << "ceph-fuse[" << getpid() << "]: starting ceph client" << std::endl;
     r = messenger->start();
+    cerr << "ceph-fuse[" << getpid() << "]: messenger started" << std::endl;
     if (r < 0) {
       cerr << "ceph-fuse[" << getpid() << "]: ceph messenger failed with " << cpp_strerror(-r) << std::endl;
       goto out_messenger_start_failed;
@@ -235,18 +236,26 @@ int main(int argc, const char **argv, const char *envp[]) {
 
     init_async_signal_handler();
     register_async_signal_handler(SIGHUP, sighup_handler);
+    cerr << "ceph-fuse[" << getpid() << "]: sighup_handler registered" << std::endl;
 
     // start client
     r = client->init();
+    cerr << "ceph-fuse[" << getpid() << "]: client->init() started" << std::endl;
     if (r < 0) {
       cerr << "ceph-fuse[" << getpid() << "]: ceph client failed with " << cpp_strerror(-r) << std::endl;
       goto out_init_failed;
     }
     
+    cerr << "ceph-fuse[" << getpid() << "]: updating metadata: " 
+         << " mount_point: " << cfuse->get_mount_point()
+	 << std::endl;
     client->update_metadata("mount_point", cfuse->get_mount_point());
     perms = client->pick_my_perms();
     // start up fuse
     // use my argc, argv (make sure you pass a mount point!)
+    cerr << "ceph-fuse[" << getpid() << "]: client->mount() starting: " 
+	 << g_conf->client_mountpoint.c_str() 
+         << std::endl;
     r = client->mount(g_conf->client_mountpoint.c_str(), perms,
 		      g_ceph_context->_conf->fuse_require_active_mds);
     if (r < 0) {
@@ -256,15 +265,18 @@ int main(int argc, const char **argv, const char *envp[]) {
       goto out_shutdown;
     }
 
+    cerr << "ceph-fuse[" << getpid() << "]: cfuse->start()" << std::endl;
     r = cfuse->start();
     if (r != 0) {
       cerr << "ceph-fuse[" << getpid() << "]: fuse failed to start" << std::endl;
       goto out_client_unmount;
     }
 
-    cerr << "ceph-fuse[" << getpid() << "]: starting fuse" << std::endl;
+    cerr << "ceph-fuse[" << getpid() << "]: starting fuse, tester.init()" << std::endl;
     tester.init(cfuse, client);
+    cerr << "ceph-fuse[" << getpid() << "]: tester.create()" << std::endl;
     tester.create("tester");
+    cerr << "ceph-fuse[" << getpid() << "]: cfuse-loop()" << std::endl;
     r = cfuse->loop();
     tester.join(&tester_rp);
     tester_r = static_cast<int>(reinterpret_cast<uint64_t>(tester_rp));
