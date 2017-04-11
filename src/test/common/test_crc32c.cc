@@ -266,3 +266,4 @@ TEST(Crc32c, RangeNull) {
     ASSERT_EQ(crc, *check);
   }
 }
+

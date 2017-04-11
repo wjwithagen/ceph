@@ -24,3 +24,4 @@ int ceph_arch_probe(void)
 
 // do this once using the magic of c++.
 int ceph_arch_probed = ceph_arch_probe();
+

@@ -52,3 +52,4 @@ ceph_crc32c_func_t ceph_choose_crc32(void)
  */
 ceph_crc32c_func_t ceph_crc32c_func = ceph_choose_crc32();
 
+

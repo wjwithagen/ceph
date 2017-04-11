@@ -117,3 +117,4 @@ elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "(powerpc|ppc)64le")
     message(STATUS " HAVE_POWER8 yes")
   endif()
 endif()
+
