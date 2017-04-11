@@ -14,6 +14,7 @@
 *.swo
 *.tmp
 *.orig
+*.rej
 *.patch
 *.rej
 *.pyc
