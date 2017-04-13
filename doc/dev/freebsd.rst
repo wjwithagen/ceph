@@ -42,14 +42,15 @@ A sample file is provided in ``/usr/local/share/doc/ceph/sample.ceph.conf``
 MON creation
 ------------
 
-Monitors are created by following the manual creation steps on: 
-``http://docs.ceph.com/docs/master/install/manual-deployment/``
+Monitors are created by following the manual creation steps on::
+
+  http://docs.ceph.com/docs/master/install/manual-deployment/
 
 
 OSD creation
 ------------
 
-OSDs can be create with ``ceph-disk``: 
+OSDs can be create with ``ceph-disk``::
 
   ceph-disk prepare /var/lib/ceph/osd/osd1
   ceph-disk activate /var/lib/ceph/osd/osd1
