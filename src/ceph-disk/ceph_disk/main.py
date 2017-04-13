@@ -762,7 +762,7 @@ def list_all_partitions():
     """
     Return a list of devices and partitions
     """
-    if not FreeBSD:
+    if not FREEBSD:
         names = os.listdir('/sys/block')
         dev_part_list = {}
         for name in names:
@@ -771,11 +771,12 @@ def list_all_partitions():
                 continue
             dev_part_list[name] = list_partitions(get_dev_path(name))
     else:
-        for line in open(PROCDIR+"/partitions"):
-            columns = line.split(' ')
-            if len(columns) >= 4:
-                name = columns[3]
-                dev_part_list[name] = list_partitions(get_dev_path(name))
+        with open(os.path.join(PROCDIR, "partitions")) as partitions:
+            for line in partitions:
+                columns = line.split()
+                if len(columns) >= 4:
+                    name = columns[3]
+                    dev_part_list[name] = list_partitions(get_dev_path(name))
     return dev_part_list
 
 
@@ -4529,25 +4530,24 @@ def list_devices():
 def list_zfs():
     try:
         out, err, ret = command(
-            [   'zfs',
+            [
+                'zfs',
                 'list',
                 '-o', 'name,mountpoint'
             ]
-           )
+        )
     except subprocess.CalledProcessError as e:
         LOG.info('zfs list -o name,mountpoint '
-           'fails.\n (Error: %s)' % e)
-        return 1
+                 'fails.\n (Error: %s)' % e)
     lines = out.splitlines()
     for line in lines[2:]:
         vdevline = line.split()
-        if os.path.exists(vdevline[1]+'/active'):
-            elems = vdevline[1].split('/')
-            print(vdevline[0]+ " ceph data, active, cluster ceph, "+elems[5]+
-                " mounted on: "+ vdevline[1])
+        if os.path.exists(os.path.join(vdevline[1], 'active')):
+            elems = os.path.split(vdevline[1])
+            print(vdevline[0], "ceph data, active, cluster ceph,", elems[5],
+                  "mounted on:", vdevline[1])
         else:
-            print(vdevline[0]+ " other, zfs, mounted on: "+ vdevline[1])
-    return lines[2:]
+            print(vdevline[0] + " other, zfs, mounted on: " + vdevline[1])
 
 
 def main_list(args):
@@ -4586,13 +4586,9 @@ def main_list_freebsd(args):
     # Currently accomodate only ZFS Filestore partitions
     #   return a list of VDEVs and mountpoints
     # > zfs list
-    # NAME                            USED  AVAIL  REFER  MOUNTPOINT
-    # osd0                           1.01G  1.32T  1.01G  /var/lib/ceph/osd/osd.0
-    # osd1                           1.01G  1.32T  1.01G  /var/lib/ceph/osd/osd.1
-    # osd2                           1.01G  1.32T  1.01G  /var/lib/ceph/osd/osd.2
-    # osd3                           1.01G  1.75T  1.01G  /var/lib/ceph/osd/osd.3
-    # osd6                           5.01G  1.31T  5.01G  /var/lib/ceph/osd/osd.6
-    # osd7                           5.01G   220G  5.01G  /var/lib/ceph/osd/osd.7
+    # NAME   USED  AVAIL  REFER  MOUNTPOINT
+    # osd0  1.01G  1.32T  1.01G  /var/lib/ceph/osd/osd.0
+    # osd1  1.01G  1.32T  1.01G  /var/lib/ceph/osd/osd.1
     list_zfs()
 
 
