@@ -9,13 +9,13 @@ Disk layout
 Current implementation works on ZFS pools
 
 * created in /var/lib/ceph
-* One ZFS pool per OSD, like: 
+* One ZFS pool per OSD, like::
 
     gpart create -s GPT ada1
     gpart add -t freebsd-zfs -l osd1 ada1
     zpool create -o mountpoint=/var/lib/ceph/osd/osd.1 osd
 
-* Maybe add some cache and log (ZIL)? Assuming that ada2 is an SSD:
+* Maybe add some cache and log (ZIL)? Assuming that ada2 is an SSD::
  
     gpart create -s GPT ada2
     gpart add -t freebsd-zfs -l osd1-log -s 1G ada2
@@ -32,7 +32,7 @@ Configuration
 As per FreeBSD default parts of extra software go into ``/usr/local/``. Which
 means that for ``/etc/ceph.conf`` the default location is 
 ``/usr/local/etc/ceph/ceph.conf``. Smartest thing to do is to create a softlink
-from ``/etc/ceph`` to ``/usr/local/etc/ceph``
+from ``/etc/ceph`` to ``/usr/local/etc/ceph``::
 
   ln -s /usr/local/etc/ceph /etc/ceph
   
@@ -49,7 +49,7 @@ Monitors are created by following the manual creation steps on:
 OSD creation
 ------------
 
-OSDs can be create with ``ceph-disk`` 
+OSDs can be create with ``ceph-disk``: 
 
   ceph-disk prepare /var/lib/ceph/osd/osd1
   ceph-disk activate /var/lib/ceph/osd/osd1
