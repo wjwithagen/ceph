@@ -2,7 +2,7 @@
 # $FreeBSD: head/net/ceph-devel/Makefile 437431 2017-04-01 11:59:18Z antoine $
 
 PORTNAME=	ceph
-DISTVERSION=	wip.v2017-2-14
+DISTVERSION=	wip.FreeBSD.201704
 CATEGORIES=	net
 PKGNAMESUFFIX=	-devel
 
