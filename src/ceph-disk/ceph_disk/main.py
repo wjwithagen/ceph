@@ -640,7 +640,7 @@ def is_mpath(dev):
     True if the path is managed by multipath
     """
     if FREEBSD:
-        return True
+        return False
     uuid = get_dm_uuid(dev)
     return (uuid and
             (re.match('part\d+-mpath-', uuid) or
