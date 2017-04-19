@@ -1308,8 +1308,8 @@ function wait_for_health() {
     local -i loop=0
 
     while ! ceph health detail | grep "$grepstr" ; do
+        ceph health detail
 	if (( $loop >= ${#delays[*]} )) ; then
-            ceph health detail
             return 1
         fi
         sleep ${delays[$loop]}
