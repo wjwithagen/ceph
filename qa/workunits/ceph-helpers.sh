@@ -1321,7 +1321,7 @@ function wait_for_health_ok() {
      wait_for_health "HEALTH_OK" || return 1
 }
 
-function test_wait_for_health_ok() {
+function test_wait_for_health() {
     local dir=$1
 
     setup $dir || return 1
@@ -1329,7 +1329,7 @@ function test_wait_for_health_ok() {
     run_mgr $dir x || return 1
     ! TIMEOUT=1 wait_for_health_ok || return 1
     run_osd $dir 0 || return 1
-    wait_for_health_ok || return 1
+    wait_for_health "HEALTH_ERR too few PGs per OSD" || return 1
     teardown $dir || return 1
 }
 
