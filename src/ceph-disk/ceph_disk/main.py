@@ -4547,34 +4547,8 @@ def list_devices():
                                     space_map[space_uuid.lower()] = dev
                         finally:
                             unmount(tpath)
-def list_zfs():
-    try:
-        out, err, ret = command(
-            [
-                'zfs',
-                'list',
-                '-o', 'name,mountpoint'
-            ]
-        )
-    except subprocess.CalledProcessError as e:
-        LOG.info('zfs list -o name,mountpoint '
-                 'fails.\n (Error: %s)' % e)
-    lines = out.splitlines()
-    for line in lines[2:]:
-        vdevline = line.split()
-        if os.path.exists(os.path.join(vdevline[1], 'active')):
-            elems = os.path.split(vdevline[1])
-            print(vdevline[0], "ceph data, active, cluster ceph,", elems[5],
-                  "mounted on:", vdevline[1])
-        else:
-            print(vdevline[0] + " other, zfs, mounted on: " + vdevline[1])
-
-
                     except MountError:
                         pass
-        if FREEBSD:
-            main_list_freebsd(args)
-        else:
 
     LOG.debug("main_list: " + str(partmap) + ", uuid_map = " +
               str(uuid_map) + ", space_map = " + str(space_map))
@@ -4628,16 +4602,6 @@ def main_list(args):
             main_list_freebsd(args)
         else:
             main_list_protected(args)
-
-def main_list_freebsd(args):
-    # Currently accomodate only ZFS Filestore partitions
-    #   return a list of VDEVs and mountpoints
-    # > zfs list
-    # NAME   USED  AVAIL  REFER  MOUNTPOINT
-    # osd0  1.01G  1.32T  1.01G  /var/lib/ceph/osd/osd.0
-    # osd1  1.01G  1.32T  1.01G  /var/lib/ceph/osd/osd.1
-    list_zfs()
-
 
 
 def main_list_protected(args):
