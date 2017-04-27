@@ -646,7 +646,7 @@ def is_mpath(dev):
     True if the path is managed by multipath
     """
     if FREEBSD:
-        return True
+        return False
     uuid = get_dm_uuid(dev)
     return (uuid and
             (re.match('part\d+-mpath-', uuid) or
@@ -4616,7 +4616,7 @@ def list_zfs():
             print(vdevline[0], "ceph data, active, cluster ceph,", elems[1],
                   "mounted on:", vdevline[1])
         else:
-            print(vdevline[0] + " other, zfs, mounted on: " +  vdevline[1])
+            print(vdevline[0] + " other, zfs, mounted on: " + vdevline[1])
 
 
 def main_list(args):
