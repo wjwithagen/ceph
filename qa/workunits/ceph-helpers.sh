@@ -174,7 +174,8 @@ function test_teardown() {
 # @param delays sequence of sleep times before failure
 #
 function kill_daemon() {
-    set -x
+    local trace=$(shopt -q -o xtrace && echo true || echo false)
+    $trace && shopt -u -o xtrace
     local pid=$(cat $1)
     local send_signal=$2
     local delays=${3:-0.1 0.2 1 1 1 2 3 5 5 5 10 10 20 60 60 60 120}
@@ -189,6 +190,7 @@ function kill_daemon() {
          send_signal=0
          sleep $try
     done;
+    $trace && shopt -s -o xtrace
     return $exit_code
 }
 
