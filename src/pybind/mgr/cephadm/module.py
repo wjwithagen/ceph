@@ -17,6 +17,7 @@ from threading import Event
 
 from ceph.deployment.service_spec import PrometheusSpec
 from cephadm.cert_mgr import CertMgr
+from .utils import get_default_ssh_config
 from cephadm.tlsobject_store import TLSObjectScope, TLSObjectException
 
 import string
@@ -102,11 +103,12 @@ from .inventory import (
 from .upgrade import CephadmUpgrade
 from .template import TemplateMgr
 from .utils import CEPH_IMAGE_TYPES, RESCHEDULE_FROM_OFFLINE_HOSTS_TYPES, forall_hosts, \
-    cephadmNoImage, SpecialHostLabels
+    cephadmNoImage, SpecialHostLabels, is_fips_enabled
 from .configchecks import CephadmConfigChecks
 from .offline_watcher import OfflineHostWatcher
 from .tuned_profiles import TunedProfileUtils
 from .ceph_volume import CephVolume
+from .version_tracker import VersionTracker
 
 try:
     import asyncssh
@@ -160,6 +162,7 @@ def host_exists(hostname_position: int = 1) -> Callable:
 
 class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule):
     CLICommand = CephadmCLICommand
+
     _STORE_HOST_PREFIX = "host"
 
     instance = None
@@ -200,7 +203,7 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule):
         Option(
             'facts_cache_timeout',
             type='secs',
-            default=1 * 60,
+            default=10 * 60,
             desc='Seconds for which to cache host facts data',
         ),
         Option(
@@ -556,6 +559,17 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule):
                  'When enabled, cephadm and bash commands are validated and executed via '
                  'the secure invoker wrapper.'
         ),
+        Option(
+            'log_deploy_configuration',
+            type='bool',
+            default=False,
+            desc=(
+                'Whether to log deploy config for daemons cephadm deploys in both the cephadm mgr '
+                'module and cephadm.log on individual hosts. Useful for debugging and developers, '
+                'but these log statements may contain sensitive info such as cephx keys. Only relevant '
+                'when logging at debug level'
+            )
+        )
     ]
     for image in DefaultImages:
         MODULE_OPTIONS.append(Option(image.key, default=image.image_ref, desc=image.desc))
@@ -672,6 +686,7 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule):
             self.certificate_check_debug_mode = False
             self.certificate_check_period = 0
             self.cephadm_binary_logging_level = 'debug'
+            self.log_deploy_configuration = False
 
         self.notify(NotifyType.mon_map, None)
         self.config_notify()
@@ -692,6 +707,8 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule):
         self.ssh._reconfig_ssh()
 
         CephadmOrchestrator.instance = self
+
+        self.version_tracker = VersionTracker(self)
 
         self.upgrade = CephadmUpgrade(self)
 
@@ -1388,7 +1405,7 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule):
         ssh_config = self.get_store("ssh_config")
         if ssh_config:
             return HandleCommandResult(stdout=ssh_config)
-        return HandleCommandResult(stdout=DEFAULT_SSH_CONFIG)
+        return HandleCommandResult(stdout=get_default_ssh_config())
 
     @CephadmCLICommand.Write('cephadm generate-key')
     def _generate_key(self) -> Tuple[int, str, str]:
@@ -1396,16 +1413,31 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule):
         Generate a cluster SSH key (if not present)
         """
         if not self.ssh_pub or not self.ssh_key:
-            self.log.info('Generating ssh key...')
+            fips_enabled = is_fips_enabled()
+            key_type = 'rsa' if fips_enabled else 'ed25519'
+            self.log.info(
+                'Generating %s ssh key%s...',
+                key_type,
+                ' for FIPS mode' if fips_enabled else '',
+            )
             tmp_dir = TemporaryDirectory()
             path = tmp_dir.name + '/key'
+            args = [
+                '/usr/bin/ssh-keygen',
+                '-t', key_type,
+            ]
+
+            if fips_enabled:
+                args.extend(['-b', '4096'])
+
+            args.extend([
+                '-C', 'ceph-%s' % self._cluster_fsid,
+                '-N', '',
+                '-f', path,
+            ])
+
             try:
-                subprocess.check_call([
-                    '/usr/bin/ssh-keygen',
-                    '-C', 'ceph-%s' % self._cluster_fsid,
-                    '-N', '',
-                    '-f', path
-                ])
+                subprocess.check_call(args)
                 with open(path, 'r') as f:
                     secret = f.read()
                 with open(path + '.pub', 'r') as f:
@@ -3093,6 +3125,19 @@ Then run the following:
             results.append(note)
         return results
 
+    def key_rotate(self, daemon_spec: CephadmDaemonDeploySpec) -> None:
+        rc, out, err = self.mon_command({
+            'prefix': 'auth rotate',
+            'entity': daemon_spec.entity_name(),
+            'format': 'json',
+            'key_type': utils.ROTATION_CIPHER
+        })
+        if rc:
+            raise OrchestratorError(
+                f'Failed to rotate daemon key for {daemon_spec.entity_name()}.\n'
+                f'Rc: {rc}\nOut: {out}\nErr: {err}'
+            )
+
     def _rotate_daemon_key(self, daemon_spec: CephadmDaemonDeploySpec) -> str:
         self.log.info(f'Rotating authentication key for {daemon_spec.name()}')
         rc, out, err = self.mon_command({
@@ -3185,7 +3230,7 @@ Then run the following:
             return ''  # unreachable
 
         if action == 'rotate-key':
-            return self._rotate_daemon_key(daemon_spec)
+            raise OrchestratorError('rotate-key is not supported in this release')
 
         if action == 'redeploy' or action == 'reconfig' or (action == 'restart' and self._mon_public_network_changed(daemon_spec)):
             if action == 'restart':
@@ -3266,11 +3311,13 @@ Then run the following:
                 raise OrchestratorError(f'Unable to {action} daemon {d.name()}: {r.stderr} \nNote: Warnings can be bypassed with the --force flag')
 
         if action == 'rotate-key':
-            if d.daemon_type not in ['mgr', 'osd', 'mds',
-                                     'rgw', 'crash', 'nfs', 'rbd-mirror', 'iscsi']:
-                raise OrchestratorError(
-                    f'key rotation not supported for {d.daemon_type}'
-                )
+            # TODO: add this commented section back once this command is fixed
+            # if d.daemon_type not in ['mgr', 'osd', 'mds',
+            #                          'rgw', 'crash', 'nfs', 'rbd-mirror', 'iscsi']:
+            #     raise OrchestratorError(
+            #         f'key rotation not supported for {d.daemon_type}'
+            #     )
+            raise OrchestratorError(f'key rotation by orchestrator not supported in this release (for {d.name()})')
 
         # Track user-initiated stop/start actions
         if action == 'stop':
@@ -3388,15 +3435,6 @@ Then run the following:
                     msg += f'\thost {h}: {" ".join([f"osd.{id}" for id in ls])}'
                 raise OrchestratorError(
                     f'If {service_name} is removed then the following OSDs will remain, --force to proceed anyway\n{msg}')
-        elif service_name.startswith('nfs.'):
-            # check if its using old node id style and remove from mon store
-            nfs_services = self.get_store('nfs_services_with_old_nodeid')
-            if nfs_services:
-                nfs_services = nfs_services.split(',')
-                if service_name in nfs_services:
-                    nfs_services.remove(service_name)
-                    val = ','.join(nfs_services) if nfs_services else None
-                    self.set_store('nfs_services_with_old_nodeid', val)
 
         spec = self.spec_store[service_name].spec
         CephadmServe(self)._remove_service_config(spec)
@@ -5162,3 +5200,20 @@ Then run the following:
     def trigger_connect_dashboard_rgw(self) -> None:
         self.need_connect_dashboard_rgw = True
         self.event.set()
+
+    @CephadmCLICommand.Read('cephadm get-cluster-version-history')
+    def do_get_cluster_version_history(self, show_config: Optional[bool] = False) -> HandleCommandResult:
+        '''
+        Shows all previous and current cluster versions ordered chronologically
+        '''
+        out = self.version_tracker.get_cluster_version_history(show_config)
+        return HandleCommandResult(stdout=out)
+
+    @CephadmCLICommand.Write('cephadm remove-cluster-version-history')
+    def do_remove_cluster_version_history(self, all: Optional[bool] = False, before: Optional[str] = None, after: Optional[str] = None) -> HandleCommandResult:
+        '''
+        Delete cluster versions stored in history
+        '''
+        err, msg = self.version_tracker.remove_cluster_version_history(all, before, after)
+        kwargs = {'stderr': msg} if err else {'stdout': msg}
+        return HandleCommandResult(retval=err, **kwargs)

@@ -139,9 +139,22 @@ DaemonServer::DaemonServer(MonClient *monc_,
                                                     cct->_conf->mgr_op_history_slow_op_threshold);
 }
 
-DaemonServer::~DaemonServer() {
+void DaemonServer::shutdown()
+{
+  bool expected = false;
+  if (!shutting_down.compare_exchange_strong(expected, true)) {
+    return;
+  }
+
+  op_tracker.on_shutdown();
+
   delete msgr;
+  msgr = nullptr;
   g_conf().remove_observer(this);
+}
+
+DaemonServer::~DaemonServer() {
+  shutdown();
 }
 
 class DaemonServerHook : public AdminSocketHook {
@@ -290,7 +303,7 @@ bool DaemonServer::ms_handle_fast_authentication(Connection *con)
 	   << " addr " << con->get_peer_addrs()
 	   << dendl;
 
-  AuthCapsInfo &caps_info = con->get_peer_caps_info();
+  auto& caps_info = con->get_peer_caps_info();
   if (caps_info.allow_all) {
     dout(10) << " session " << s << " " << s->entity_name
 	     << " allow_all" << dendl;

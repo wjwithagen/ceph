@@ -87,6 +87,8 @@ if(WITH_MOLD)
     endif()
   endforeach()
   set(USING_MOLD_LINKER TRUE CACHE INTERNAL "")
+else()
+  set(USING_MOLD_LINKER FALSE CACHE INTERNAL "")
 endif()
 
 option(WITH_CCACHE "Build with ccache.")
@@ -133,6 +135,18 @@ if(WITH_SCCACHE)
   set(CMAKE_C_COMPILER_LAUNCHER ${SCCACHE_EXECUTABLE})
   set(CMAKE_CXX_COMPILER_LAUNCHER ${SCCACHE_EXECUTABLE})
 endif(WITH_SCCACHE)
+
+set(CEPH_EXTERNAL_PROJECT_CMAKE_ARGS)
+foreach(language C CXX)
+  if(CMAKE_${language}_COMPILER_LAUNCHER)
+    string(REPLACE ";" "!" compiler_launcher
+      "${CMAKE_${language}_COMPILER_LAUNCHER}")
+    list(APPEND CEPH_EXTERNAL_PROJECT_CMAKE_ARGS
+      -DCMAKE_${language}_COMPILER_LAUNCHER=${compiler_launcher})
+  endif()
+endforeach()
+unset(compiler_launcher)
+unset(language)
 
 option(WITH_MANPAGE "Build man pages." ON)
 if(WITH_MANPAGE)

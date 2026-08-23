@@ -560,6 +560,7 @@ else:
                                           "Make all the auto-listeners for this subsystem secure",
                                           True, False),
                 "traddr": Param(str, "NVMeoF gateway address (deprecated)", True, None),
+                "model_name": Param(str, "Subsystem model name", True, None),
             },
         )
         @convert_to_model(model.SubsystemStatus)
@@ -570,7 +571,7 @@ else:
                    gw_group: Optional[str] = None, server_address: Optional[str] = None,
                    network_mask: Optional[List[str]] = None,
                    port: Optional[int] = None, secure_listeners: Optional[bool] = False,
-                   traddr: Optional[str] = None):
+                   traddr: Optional[str] = None, model_name: Optional[str] = None):
             server_address = resolve_nvmeof_server_address(
                 server_address=server_address,
                 traddr=traddr
@@ -584,7 +585,8 @@ else:
                     max_namespaces=max_namespaces, enable_ha=True,
                     no_group_append=no_group_append,
                     dhchap_key=dhchap_key, network_mask=network_mask,
-                    port=port, secure_listeners=secure_listeners
+                    port=port, secure_listeners=secure_listeners,
+                    model_name=model_name
                 )
             )
 
@@ -621,6 +623,9 @@ else:
 
         @Endpoint('PUT', '{nqn}/change_key')
         @UpdatePermission
+        @empty_response
+        @NvmeofCLICommand("nvmeof subsystem change_key", model.RequestStatus,
+                          success_message_template="Changing key for subsystem {nqn}: Successful")
         @EndpointDoc(
             "Change subsystem inband authentication key",
             parameters={
@@ -631,9 +636,6 @@ else:
                 "traddr": Param(str, "NVMeoF gateway address (deprecated)", True, None),
             },
         )
-        @empty_response
-        @NvmeofCLICommand("nvmeof subsystem change_key", model.RequestStatus,
-                          success_message_template="Changing key for subsystem {nqn}: Successful")
         @convert_to_model(model.RequestStatus)
         @handle_nvmeof_error
         def change_key(self, nqn: str, dhchap_key: str, gw_group: Optional[str] = None,
@@ -653,6 +655,9 @@ else:
                 )
             )
 
+        @empty_response
+        @NvmeofCLICommand("nvmeof subsystem del_key", model.RequestStatus,
+                          success_message_template="Deleting key for subsystem {nqn}: Successful")
         @EndpointDoc(
             "Delete subsystem inband authentication key",
             parameters={
@@ -662,9 +667,6 @@ else:
                 "traddr": Param(str, "NVMeoF gateway address (deprecated)", True, None),
             },
         )
-        @empty_response
-        @NvmeofCLICommand("nvmeof subsystem del_key", model.RequestStatus,
-                          success_message_template="Deleting key for subsystem {nqn}: Successful")
         @convert_to_model(model.RequestStatus)
         @handle_nvmeof_error
         def del_key(self, nqn: str, gw_group: Optional[str] = None,

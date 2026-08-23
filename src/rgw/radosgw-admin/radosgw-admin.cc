@@ -192,6 +192,8 @@ void usage()
   cout << "  bucket link                      link bucket to specified user\n";
   cout << "  bucket unlink                    unlink bucket from specified user\n";
   cout << "  bucket stats                     returns bucket statistics\n";
+  cout << "  bucket suspend                   suspend a bucket\n";
+  cout << "  bucket unsuspend                 unsuspend a bucket\n";
   cout << "  bucket rm                        remove bucket\n";
   cout << "  bucket check                     check bucket index by verifying size and object count stats\n";
   cout << "  bucket check olh                 check for olh index entries and objects that are pending removal\n";
@@ -750,6 +752,8 @@ enum class OPT {
 #endif
   BUCKET_LAYOUT,
   BUCKET_STATS,
+  BUCKET_SUSPEND,
+  BUCKET_UNSUSPEND,
 #ifdef WITH_RADOSGW_RADOS
   BUCKET_CHECK,
   BUCKET_CHECK_OLH,
@@ -1036,6 +1040,8 @@ static SimpleCmd::Commands all_cmds = {
 #endif
   { "bucket layout", OPT::BUCKET_LAYOUT },
   { "bucket stats", OPT::BUCKET_STATS },
+  { "bucket suspend", OPT::BUCKET_SUSPEND },
+  { "bucket unsuspend", OPT::BUCKET_UNSUSPEND },
 #ifdef WITH_RADOSGW_RADOS
   { "bucket check", OPT::BUCKET_CHECK },
   { "bucket check olh", OPT::BUCKET_CHECK_OLH },
@@ -7058,7 +7064,9 @@ int main(int argc, const char **argv)
 #ifdef WITH_RADOSGW_RADOS
                                         OPT::BUCKET_LINK, OPT::BUCKET_UNLINK,
 #endif
-                                        OPT::BUCKET_CHOWN, 
+                                        OPT::BUCKET_CHOWN,
+                                        OPT::BUCKET_SUSPEND,
+                                        OPT::BUCKET_UNSUSPEND,
 #ifdef WITH_RADOSGW_RADOS
                                         OPT::METADATA_PUT,
                                         OPT::METADATA_RM,
@@ -7070,7 +7078,8 @@ int main(int argc, const char **argv)
                                         OPT::ROLE_POLICY_PUT, OPT::ROLE_POLICY_DELETE,
                                         OPT::ROLE_POLICY_ATTACH, OPT::ROLE_POLICY_DETACH,
                                         OPT::USER_POLICY_ATTACH, OPT::USER_POLICY_DETACH,
-                                        OPT::RATELIMIT_SET, OPT::RATELIMIT_ENABLE, OPT::RATELIMIT_DISABLE};
+                                        OPT::RATELIMIT_SET, OPT::RATELIMIT_ENABLE, OPT::RATELIMIT_DISABLE,
+                                        OPT::QUOTA_SET, OPT::QUOTA_ENABLE, OPT::QUOTA_DISABLE};
 
   bool print_warning_message = (non_master_ops_list.find(opt_cmd) != non_master_ops_list.end() &&
                                 non_master_cmd);
@@ -8152,6 +8161,7 @@ int main(int argc, const char **argv)
       return EINVAL;
     }
 
+    bucket_op.account_id = account_id;
     bucket_op.set_bucket_name(bucket_name);
     bucket_op.set_new_bucket_name(new_bucket_name);
     string err;
@@ -10846,6 +10856,26 @@ next:
     }
   }
 
+  if ((opt_cmd == OPT::BUCKET_SUSPEND) || (opt_cmd == OPT::BUCKET_UNSUSPEND)) {
+    if (bucket_name.empty()) {
+      cerr << "ERROR: bucket not specified" << std::endl;
+      return EINVAL;
+    }
+    ret = init_bucket(tenant, bucket_name, bucket_id, &bucket);
+    if (ret < 0) {
+      return -ret;
+    }
+    std::vector<rgw_bucket> buckets;
+    buckets.push_back(bucket->get_key());
+    const bool enabled = (opt_cmd == OPT::BUCKET_UNSUSPEND);
+    ret = driver->set_buckets_enabled(dpp(), buckets, enabled, null_yield);
+    if (ret < 0) {
+      cerr << "failed to " << (enabled ? "unsuspend" : "suspend")
+           << " bucket: " << cpp_strerror(-ret) << std::endl;
+      return -ret;
+    }
+  }
+
   if (opt_cmd == OPT::BUCKET_SYNC_INFO) {
     if (bucket_name.empty()) {
       cerr << "ERROR: bucket not specified" << std::endl;
@@ -11833,7 +11863,11 @@ next:
         op_state.quota_max_objects = std::max<int64_t>(-1, max_objects);
       }
       if (have_max_size) {
-        op_state.quota_max_size = std::max<int64_t>(-1, rgw_rounded_kb(max_size) * 1024);
+        if (max_size < 0) {
+          op_state.quota_max_size = -1;
+        } else {
+          op_state.quota_max_size = rgw_rounded_kb(max_size) * 1024;
+        }
       }
 
       std::string err_msg;
