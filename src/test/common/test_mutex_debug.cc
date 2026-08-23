@@ -64,7 +64,7 @@ TEST(MutexDebugDeathTest, NotRecursive) {
   // pthread_mutex_destroy'd
   std::unique_lock locker{m};
   ASSERT_TRUE(m.is_locked());
-  ASSERT_DEATH(m.lock(), "FAILED ceph_assert(recursive || !is_locked_by_me())");
+  ASSERT_DEATH(m.lock(), "FAILED ceph_assert\\(recursive \\|\\| !is_locked_by_me\\(\\)\\)");
 }
 
 TEST(MutexRecursiveDebug, Lock) {

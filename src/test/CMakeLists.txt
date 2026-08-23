@@ -1090,6 +1090,7 @@ add_ceph_unittest(unittest_ceph_assert)
 target_link_libraries(unittest_ceph_assert ceph-common global)
 endif(NOT WIN32)
 
+if(NOT FREEBSD)
 find_package(benchmark QUIET)
 if (benchmark_FOUND)
   add_executable(bench_lrus
@@ -1104,6 +1105,7 @@ if (benchmark_FOUND)
 else()
   message(STATUS "The google/benchmark library was not found. Skipping micro benchmark tests")
 endif(benchmark_FOUND)
+endif(NOT FREEBSD)
 
 add_executable(test_nvmeof_gw_utils
   test_nvmeof_gw_utils.cc

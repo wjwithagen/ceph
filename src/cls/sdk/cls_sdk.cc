@@ -1,6 +1,8 @@
 /*
  * This is an example RADOS object class built using only the Ceph SDK interface.
  */
+
+#include <time.h>
 #include "include/rados/objclass.h"
 #include "cls_sdk_ops.h"
 

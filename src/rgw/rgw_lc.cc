@@ -3415,7 +3415,7 @@ std::string s3_expiration_header(
   if (expiration_date && rule_id) {
     auto exp = ceph::real_clock::to_time_t(*expiration_date);
     // Fri, 21 Dec 2012 00:00:00 GMT
-    auto exp_str = fmt::format("{:%a, %d %b %Y %T %Z}", fmt::gmtime(exp));
+    auto exp_str = fmt::format("{:%a, %d %b %Y %T} GMT", fmt::gmtime(exp));
     hdr = fmt::format("expiry-date=\"{0}\", rule-id=\"{1}\"", exp_str,
 		      *rule_id);
   }

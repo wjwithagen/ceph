@@ -18,6 +18,9 @@
 #define COMMON_CEPH_ERROR_CODE
 
 #include <cerrno>
+#ifdef __FreeBSD__
+#include <exception>
+#endif
 #ifdef __has_include
 #  if __has_include(<format>)
 #    include <format>
@@ -36,6 +39,8 @@
 #include <boost/system/error_condition.hpp>
 #include <boost/system/generic_category.hpp>
 #include <boost/system/system_error.hpp>
+
+#include "include/buffer.h"
 
 #include <fmt/format.h>
 
@@ -247,30 +252,30 @@ make_error_condition(errc e) noexcept {
   return { static_cast<int>(e), buffer_category() };
 }
 
-struct error : boost::system::system_error {
+struct CEPH_BUFFER_API error : boost::system::system_error {
   using system_error::system_error;
 };
 
-struct bad_alloc : public error {
+struct CEPH_BUFFER_API bad_alloc : public error {
   bad_alloc() : error(errc::bad_alloc) {}
   bad_alloc(const char* what_arg) : error(errc::bad_alloc, what_arg) {}
   bad_alloc(const std::string& what_arg) : error(errc::bad_alloc, what_arg) {}
 };
-struct end_of_buffer : public error {
+struct CEPH_BUFFER_API end_of_buffer : public error {
   end_of_buffer() : error(errc::end_of_buffer) {}
   end_of_buffer(const char* what_arg) : error(errc::end_of_buffer, what_arg) {}
   end_of_buffer(const std::string& what_arg)
     : error(errc::end_of_buffer, what_arg) {}
 };
 
-struct malformed_input : public error {
+struct CEPH_BUFFER_API malformed_input : public error {
   malformed_input() : error(errc::malformed_input) {}
   malformed_input(const char* what_arg)
     : error(errc::malformed_input, what_arg) {}
   malformed_input(const std::string& what_arg)
     : error(errc::malformed_input, what_arg) {}
 };
-struct error_code : public error {
+struct CEPH_BUFFER_API error_code : public error {
   error_code(int r) : error(-r, boost::system::generic_category()) {}
   error_code(int r, const char* what_arg)
     : error(-r, boost::system::generic_category(), what_arg) {}

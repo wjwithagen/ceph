@@ -49,7 +49,7 @@ struct aio_t {
 #elif defined(HAVE_POSIXAIO)
     n_aiocb = iov.size();
     aio.aiocbp = (struct aiocb*)calloc(iov.size(), sizeof(struct aiocb));
-    for (int i = 0; i < iov.size(); i++) {
+    for (size_t i = 0; i < iov.size(); i++) {
       aio.aiocbp[i].aio_fildes = fd;
       aio.aiocbp[i].aio_offset = offset;
       aio.aiocbp[i].aio_buf = iov[i].iov_base;

@@ -41,7 +41,7 @@ else
     KERNCORE="kernel.core_pattern"
 fi
 
-EXTRA_OPTS=""
+EXTRA_OPTS=" --erasure-code-dir=${CEPH_ROOT:-.}/build/lib --plugin-dir=${CEPH_ROOT:-.}/build/lib --debug-bdev 20 --debug-bluestore 20"
 
 #! @file ceph-helpers.sh
 #  @brief Toolbox to manage Ceph cluster dedicated to testing
@@ -667,7 +667,11 @@ EOF
     echo adding osd$id key to auth repository
     ceph -i "$key_fn" auth add osd.$id osd "allow *" mon "allow profile osd" mgr "allow profile osd"
     echo start osd.$id
-    ceph-osd -i $id $ceph_args &
+    if [ -n "$CEPH_OSD_TRUSS" ]; then
+      truss -f -o "$CEPH_OSD_TRUSS.$id" ceph-osd -i $id $ceph_args &
+    else
+      ceph-osd -i $id $ceph_args &
+    fi
 
     # If noup is set, then can't wait for this osd
     if ceph osd dump --format=json | jq '.flags_set[]' | grep -q '"noup"' ; then

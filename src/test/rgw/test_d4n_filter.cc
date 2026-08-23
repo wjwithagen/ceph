@@ -4,7 +4,6 @@
 
 #include "common/async/context_pool.h"
 
-#include <sys/xattr.h>
 #include <filesystem>
 #include "gtest/gtest.h"
 #include "common/ceph_argparse.h"

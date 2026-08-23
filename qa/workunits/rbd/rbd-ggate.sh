@@ -7,6 +7,15 @@ SIZE=64
 DATA=
 DEV=
 
+if command -v xmlstarlet >/dev/null 2>&1; then
+    XML=xmlstarlet
+elif command -v xml >/dev/null 2>&1; then
+    XML=xml
+else
+    echo "xmlstarlet (or xml) not found" >&2
+    exit 1
+fi
+
 if [ `uname -K` -ge 1200078 ] ; then
     RBD_GGATE_RESIZE_SUPPORTED=1
 fi
@@ -58,11 +67,10 @@ setup()
 	PATH=${CEPH_BIN}:${PATH}
     fi
 
-    _sudo echo test sudo
     check_geom_gate
 
     trap cleanup INT TERM EXIT
-    TEMPDIR=`mktemp -d`
+    TEMPDIR=`mktemp -d -t ceph`
     DATA=${TEMPDIR}/data
     dd if=/dev/urandom of=${DATA} bs=1M count=${SIZE}
     ceph osd pool create ${POOL} 32
@@ -139,16 +147,16 @@ _sudo sync
 
 echo  trim test
 provisioned=`rbd -p ${POOL} --format xml du ${IMAGE} |
-  xmlstarlet sel -t -m "//stats/images/image/provisioned_size" -v .`
+  $XML sel -t -m "//stats/images/image/provisioned_size" -v .`
 used=`rbd -p ${POOL} --format xml du ${IMAGE} |
-  xmlstarlet sel -t -m "//stats/images/image/used_size" -v .`
+  $XML sel -t -m "//stats/images/image/used_size" -v .`
 [ "${used}" -eq "${provisioned}" ]
 _sudo newfs -E ${DEV}
 _sudo sync
 provisioned=`rbd -p ${POOL} --format xml du ${IMAGE} |
-  xmlstarlet sel -t -m "//stats/images/image/provisioned_size" -v .`
+  $XML sel -t -m "//stats/images/image/provisioned_size" -v .`
 used=`rbd -p ${POOL} --format xml du ${IMAGE} |
-  xmlstarlet sel -t -m "//stats/images/image/used_size" -v .`
+  $XML sel -t -m "//stats/images/image/used_size" -v .`
 [ "${used}" -lt "${provisioned}" ]
 
 echo  resize test

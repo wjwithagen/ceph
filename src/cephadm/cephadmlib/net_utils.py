@@ -8,6 +8,8 @@ import os
 import re
 import socket
 import struct
+import sys
+import subprocess
 
 from typing import Dict, Tuple, List
 
@@ -182,6 +184,15 @@ def ip_in_subnets(ip_addr: str, subnets: str) -> bool:
 
 def get_ipv4_address(ifname):
     # type: (str) -> str
+    if sys.platform.startswith('linux'):
+        return _get_ipv4_address_linux(ifname)
+    if sys.platform.startswith('freebsd'):
+        return _get_ipv4_address_freebsd(ifname)
+    return ''
+
+
+def _get_ipv4_address_linux(ifname):
+    # type: (str) -> str
     def _extract(sock: socket.socket, offset: int) -> str:
         return socket.inet_ntop(
             socket.AF_INET,
@@ -204,11 +215,57 @@ def get_ipv4_address(ifname):
     return '{}/{}'.format(addr, dec_mask)
 
 
+def _get_ipv4_address_freebsd(ifname):
+    # type: (str) -> str
+    """Look up an interface's IPv4 address via ifconfig(8).
+
+    FreeBSD has no Linux-style SIOCGIFADDR/SIOCGIFNETMASK ioctl
+    encoding (the numeric ioctl values are Linux-specific), so shell
+    out and parse `ifconfig <ifname>` output instead. Returns the
+    first `inet` line for the interface, converting the hex netmask
+    FreeBSD reports (e.g. 0xfffffc00) to a prefix length, matching
+    the '<addr>/<prefixlen>' format the Linux path returns.
+    """
+    try:
+        out = subprocess.check_output(
+            ['/sbin/ifconfig', ifname],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return ''
+
+    for line in out.splitlines():
+        line = line.strip()
+        if not line.startswith('inet '):
+            continue
+        fields = line.split()
+        # e.g.: inet 192.168.10.77 netmask 0xfffffc00 broadcast 192.168.11.255
+        addr = fields[1]
+        try:
+            netmask_idx = fields.index('netmask') + 1
+            netmask_hex = fields[netmask_idx]
+            prefixlen = bin(int(netmask_hex, 16)).count('1')
+            ipaddress.ip_address(addr)
+        except (ValueError, IndexError):
+            continue
+        return '{}/{}'.format(addr, prefixlen)
+    return ''
+
+
 def get_ipv6_address(ifname):
+    # type: (str) -> str
+    if sys.platform.startswith('linux'):
+        return _get_ipv6_address_linux(ifname)
+    if sys.platform.startswith('freebsd'):
+        return _get_ipv6_address_freebsd(ifname)
+    return ''
+
+
+def _get_ipv6_address_linux(ifname):
     # type: (str) -> str
     if not os.path.exists('/proc/net/if_inet6'):
         return ''
-
     raw = read_file(['/proc/net/if_inet6'])
     data = raw.splitlines()
     # based on docs @ https://www.tldp.org/HOWTO/Linux+IPv6-HOWTO/ch11s04.html
@@ -227,6 +284,44 @@ def get_ipv6_address(ifname):
             # apply naming rules using ipaddress module
             ipv6 = ipaddress.ip_address(ipv6_fmtd)
             return '{}/{}'.format(str(ipv6), int('0x{}'.format(field[2]), 16))
+    return ''
+
+
+def _get_ipv6_address_freebsd(ifname):
+    # type: (str) -> str
+    """Look up an interface's IPv6 address via ifconfig(8).
+
+    FreeBSD has no Linux-style /proc/net/if_inet6, so shell out and
+    parse `ifconfig <ifname>` output instead. Returns the first
+    `inet6` line for the interface, matching the Linux path's
+    "first match wins" behavior (which, for /proc/net/if_inet6,
+    typically means link-local first). The FreeBSD zone-id suffix
+    on link-local addresses (e.g. %ix0) is stripped before parsing,
+    since ipaddress.ip_address() does not accept it.
+    """
+    try:
+        out = subprocess.check_output(
+            ['/sbin/ifconfig', ifname],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return ''
+
+    for line in out.splitlines():
+        line = line.strip()
+        if not line.startswith('inet6 '):
+            continue
+        fields = line.split()
+        # e.g.: inet6 fe80::ec4:7aff:fe1f:8dc8%ix0 prefixlen 64 scopeid 0x1
+        #       inet6 2001:4cb8:3:1::77 prefixlen 64
+        addr = fields[1].split('%', 1)[0]
+        try:
+            prefixlen = fields[fields.index('prefixlen') + 1]
+            ipv6 = ipaddress.ip_address(addr)
+        except (ValueError, IndexError):
+            continue
+        return '{}/{}'.format(str(ipv6), prefixlen)
     return ''
 
 

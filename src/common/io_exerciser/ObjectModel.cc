@@ -86,8 +86,7 @@ void ObjectModel::applyIoOp(IoOp& op) {
           if (writeOp.offset[i] + writeOp.length[i] > primary_contents.size()) {
             primary_contents.resize(writeOp.offset[i] + writeOp.length[i]);
           }
-          std::generate(std::execution::seq,
-                        std::next(primary_contents.begin(), writeOp.offset[i]),
+          std::generate(std::next(primary_contents.begin(), writeOp.offset[i]),
                         std::next(primary_contents.begin(),
                                   writeOp.offset[i] + writeOp.length[i]),
                         generate_random);
@@ -145,7 +144,7 @@ void ObjectModel::applyIoOp(IoOp& op) {
       ceph_assert(writes.empty());
       primary_created = true;
       primary_contents.resize(static_cast<CreateOp&>(op).size);
-      std::generate(std::execution::seq, primary_contents.begin(), primary_contents.end(),
+      std::generate(primary_contents.begin(), primary_contents.end(),
                     generate_random);
       break;
 
@@ -159,7 +158,7 @@ void ObjectModel::applyIoOp(IoOp& op) {
       primary_contents.resize(new_size);
       // Yes, truncate CAN be used to make an object bigger!
       if (expand) {
-        std::generate(std::execution::seq, primary_contents.begin() + new_size, primary_contents.end(),
+        std::generate(primary_contents.begin() + new_size, primary_contents.end(),
                       generate_random);
       }
     } break;

@@ -12,6 +12,7 @@
 #  version 2.1 of the License, or (at your option) any later version.
 #
 set -e
+set -vx
 
 if ! [ "${_SOURCED_LIB_BUILD}" = 1 ]; then
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -370,8 +371,9 @@ if [ x$(uname)x = xFreeBSDx ]; then
         devel/binutils \
         devel/git \
         devel/gperf \
-        devel/gmake \
         devel/cmake \
+        devel/gmake \
+        devel/ninja \
         devel/nasm \
         devel/boost-all \
         devel/boost-python-libs \
@@ -380,31 +382,37 @@ if [ x$(uname)x = xFreeBSDx ]; then
         devel/libedit \
         devel/libtool \
         devel/google-perftools \
-        lang/cython \
-        net/openldap24-client \
+        net/openldap26-client \
         archivers/snappy \
         archivers/liblz4 \
         ftp/curl \
-        misc/e2fsprogs-libuuid \
+	math/qhull \
+	misc/libuuid \
         misc/getopt \
         net/socat \
         textproc/expat2 \
         textproc/gsed \
+        lang/cython \
         lang/gawk \
+        lang/python312 \
+	lang/rust \
         textproc/libxml2 \
         textproc/xmlstarlet \
         textproc/jq \
         textproc/py-sphinx \
         emulators/fuse \
         java/junit \
-        lang/python36 \
         devel/py-pip \
         devel/py-flake8 \
         devel/py-tox \
         devel/py-argparse \
         devel/py-nose \
         devel/py-prettytable \
-        devel/py-yaml \
+        devel/py-pyyaml \
+	devel/py-ast-serialize \
+	science/py-scipy \
+	databases/py-sqlite3 \
+	devel/py-wcwidth \
         www/py-routes \
         www/py-flask \
         www/node \
@@ -415,6 +423,7 @@ if [ x$(uname)x = xFreeBSDx ]; then
         security/oath-toolkit \
         sysutils/flock \
         sysutils/fusefs-libs \
+
     exit
 else
     [ $WITH_CRIMSON ] && with_crimson=true || with_crimson=false

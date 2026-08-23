@@ -294,4 +294,10 @@ if(HAVE_KEYUTILS)
     keyring.cc)
   add_library(keyring STATIC ${keyring_srcs})
   target_link_libraries(keyring keyutils::keyutils)
+elseif(FREEBSD)
+  # we still need to compile keyring, to get the get_best() selector.
+  # We don't link the keyutils lib, since that is not available under FreeBSD
+  set(keyring_srcs
+    keyring.cc)
+  add_library(keyring STATIC ${keyring_srcs})
 endif()

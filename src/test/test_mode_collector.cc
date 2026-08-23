@@ -5,6 +5,7 @@
 #include <string>
 #include <string_view>
 
+#include "include/compat.h"
 #include "common/mode_collector.h"
 #include "gtest/gtest.h"
 
@@ -103,7 +104,7 @@ class eversion_t {
  public:
   version_t version;
   epoch_t epoch;
-  __u32 __pad;
+  uint32_t __pad;
   eversion_t() : version(0), epoch(0), __pad(0) {}
   eversion_t(epoch_t e, version_t v) : version(v), epoch(e), __pad(0) {}
 

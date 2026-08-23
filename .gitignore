@@ -97,3 +97,8 @@ src/pybind/rbd/rbd.egg-info/
 src/pybind/rgw/build/
 src/pybind/rgw/rgw.c
 src/pybind/rgw/rgw.egg-info/
+Testing/
+build-asan/
+tmp/
+*.bak
+do_freebsd-asan.sh

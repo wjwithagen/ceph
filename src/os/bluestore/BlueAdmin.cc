@@ -7,7 +7,7 @@
 #include "common/pretty_binary.h"
 #include "os/bluestore/BlueStore.h"
 #include "common/debug.h"
-#include <asm-generic/errno-base.h>
+#include <cerrno>
 #include <iostream>
 #include <sstream>
 #include <vector>

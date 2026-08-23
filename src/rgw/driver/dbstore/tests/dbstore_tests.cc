@@ -297,7 +297,7 @@ TEST_F(DBStoreTest, StoreUser) {
   /* invalid version number */
   objv_tracker.read_version.ver = 4;
   ret = db->store_user(dpp, uinfo, true, &attrs, &objv_tracker, &old_uinfo);
-  ASSERT_EQ(ret, -125); /* returns ECANCELED */
+  ASSERT_EQ(hostos_to_ceph_errno(ret), -125); /* returns ECANCELED */
   ASSERT_EQ(old_uinfo.user_id.id, uinfo.user_id.id);
   ASSERT_EQ(old_uinfo.user_email, uinfo.user_email);
 
@@ -402,7 +402,7 @@ TEST_F(DBStoreTest, UpdateBucketAttrs) {
   /* invalid version number */
   objv.read_version.ver = 4;
   ret = db->update_bucket(dpp, "attrs", info, false, nullptr, &attrs, &bucket_mtime, &objv);
-  ASSERT_EQ(ret, -125); /* returns ECANCELED */
+  ASSERT_EQ(hostos_to_ceph_errno(ret), -125); /* returns ECANCELED */
 
   /* right version number */
   objv.read_version.ver = 1;
@@ -635,7 +635,7 @@ TEST_F(DBStoreTest, RemoveUserAPI) {
   /* invalid version number...should fail */
   objv.read_version.ver = 4;
   ret = db->remove_user(dpp, uinfo, &objv);
-  ASSERT_EQ(ret, -125);
+  ASSERT_EQ(hostos_to_ceph_errno(ret), -125); /* returns ECANCELED */
 
   objv.read_version.ver = 2;
   ret = db->remove_user(dpp, uinfo, &objv);

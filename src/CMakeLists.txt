@@ -187,6 +187,8 @@ elseif(CMAKE_CXX_COMPILER_ID STREQUAL Clang)
     -Wno-vla-cxx-extension)
   endif()
   if(FREEBSD)
+    add_compile_options(-fexperimental-library)
+    add_link_options(-fexperimental-library)
     # Need to use the GNU binutils linker to get versioning right.
     string(APPEND CMAKE_EXE_LINKER_FLAGS " -fuse-ld=/usr/local/bin/ld -Wno-unused-command-line-argument")
     string(APPEND CMAKE_SHARED_LINKER_FLAGS " -fuse-ld=/usr/local/bin/ld -Wno-unused-command-line-argument")
@@ -647,6 +649,10 @@ endif()
 
 if(WITH_JAEGER)
   list(APPEND ceph_common_deps jaeger_base)
+endif()
+
+if(CMAKE_SYSTEM_NAME MATCHES "FreeBSD")
+  list(APPEND ceph_common_deps rt)
 endif()
 
 if(WIN32)

@@ -35,6 +35,15 @@ extern "C" {
 #include <sys/types.h>
 #include <sys/stat.h>
 #include "statlite.h"
+#ifndef __s32
+using __s32 = int32_t;
+#endif
+#ifndef __u32
+using __u32 = uint32_t;
+#endif
+#ifndef __u64
+using __u64 = uint64_t;
+#endif
 }
 
 #include <deque>

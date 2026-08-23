@@ -1,4 +1,5 @@
 # build isa-l_crypto from its makefile and expose as target ISAL::Crypto
+if(LINUX)
 set(CEPH_HAVE_ISAL, TRUE)
 
 include(BuildISALCrypto)
@@ -20,3 +21,4 @@ set_target_properties(ceph_crypto_isal PROPERTIES
   SOVERSION 1
   INSTALL_RPATH "")
 install(TARGETS ceph_crypto_isal DESTINATION ${crypto_plugin_dir})
+endif(LINUX)

@@ -1381,6 +1381,8 @@ public:
 
     std::atomic_int nref = 0;      ///< reference count
     std::atomic_int pin_nref = 0;  ///< reference count replica to track pinning
+    friend void intrusive_ptr_add_ref(Onode *o) { o->get(); }
+    friend void intrusive_ptr_release(Onode *o) { o->put(); }
     Collection *c;
     ghobject_t oid;
 
@@ -4308,12 +4310,12 @@ inline std::ostream& operator<<(std::ostream& out, const BlueStore::volatile_sta
       << s.values[BlueStore::volatile_statfs::STATFS_COMPRESSED_ALLOCATED];
 }
 
-static inline void intrusive_ptr_add_ref(BlueStore::Onode *o) {
-  o->get();
-}
-static inline void intrusive_ptr_release(BlueStore::Onode *o) {
-  o->put();
-}
+//static inline void intrusive_ptr_add_ref(BlueStore::Onode *o) {
+//  o->get();
+//}
+//static inline void intrusive_ptr_release(BlueStore::Onode *o) {
+//  o->put();
+//}
 
 static inline void intrusive_ptr_add_ref(BlueStore::OpSequencer *o) {
   o->get();

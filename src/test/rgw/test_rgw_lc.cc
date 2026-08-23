@@ -117,7 +117,7 @@ TEST(ExpHdr, ReplaceStrftime)
 
   constexpr auto dec21 = year(2012)/12/21;
   auto exp = sys_days(dec21) + 9h + 13min + 7s ;
-  auto exp_str = fmt::format("{:%a, %d %b %Y %T %Z}", fmt::gmtime(exp));
+  auto exp_str = fmt::format("{:%a, %d %b %Y %T} GMT", fmt::gmtime(exp));
   std::cout << "exp_str: " << exp_str << std::endl;
   ASSERT_EQ(exp_str, "Fri, 21 Dec 2012 09:13:07 GMT");
 

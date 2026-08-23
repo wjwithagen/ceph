@@ -170,6 +170,7 @@ int KernelDevice::open(const string& p)
   bool is_block;
   r = stat(path.c_str(), &statbuf);
   if (r != 0) {
+    r = -errno;
     derr << __func__ << " stat got: " << cpp_strerror(r) << dendl;
     goto out_fail;
   }
@@ -1201,7 +1202,7 @@ int KernelDevice::aio_write(
 
   _aio_log_start(ioc, off, len);
 
-#ifdef HAVE_LIBAIO
+#if defined(HAVE_LIBAIO) || defined(HAVE_POSIXAIO)
   if (aio && dio && !buffered) {
     if (cct->_conf->bdev_inject_crash &&
 	rand() % cct->_conf->bdev_inject_crash == 0) {
