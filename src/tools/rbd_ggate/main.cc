@@ -242,7 +242,7 @@ static int do_unmap()
 
   int r = rbd::ggate::Driver::kill(devname);
   if (r < 0) {
-    cerr << "rbd-ggate: failed to destroy " << devname << ": "
+    std::cerr << "rbd-ggate: failed to destroy " << devname << ": "
          << cpp_strerror(r) << std::endl;
     return r;
   }
@@ -403,7 +403,7 @@ int main(int argc, const char *argv[]) {
 
   auto args = argv_to_vec(argc, argv);
   if (args.empty()) {
-    cerr << argv[0] << ": -h or --help for usage" << std::endl;
+    std::cerr << argv[0] << ": -h or --help for usage" << std::endl;
     exit(1);
   }
   if (ceph_argparse_need_usage(args)) {
@@ -443,21 +443,21 @@ int main(int argc, const char *argv[]) {
     } else if (strcmp(*args.begin(), "list") == 0) {
       cmd = List;
     } else {
-      cerr << "rbd-ggate: unknown command: " << *args.begin() << std::endl;
+      std::cerr << "rbd-ggate: unknown command: " << *args.begin() << std::endl;
       return EXIT_FAILURE;
     }
     args.erase(args.begin());
   }
 
   if (cmd == None) {
-    cerr << "rbd-ggate: must specify command" << std::endl;
+    std::cerr << "rbd-ggate: must specify command" << std::endl;
     return EXIT_FAILURE;
   }
 
   switch (cmd) {
     case Connect:
       if (args.begin() == args.end()) {
-        cerr << "rbd-ggate: must specify image-or-snap-spec" << std::endl;
+        std::cerr << "rbd-ggate: must specify image-or-snap-spec" << std::endl;
         return EXIT_FAILURE;
       }
       if (parse_imgpath(*args.begin(), &poolname, &nsname, &imgname,
@@ -483,14 +483,14 @@ int main(int argc, const char *argv[]) {
   }
 
   if (args.begin() != args.end()) {
-    cerr << "rbd-ggate: unknown args: " << *args.begin() << std::endl;
+    std::cerr << "rbd-ggate: unknown args: " << *args.begin() << std::endl;
     return EXIT_FAILURE;
   }
 
   switch (cmd) {
     case Connect:
       if (imgname.empty()) {
-        cerr << "rbd-ggate: image name was not specified" << std::endl;
+        std::cerr << "rbd-ggate: image name was not specified" << std::endl;
         return EXIT_FAILURE;
       }
 

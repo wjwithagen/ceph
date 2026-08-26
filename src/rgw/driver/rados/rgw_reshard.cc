@@ -1658,7 +1658,8 @@ int RGWReshard::process_entry(const cls_rgw_reshard_entry& entry,
       ldpp_dout(dpp, 20) <<  __func__ <<
 	": INFO: reshard reduction for bucket \"" <<
 	entry.bucket_name << "\" will not proceed until " <<
-	(when_queued + timespan) << dendl;
+	ceph::real_time(std::chrono::duration_cast<ceph::real_clock::duration>(
+          (when_queued + timespan).time_since_epoch())) << dendl;
 
       return 0;
     }

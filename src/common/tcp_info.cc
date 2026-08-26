@@ -29,7 +29,7 @@ bool dump_tcp_info(int fd, Formatter* f) {
   return false;
 }
 
-#else
+#elif defined(__linux__)
 
 bool tcp_info(int fd, struct tcp_info& info) {
   socklen_t info_len = sizeof(info);
@@ -117,6 +117,15 @@ bool dump_tcp_info(int fd, Formatter* f) {
   return true;
 }
 
+#else
+struct tcp_info {};
+bool tcp_info(int fd, struct tcp_info& info) {
+  return false;
+}
+bool dump_tcp_info(int fd, ceph::Formatter* f) {
+  return false;
+}
 #endif
-
 }  // namespace ceph
+
+

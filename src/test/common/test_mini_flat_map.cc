@@ -38,7 +38,7 @@ struct Key {
   Key(int8_t k) : k(k) {
   }
 
-  explicit constexpr operator int8_t() const {
+  explicit constexpr operator int() const {
     return k;
   }
   Key &operator++() {

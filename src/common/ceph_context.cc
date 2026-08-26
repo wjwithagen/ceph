@@ -25,7 +25,9 @@
 #include <boost/algorithm/string.hpp>
 
 #ifdef HAVE_BREAKPAD
+#if defined(__linux__)
 #include <breakpad/client/linux/handler/exception_handler.h>
+#endif
 #endif
 
 #include "include/ceph_fs.h" // for CEPH_CRYPTO_NONE

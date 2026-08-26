@@ -2,7 +2,7 @@
 // vim: ts=8 sw=2 sts=2 expandtab ft=cpp
 
 #include "notify.h"
-#ifdef linux
+#if defined(__linux__) || defined(__FreeBSD__)
 #include <sys/inotify.h>
 #endif
 
@@ -10,11 +10,11 @@ namespace file::listing {
 
   std::unique_ptr<Notify> Notify::factory(Notifiable* n, const std::string& bucket_root)
   {
-#ifdef __linux__
+#if defined(__linux__) || defined(__FreeBSD__)
     return std::unique_ptr<Notify>(new Inotify(n, bucket_root));
 #else
 #error currently, rgw posix driver requires inotify
-#endif /* linux */
+#endif /* __linux__) || defined(__FreeBSD__ */
     return nullptr;
   } /* Notify::factory */
 

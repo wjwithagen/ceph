@@ -1,6 +1,7 @@
 #include "common/debug.h"
 #include "common/errno.h"
 #include "debug.h"
+#include <cstdarg>
 
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_rbd

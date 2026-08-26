@@ -10,6 +10,9 @@
 #include <features.h>
 #include <sys/xattr.h>
 #endif
+#if defined(__FreeBSD__)
+#include "include/xattr_compat.h"
+#endif
 
 #include <filesystem>
 #include <errno.h>

@@ -22,6 +22,16 @@
 #if defined(__sun) || defined(_AIX) || defined(__APPLE__) || \
     defined(__FreeBSD__) || defined(_WIN32)
 extern "C" {
+#ifndef __s32
+using __s32 = int32_t;
+#endif
+#ifndef __u32
+using __u32 = uint32_t;
+#endif
+#ifndef __u64
+using __u64 = uint64_t;
+#endif
+
 __s32  ceph_to_hostos_errno(__s32 e);
 __s32  hostos_to_ceph_errno(__s32 e);
 }

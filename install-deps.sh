@@ -12,6 +12,7 @@
 #  version 2.1 of the License, or (at your option) any later version.
 #
 set -e
+set -vx
 
 if ! [ "${_SOURCED_LIB_BUILD}" = 1 ]; then
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

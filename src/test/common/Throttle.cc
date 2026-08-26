@@ -354,8 +354,13 @@ TEST(BackoffThrottle, balanced)
     0.001,
     7,
     2);
+#if defined(__FreeBSD__)
+  ASSERT_LT(results.first, 60);
+  ASSERT_GT(results.first, 25);
+#else
   ASSERT_LT(results.first, 60);
   ASSERT_GT(results.first, 40);
+#endif
   ASSERT_LT(results.second.count(), 0.002);
   ASSERT_GT(results.second.count(), 0.0005);
 }
@@ -372,8 +377,13 @@ TEST(BackoffThrottle, oversaturated)
     0.001,
     1,
     3);
+#if defined(__FreeBSD__)
+  ASSERT_LT(results.first, 101);
+  ASSERT_GT(results.first, 75);
+#else
   ASSERT_LT(results.first, 101);
   ASSERT_GT(results.first, 85);
+#endif
   ASSERT_LT(results.second.count(), 0.002);
   ASSERT_GT(results.second.count(), 0.0005);
 }

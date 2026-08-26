@@ -18,6 +18,9 @@
 #define COMMON_CEPH_ERROR_CODE
 
 #include <cerrno>
+#ifdef __FreeBSD__
+#include <exception>
+#endif
 #ifdef __has_include
 #  if __has_include(<format>)
 #    include <format>

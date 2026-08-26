@@ -11,6 +11,7 @@
 #include "common/dout.h"
 
 #include <unistd.h>
+#include <sys/wait.h>
 
 #include <limits.h>
 

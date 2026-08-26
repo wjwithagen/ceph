@@ -16,7 +16,11 @@
 #include "rgw_sal_posix.h"
 #include <dirent.h>
 #include <sys/stat.h>
+#if defined(__FreeBSD__)
+#include "include/xattr_compat.h"
+#else
 #include <sys/xattr.h>
+#endif
 #include <unistd.h>
 #include <cstdint>
 #include "rgw_multi.h"

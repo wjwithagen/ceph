@@ -637,6 +637,10 @@ if(WITH_JAEGER)
   list(APPEND ceph_common_deps jaeger_base)
 endif()
 
+if(CMAKE_SYSTEM_NAME MATCHES "FreeBSD")
+  list(APPEND ceph_common_deps rt)
+endif()
+
 if(WIN32)
   list(APPEND ceph_common_deps ws2_32 mswsock iphlpapi bcrypt)
   list(APPEND ceph_common_deps dlfcn_win32)

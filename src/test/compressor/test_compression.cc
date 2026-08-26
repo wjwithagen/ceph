@@ -469,6 +469,7 @@ TEST(CompressionPlugin, all)
   stringstream ss;
   EXPECT_EQ(0, factory->factory(&compressor, &ss));
   EXPECT_TRUE(compressor.get());
+  compressor.reset();   // <-- release before dlclose to avoid dangling vtable use
   {
     std::lock_guard l(reg->lock);
     EXPECT_EQ(-ENOENT, reg->remove("compressor", "does not exist"));
