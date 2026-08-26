@@ -11,7 +11,7 @@
 #ifdef __linux__
 #include <linux/fscrypt.h>
 #endif
-
+#include "include/compat.h"
 #include "proxy_manager.h"
 #include "proxy_link.h"
 #include "proxy_helpers.h"

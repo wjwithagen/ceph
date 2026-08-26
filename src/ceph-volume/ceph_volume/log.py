@@ -1,6 +1,5 @@
 import logging
 import os
-from ceph_volume import terminal
 from ceph_volume import conf
 
 BASE_FORMAT = "[%(name)s][%(levelname)-6s] %(message)s"
@@ -22,9 +21,7 @@ def setup(name='ceph-volume.log', log_path=None, log_level=None):
 
     try:
         fh = logging.FileHandler(log_path)
-    except (OSError, IOError) as err:
-        terminal.warning("Falling back to /tmp/ for logging. Can't use %s" % log_path)
-        terminal.warning(str(err))
+    except (OSError, IOError):
         conf.log_path = tmp_log_file
         fh = logging.FileHandler(tmp_log_file)
 

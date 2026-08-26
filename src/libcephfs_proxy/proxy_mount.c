@@ -8,6 +8,8 @@
 #include <fcntl.h>
 #include <ctype.h>
 
+#include "include/compat.h" 
+
 /* Maximum number of symlinks to visit while resolving a path before returning
  * ELOOP. */
 #define PROXY_MAX_SYMLINKS 16

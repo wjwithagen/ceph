@@ -419,6 +419,7 @@ endif(WITH_UADK)
 
 # needs mds and? XXX
 option(WITH_LIBCEPHFS "libcephfs client library" ON)
+option(WITH_LIBCEPHFS_PROXY "libcephfs proxy library" ON)
 
 option(WITH_LIBCEPHSQLITE "libcephsqlite client library" ON)
 if(WITH_LIBCEPHSQLITE)
