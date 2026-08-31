@@ -366,7 +366,7 @@ if [ x$(uname)x = xFreeBSDx ]; then
         echo "Installing extra packages not supported on FreeBSD" >&2
         exit 1
     fi
-    $SUDO pkg install -yq \
+    $SUDO pkg install -y \
 	devel/git \
 	devel/cmake \
 	devel/ninja \
@@ -383,7 +383,6 @@ if [ x$(uname)x = xFreeBSDx ]; then
 	devel/boost-libs \
 	devel/boost-python-libs \
 	devel/google-perftools \
-	devel/py-cython \
 	devel/protobuf \
 	devel/grpc \
 	lang/python312 \
@@ -405,13 +404,13 @@ if [ x$(uname)x = xFreeBSDx ]; then
 	security/nss \
 	security/oath-toolkit \
 	security/py-bcrypt \
-	security/py-openssl \
+	security/py-pyopenssl \
 	sysutils/flock \
 	sysutils/fusefs-libs \
 	sysutils/smartmontools \
 	misc/getopt \
 	devel/py-prettytable \
-	devel/py-yaml \
+	devel/py-pyyaml \
 	devel/py-protobuf \
 	devel/py-grpcio \
 	devel/py-virtualenv \
@@ -422,6 +421,10 @@ if [ x$(uname)x = xFreeBSDx ]; then
 	www/py-requests \
 	www/py-pyjwt \
 	textproc/py-sphinx \
+
+    PYTHON_VERSION=$(python -c "import sys; print('%d%d' % sys.version_info[:2])")
+    $SUDO pkg install -y \
+	py${PYTHON_VERSION}-cython 
 
 # --- dropped for v21 on FreeBSD -------------------------------------------
 # Disabled by CMAKE_OFF, so the dependency is dead weight:
