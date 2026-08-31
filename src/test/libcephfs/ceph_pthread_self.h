@@ -1,13 +1,10 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
 // vim: ts=8 sw=2 sts=2 expandtab
-
 #ifndef CEPH_TEST_LIBCEPHFS_PTHREAD_SELF
 #define CEPH_TEST_LIBCEPHFS_PTHREAD_SELF
-
 #include <pthread.h>
-
 #include <type_traits>
-
+#include <cstdint>
 /*
  * There is a  difference between libc shipped with FreeBSD and
  * glibc shipped with GNU/Linux for the return type of pthread_self().
@@ -18,14 +15,23 @@
  * libc returns an opague pthread_t that is not default convertable
  * to a uint64_t, which is what gtest expects.
  * And tests using gtest will not compile because of this difference.
- * 
+ *
  */
+template <typename T>
+static uint64_t pthread_id_to_u64(T me) {
+  if constexpr (std::is_pointer_v<T>) {
+    return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(me));
+  } else {
+    return static_cast<uint64_t>(me);
+  }
+}
+
 static uint64_t ceph_pthread_self() {
   auto me = pthread_self();
   static_assert(std::is_convertible_v<decltype(me), uint64_t> ||
                 std::is_pointer_v<decltype(me)>,
                 "we need to use pthread_self() for the owner parameter");
-  return static_cast<uint64_t>(me);
+  return pthread_id_to_u64(me);
 }
-
 #endif
+
