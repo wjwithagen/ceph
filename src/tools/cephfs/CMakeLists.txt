@@ -1,4 +1,4 @@
-iet(cephfs_journal_tool_srcs
+set(cephfs_journal_tool_srcs
   cephfs-journal-tool.cc
   JournalTool.cc
   ProgressTracker.cc
