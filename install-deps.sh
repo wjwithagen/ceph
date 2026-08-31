@@ -367,63 +367,88 @@ if [ x$(uname)x = xFreeBSDx ]; then
         exit 1
     fi
     $SUDO pkg install -yq \
-        devel/babeltrace \
-        devel/binutils \
-        devel/git \
-        devel/gperf \
-        devel/cmake \
-        devel/gmake \
-        devel/ninja \
-        devel/nasm \
-        devel/boost-all \
-        devel/boost-python-libs \
-        devel/valgrind \
-        devel/pkgconf \
-        devel/libedit \
-        devel/libtool \
-        devel/google-perftools \
-        net/openldap26-client \
-        archivers/snappy \
-        archivers/liblz4 \
-        ftp/curl \
-	math/qhull \
-	misc/libuuid \
-        misc/getopt \
-        net/socat \
-        textproc/expat2 \
-        textproc/gsed \
-        lang/cython \
-        lang/gawk \
-        lang/python312 \
-	lang/rust \
-        textproc/libxml2 \
-        textproc/xmlstarlet \
-        textproc/jq \
-        textproc/py-sphinx \
-        emulators/fuse \
-        java/junit \
-        devel/py-pip \
-        devel/py-flake8 \
-        devel/py-tox \
-        devel/py-argparse \
-        devel/py-nose \
-        devel/py-prettytable \
-        devel/py-pyyaml \
-	devel/py-ast-serialize \
-	science/py-scipy \
+	devel/git \
+	devel/cmake \
+	devel/ninja \
+	devel/ccache \
+	devel/pkgconf \
+	devel/gperf \
+	devel/nasm \
+	devel/yasm \
+	devel/autoconf \
+	devel/automake \
+	devel/libtool \
+	devel/libedit \
+	devel/libatomic_ops \
+	devel/boost-libs \
+	devel/boost-python-libs \
+	devel/google-perftools \
+	devel/py-cython \
+	devel/protobuf \
+	devel/grpc \
+	lang/python312 \
+	lang/lua54 \
+	lang/gawk \
+	databases/sqlite3 \
 	databases/py-sqlite3 \
-	devel/py-wcwidth \
-        www/py-routes \
-        www/py-flask \
-        www/node \
-        www/npm \
-        www/fcgi \
-        security/nss \
-        security/krb5 \
-        security/oath-toolkit \
-        sysutils/flock \
-        sysutils/fusefs-libs \
+	archivers/snappy \
+	archivers/liblz4 \
+	ftp/curl \
+	net/openldap26-client \
+	net/rabbitmq-c \
+	net/socat \
+	textproc/expat2 \
+	textproc/libxml2 \
+	textproc/xmlstarlet \
+	textproc/jq \
+	textproc/gsed \
+	security/nss \
+	security/oath-toolkit \
+	security/py-bcrypt \
+	security/py-openssl \
+	sysutils/flock \
+	sysutils/fusefs-libs \
+	sysutils/smartmontools \
+	misc/getopt \
+	devel/py-prettytable \
+	devel/py-yaml \
+	devel/py-protobuf \
+	devel/py-grpcio \
+	devel/py-virtualenv \
+	www/py-routes \
+	www/py-werkzeug \
+	www/py-cherrypy \
+	www/py-pecan \
+	www/py-requests \
+	www/py-pyjwt \
+	textproc/py-sphinx \
 
+# --- dropped for v21 on FreeBSD -------------------------------------------
+# Disabled by CMAKE_OFF, so the dependency is dead weight:
+#	devel/babeltrace		WITH_BABELTRACE=OFF
+#	security/krb5			WITH_GSSAPI=OFF
+#	www/node			WITH_MGR_DASHBOARD_FRONTEND=OFF
+#	www/npm				WITH_MGR_DASHBOARD_FRONTEND=OFF
+#
+# Obsolete or superseded:
+#	devel/gmake			ninja is the generator now
+#	devel/binutils			only for the old -fuse-ld=ld hack; lld works
+#	devel/boost-all			not a real port; use boost-libs
+#	emulators/fuse			duplicate of sysutils/fusefs-libs
+#	www/fcgi			civetweb-era RGW frontend, gone since Beast
+#	devel/py-argparse		stdlib since python 2.7
+#	devel/py-nose			dead upstream, replaced by pytest
+#	misc/e2fsprogs-libuuid		base uuid(3) suffices unless a submodule wants it
+#	lang/python36			-> lang/python312
+#	net/openldap24-client		-> net/openldap26-client
+#	lang/cython			-> devel/py-cython
+#
+# Test/dev tooling, not build dependencies -- install separately if wanted:
+#	devel/valgrind
+#	java/junit
+#	devel/py-pip
+#	devel/py-flake8
+#	devel/py-tox
     exit
 else
     [ $WITH_CRIMSON ] && with_crimson=true || with_crimson=false
