@@ -102,3 +102,4 @@ build-asan/
 tmp/
 *.bak
 do_freebsd-asan.sh
+patches-to-do.txt
