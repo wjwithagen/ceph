@@ -4,10 +4,7 @@ LIBRADOS_PRIVATE {
                 _rados_*;
                 extern "C++" {
                         "guard variable for boost::asio::detail::call_stack<boost::asio::detail::strand_executor_service::strand_impl, unsigned char>::top_";
-                        "guard variable for boost::asio::detail::call_stack<boost::asio::detail::strand_service::strand_impl, unsigned char>::top_";
                         "guard variable for boost::asio::detail::call_stack<boost::asio::detail::thread_context, boost::asio::detail::thread_info_base>::top_";
-                        "boost::asio::detail::call_stack<boost::asio::detail::strand_executor_service::strand_impl, unsigned char>::top_";
-                        "boost::asio::detail::call_stack<boost::asio::detail::strand_service::strand_impl, unsigned char>::top_";
                         "boost::asio::detail::call_stack<boost::asio::detail::thread_context, boost::asio::detail::thread_info_base>::top_";
                 };
         local:  *;
@@ -24,8 +21,6 @@ LIBRADOS_14.2.0 {
                         "typeinfo name for ceph::buffer::v15_2_0::malformed_input";
                         "typeinfo for ceph::buffer::v15_2_0::bad_alloc";
                         "typeinfo name for ceph::buffer::v15_2_0::bad_alloc";
-                        "typeinfo for ceph::buffer::v15_2_0::error_code";
-                        "typeinfo name for ceph::buffer::v15_2_0::error_code";
                         librados::v14_2_0::*;
                         "typeinfo for librados::v14_2_0::ObjectOperation";
                         "typeinfo name for librados::v14_2_0::ObjectOperation";

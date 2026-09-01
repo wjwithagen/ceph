@@ -195,6 +195,18 @@ int main() {}"
 file(REMOVE ${CMAKE_CURRENT_BINARY_DIR}/version_script.txt)
 cmake_pop_check_state()
 
+# clang's integrated assembler accepts .symver, so HAVE_ASM_SYMVER passes,
+# but it emits the empty-version form `sym@@` for the base/default alias.
+# lld can't resolve a version node named "" and, since LLVM 17,
+# --no-undefined-version makes that a hard error rather than a warning:
+#   ld: error: symbol rados_create@@ has undefined version
+# Fall back to the unversioned C API path in librados_c.cc.
+if(FREEBSD)
+  message(STATUS "FreeBSD -- disabling .symver (lld rejects empty-version aliases)")
+  set(HAVE_ASM_SYMVER FALSE CACHE INTERNAL "" FORCE)
+  set(HAVE_ATTR_SYMVER FALSE CACHE INTERNAL "" FORCE)
+endif()
+
 # should use LINK_OPTIONS instead of LINK_LIBRARIES, if we can use cmake v3.14+
 try_compile(HAVE_LINK_VERSION_SCRIPT
   ${CMAKE_CURRENT_BINARY_DIR}
