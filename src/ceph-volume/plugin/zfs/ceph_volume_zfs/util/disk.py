@@ -6,7 +6,7 @@ from ceph_volume import sys_info
 from ceph_volume import conf
 
 report_template = """
-/dev/{geomname:<16} {mediasize:<16} {rotational!s:<7} {available:<11} {descr}"""
+/dev/{geomname:<16} {mediasize:<16} {rotational!s:<7} {available:<6} {descr}  {reason}"""
 
 
 def camcontrol_devlist_parser():
@@ -83,9 +83,47 @@ def geom_disk_parser(block):
         column = re.sub(r"\s+", "", column)
         column = re.sub(r"^[0-9]+\.", "", column)
         value = value.strip()
-        value = re.sub(r"\([0-9A-Z]+\)", '', value)
+        value = re.sub(r"\([0-9A-Z.]+\)", '', value).strip()
         parsed[column.lower()] = value
     return parsed
+
+
+def get_camcontrol_identify(diskname):
+    """
+    Runs `camcontrol identify <diskname>` to get disk geometry for
+    SAS/SCSI (da*) devices where `geom disk list` can't report the
+    mediasize via ATA commands.
+
+    Returns a dict with 'mediasize' (bytes as int) and
+    'sectorsize' (logical sector size), or empty dict on failure.
+    """
+    command = ['/sbin/camcontrol', 'identify', diskname]
+    out, err, rc = process.call(command, verbose_on_failure=False)
+    if rc != 0 or not out:
+        return {}
+    result = {}
+    sector_size = 512  # default
+    lba48 = None
+    lba = None
+    for line in out:
+        stripped = line.strip()
+        # "sector size    logical 512, physical 4096, offset 0"
+        m = re.match(r'sector size\s+logical\s+(\d+)', stripped)
+        if m:
+            sector_size = int(m.group(1))
+        # "LBA48 supported    5860533168 sectors"
+        m = re.match(r'LBA48 supported\s+(\d+)\s+sectors', stripped)
+        if m:
+            lba48 = int(m.group(1))
+        # "LBA supported      268435455 sectors"
+        m = re.match(r'LBA supported\s+(\d+)\s+sectors', stripped)
+        if m:
+            lba = int(m.group(1))
+    sectors = lba48 or lba
+    if sectors:
+        result['mediasize'] = str(sectors * sector_size)
+        result['sectorsize'] = str(sector_size)
+    return result
 
 
 def get_geom_disk(diskname):
@@ -144,6 +182,13 @@ def get_partitions(diskname):
             # unallocated / free space region, not a real partition
             continue
         partitions.append({'name': name, 'type': ptype, 'size_human': human})
+    # Sort by partition index number so p4 always appears before p5
+    # regardless of how gpart orders them in its output (which is by
+    # start sector, not by partition number).
+    def _part_index(p):
+        m = re.search(r'p(\d+)$', p['name'])
+        return int(m.group(1)) if m else 0
+    partitions.sort(key=_part_index)
     return partitions
 
 
@@ -195,12 +240,13 @@ def get_gpart_info(diskname):
     return info
 
 
-def _walk_vdevs(vdevs, diskname, pool_name, found):
+def _walk_vdevs(vdevs, diskname, pool_name, found, parent_name=None):
     """
     Recursively walks the 'vdevs' dict from `zpool status -j` output
     (which nests: root -> mirror/raidz/normal -> leaf disks) looking
     for a leaf vdev whose 'path' matches this disk, bare or
     partitioned (e.g. /dev/ada0 or /dev/ada0p3).
+    Also captures the immediate parent vdev name (raidz2-0 etc.).
     """
     if found['in_pool']:
         return
@@ -209,39 +255,106 @@ def _walk_vdevs(vdevs, diskname, pool_name, found):
         if re.match(r"^/dev/" + re.escape(diskname) + r"(p\d+)?$", path):
             found['in_pool'] = True
             found['pool_name'] = pool_name
+            # if parent_name == pool_name, the disk is a direct child
+            # of the pool root -- no real vdev group, that's a stripe
+            if parent_name and parent_name != pool_name:
+                found['vdev_name'] = parent_name
+                if 'raidz' in parent_name:
+                    found['vdev_type'] = parent_name.split('-')[0]
+                elif 'mirror' in parent_name:
+                    found['vdev_type'] = 'mirror'
+                else:
+                    found['vdev_type'] = parent_name
+            else:
+                found['vdev_name'] = None
+                found['vdev_type'] = 'stripe'
             return
         children = vdev.get('vdevs')
         if children:
-            _walk_vdevs(children, diskname, pool_name, found)
+            _walk_vdevs(children, diskname, pool_name, found, parent_name=name)
             if found['in_pool']:
                 return
+
+
+def _get_zpool_membership_plaintext(diskname):
+    """
+    Fallback plaintext parser for `zpool status` when `-j` is not
+    supported (OpenZFS < 2.3, e.g. ZFS 2.2.x on FreeBSD 14).
+    Scrapes the indented vdev tree for lines containing the diskname,
+    and also captures the vdev name (raidz2-0, mirror-1, etc.) the
+    disk belongs to.
+    """
+    command = ['/sbin/zpool', 'status', '-P']
+    out, err, rc = process.call(command, verbose_on_failure=False)
+    result = {'in_pool': False, 'pool_name': None, 'vdev_name': None, 'vdev_type': None}
+    if rc != 0 or not out:
+        return result
+    current_pool = None
+    current_vdev = None
+    current_vdev_type = None
+    for line in out:
+        stripped = line.strip()
+        m = re.match(r'^pool:\s+(\S+)', stripped)
+        if m:
+            current_pool = m.group(1)
+            current_vdev = None
+            current_vdev_type = None
+            continue
+        # vdev group lines: raidz2-0, mirror-1, etc.
+        m = re.match(r'^(raidz\d*-\d+|mirror-\d+|stripe|logs|cache|spares)\s', stripped)
+        if m:
+            current_vdev = m.group(1)
+            # derive the type from the name prefix
+            if 'raidz' in current_vdev:
+                current_vdev_type = current_vdev.split('-')[0]  # raidz1, raidz2 etc
+            elif 'mirror' in current_vdev:
+                current_vdev_type = 'mirror'
+            else:
+                current_vdev_type = current_vdev
+            continue
+        if current_pool and re.search(
+                r'(^|/)' + re.escape(diskname) + r'(p\d+)?\s', stripped):
+            result['in_pool'] = True
+            result['pool_name'] = current_pool
+            result['vdev_name'] = current_vdev
+            # no vdev group line seen = direct child of pool = stripe
+            result['vdev_type'] = current_vdev_type or 'stripe'
+            break
+        if current_pool and re.match(
+                re.escape(diskname) + r'(p\d+)?\s', stripped):
+            result['in_pool'] = True
+            result['pool_name'] = current_pool
+            result['vdev_name'] = current_vdev
+            result['vdev_type'] = current_vdev_type or 'stripe'
+            break
+    return result
 
 
 def get_zpool_membership(diskname):
     """
     Checks whether this disk (or any gpart partition on it) is
-    already a member of a zpool, using `zpool status -j` for
-    structured, reliable parsing (rather than screen-scraping the
-    plain-text vdev tree).
+    already a member of a zpool.
+
+    Tries `zpool status -j` (JSON, OpenZFS >= 2.3) first for reliable
+    structured parsing; falls back to `zpool status -P` plaintext
+    scraping on older versions (e.g. ZFS 2.2.x on FreeBSD 14) where
+    -j is not supported.
 
     Returns a dict: {'in_pool': bool, 'pool_name': str or None}.
-
-    Note: this only sees *imported* pools. A pool that exists on disk
-    but is currently exported won't show up here -- callers that need
-    that level of safety should also check `zpool import` (with no
-    args, lists importable-but-not-imported pools) before treating a
-    disk as free.
     """
     import json
     command = ['/sbin/zpool', 'status', '-j']
-    out, err, rc = process.call(command)
-    result = {'in_pool': False, 'pool_name': None}
-    if rc != 0 or not out:
+    out, err, rc = process.call(command, verbose_on_failure=False)
+    result = {'in_pool': False, 'pool_name': None, 'vdev_name': None, 'vdev_type': None}
+    if rc != 0:
+        # -j not supported -- fall back to plaintext
+        return _get_zpool_membership_plaintext(diskname)
+    if not out:
         return result
     try:
         data = json.loads(''.join(out))
     except (ValueError, TypeError):
-        return result
+        return _get_zpool_membership_plaintext(diskname)
     for pool_name, pool in data.get('pools', {}).items():
         top_vdevs = pool.get('vdevs', {})
         _walk_vdevs(top_vdevs, diskname, pool_name, result)
@@ -485,20 +598,53 @@ def _collect_vdev_paths(vdevs, paths):
             })
 
 
+def _get_zpool_vdevs_plaintext(pool_name):
+    """
+    Plaintext fallback for get_zpool_vdevs() on OpenZFS < 2.3.
+    Parses `zpool status -P` output to extract vdev device paths.
+    """
+    command = ['/sbin/zpool', 'status', '-P', pool_name]
+    out, err, rc = process.call(command, verbose_on_failure=False)
+    paths = []
+    if rc != 0 or not out:
+        return paths
+    in_config = False
+    for line in out:
+        stripped = line.strip()
+        if stripped.startswith('config:'):
+            in_config = True
+            continue
+        if stripped.startswith('errors:'):
+            in_config = False
+            continue
+        if not in_config:
+            continue
+        # leaf vdev lines look like:  /dev/ada0p3   ONLINE   0   0   0
+        m = re.match(r'^(/dev/\S+)\s+(\w+)', stripped)
+        if m:
+            paths.append({
+                'path': m.group(1),
+                'state': m.group(2),
+                'vdev_type': 'disk',
+            })
+    return paths
+
+
 def get_zpool_vdevs(pool_name):
     """
     Returns the physical devices backing a pool, as a list of dicts:
     [{'path': '/dev/ada0', 'state': 'ONLINE', 'vdev_type': 'disk'}].
 
-    Reads `zpool status -j` and walks the same nested vdev tree that
-    get_zpool_membership() searches, but collecting every leaf rather
-    than matching one disk.
+    Tries `zpool status -j` (OpenZFS >= 2.3) first, falls back to
+    plaintext parsing on older versions.
     """
     import json
     command = ['/sbin/zpool', 'status', '-j', pool_name]
     out, err, rc = process.call(command, verbose_on_failure=False)
     paths = []
-    if rc != 0 or not out:
+    if rc != 0:
+        return _get_zpool_vdevs_plaintext(pool_name)
+    if not out:
         return paths
     try:
         data = json.loads(''.join(out))
@@ -564,7 +710,24 @@ def get_disks():
     for dsk, cam_info in cam_devices.items():
         if re.match(r'^cd\d+$', dsk):
             continue
+        # ses = SCSI Enclosure Services, pass = CAM passthrough -- never OSD targets
+        if re.match(r'^(ses|pass)\d+$', dsk):
+            continue
+        # strip any accidental /dev/ prefix from the camcontrol parser
+        dsk = dsk.replace('/dev/', '')
         disk = get_geom_disk(dsk)
+        # For SAS/SCSI (da*) devices geom sometimes can't report mediasize
+        # via ATA commands, or reports 0. Augment from camcontrol identify.
+        if re.match(r'^da\d+$', dsk):
+            raw_size = disk.get('mediasize', '').strip()
+            try:
+                geom_size = int(raw_size.split()[0]) if raw_size else 0
+            except (ValueError, IndexError):
+                geom_size = 0
+            if geom_size == 0:
+                cam_id = get_camcontrol_identify(dsk)
+                if cam_id.get('mediasize'):
+                    disk.update(cam_id)
         disk['cam'] = cam_info
         disk['gpart'] = get_gpart_info(dsk)
         disk['zpool'] = get_zpool_membership(dsk)
@@ -615,8 +778,9 @@ class Disks(object):
                 geomname='Device Path',
                 mediasize='Size',
                 rotational='rotates',
-                available='available',
+                available='avail',
                 descr='Model name',
+                reason='',
             )]
         for disk in sorted(self.disks):
             output.append(self.disks[disk].report())
@@ -663,29 +827,32 @@ class Disk(object):
         membership, and active mounts. A disk failing any of these
         checks is not safe for prepare/zap to touch without an
         explicit override.
+
+        Order matters: zpool/partition/mount checks run first so that
+        the most actionable reason appears first -- especially for
+        SAS/SCSI (da*) disks where geom reports no mediasize but the
+        real reason is zpool membership.
         """
-        mediasize = self.sys_api.get('mediasize')
-        try:
-            has_usable_size = int(mediasize) > 0
-        except (TypeError, ValueError):
-            has_usable_size = False
-        if not has_usable_size:
-            self.reject_reasons.append(
-                'No usable media size reported (e.g. empty optical drive, or device not yet attached)'
-            )
+        zpool = self.sys_api.get('zpool', {})
+        if zpool.get('in_pool'):
+            vdev_name = zpool.get('vdev_name')
+            vdev_type = zpool.get('vdev_type') or 'stripe'
+            if vdev_name:
+                self.reject_reasons.append(
+                    'Member of {} vdev in zpool "{}"'.format(
+                        vdev_name, zpool.get('pool_name'))
+                )
+            else:
+                self.reject_reasons.append(
+                    'Single-disk (no redundancy) member of zpool "{}"'.format(
+                        zpool.get('pool_name'))
+                )
             self.available = False
 
         gpart = self.sys_api.get('gpart', {})
         if gpart.get('has_partitions'):
             self.reject_reasons.append(
                 'Has an existing {} partition table'.format(gpart.get('scheme'))
-            )
-            self.available = False
-
-        zpool = self.sys_api.get('zpool', {})
-        if zpool.get('in_pool'):
-            self.reject_reasons.append(
-                'Already a member of zpool "{}"'.format(zpool.get('pool_name'))
             )
             self.available = False
 
@@ -703,6 +870,25 @@ class Disk(object):
             )
             self.available = False
 
+        # mediasize check last -- for SAS/SCSI (da*) disks via HBA
+        # geom often can't read the size via ATA commands, but the
+        # real reason they're unavailable is usually zpool membership
+        # (checked above). Only flag missing size if nothing else
+        # already marked the disk unavailable.
+        if not self.reject_reasons:
+            mediasize = self.sys_api.get('mediasize')
+            try:
+                has_usable_size = int(mediasize) > 0
+            except (TypeError, ValueError):
+                has_usable_size = False
+            if not has_usable_size:
+                if re.match(r'^da\d+$', self.sys_api.get('geomname', '')):
+                    reason = 'No usable media size from geom (SAS/SCSI device via HBA)'
+                else:
+                    reason = 'No usable media size reported (e.g. empty optical drive, or device not yet attached)'
+                self.reject_reasons.append(reason)
+                self.available = False
+
     @staticmethod
     def _safe_int(value, default=0):
         """
@@ -718,16 +904,17 @@ class Disk(object):
     def report(self):
         if self.available:
             available_str = 'True'
+            reason_str = ''
         else:
-            # keep it short for the fixed-width column; full reasons
-            # are in describe()/reject_reasons for the verbose view
-            available_str = 'False (' + self.reject_reasons[0] + ')' if self.reject_reasons else 'False'
+            available_str = 'False'
+            reason_str = '(' + self.reject_reasons[0] + ')' if self.reject_reasons else ''
         return report_template.format(
             geomname=self.sys_api.get('geomname', self.path),
             mediasize=human_readable_size(self._safe_int(self.sys_api.get('mediasize'))),
             rotational=self._safe_int(self.sys_api.get('rotationrate')) != 0,
             available=available_str,
-            descr=self.sys_api.get('descr')
+            descr=self.sys_api.get('descr'),
+            reason=reason_str,
         )
 
     def describe(self):
@@ -750,7 +937,19 @@ class Disk(object):
         gpart = self.sys_api.get('gpart', {})
         partitions = gpart.get('partitions', [])
         if not partitions:
-            lines.append('  partitions: none (disk is empty)')
+            zpool = self.sys_api.get('zpool', {})
+            if zpool.get('in_pool'):
+                vdev_name = zpool.get('vdev_name')
+                if vdev_name:
+                    lines.append(
+                        '  partitions: none (whole-disk member of {} in zpool "{}")'.format(
+                            vdev_name, zpool.get('pool_name')))
+                else:
+                    lines.append(
+                        '  partitions: none (single-disk member of zpool "{}")'.format(
+                            zpool.get('pool_name')))
+            else:
+                lines.append('  partitions: none (disk is empty)')
         else:
             lines.append('  partitions:')
             mount = self.sys_api.get('mount', {})
