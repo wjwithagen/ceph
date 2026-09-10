@@ -3,7 +3,6 @@ import re
 from ceph_volume.util.disk import human_readable_size
 from ceph_volume import process
 from ceph_volume import sys_info
-from ceph_volume import conf
 
 report_template = """
 /dev/{geomname:<16} {mediasize:<16} {rotational!s:<7} {available:<6} {descr}  {reason}"""
@@ -128,19 +127,15 @@ def get_camcontrol_identify(diskname):
 
 def get_geom_disk(diskname):
     """
-    Captures all available info from geom for a single disk name
-    (e.g. 'ada0', no /dev/ prefix), along with interesting metadata
-    like sectors, size, vendor, solid/rotational, etc.
+    Captures all available info from geom
+    along with interesting metadata like sectors, size, vendor,
+    solid/rotational, etc...
 
-    Returns a dictionary, with all the geom fields as keys. Returns an
-    empty dict if geom has no provider for this disk (e.g. it hasn't
-    attached yet) rather than raising, since camcontrol is now the
-    source of truth for whether the disk exists at all.
+    Returns a dictionary, with all the geom fields as keys.
     """
-    command = ['/sbin/geom', 'disk', 'list', diskname]
+
+    command = ['/sbin/geom', 'disk', 'list', re.sub('/dev/', '', diskname)]
     out, err, rc = process.call(command)
-    if rc != 0:
-        return {}
     geom_block = ""
     for line in out:
         line.strip()
@@ -695,17 +690,8 @@ def list_ceph_zpools():
 
 
 def get_disks():
-    """
-    Primary enumeration entry point. Walks camcontrol devlist as the
-    source of truth for "what disks exist", then augments each with
-    geom, gpart, zpool-membership, and mount info.
-
-    Optical drives (cd0, cd1, ...) are skipped entirely -- they're
-    never valid OSD candidates, and running gpart/zpool checks
-    against them is pointless noise (gpart errors on a geom that was
-    never created for a driveless optical device).
-    """
-    cam_devices = camcontrol_devlist_parser()
+    command = ['/sbin/geom', 'disk', 'status', '-s']
+    out, err, rc = process.call(command)
     disks = {}
     for dsk, cam_info in cam_devices.items():
         if re.match(r'^cd\d+$', dsk):
@@ -736,7 +722,6 @@ def get_disks():
         disks['/dev/' + dsk] = disk
     return disks
 
-
 class Disks(object):
 
     def __init__(self, path=None):
@@ -749,28 +734,6 @@ class Disks(object):
                     self.disks[k] = Disk(k)
             else:
                 self.disks[k] = Disk(k)
-
-    def available_candidates(self):
-        """
-        Returns only the disks that passed all safety checks
-        (no existing partitions, not zpool members, not mounted,
-        usable media size) -- i.e. what's actually safe to hand to
-        `prepare`. This is the filtered view callers should use
-        instead of iterating self.disks directly, which includes
-        rejected/unsafe devices too.
-        """
-        return {k: v for k, v in self.disks.items() if v.available}
-
-    def verbose_report(self):
-        """
-        Human-readable, per-disk report: status, size, model,
-        partition layout (or "no partitions"), and per-partition
-        mount status. This is the -v style detail view -- use this
-        instead of printing raw sys_api dicts.
-        """
-        sections = [d.describe() for d in
-                    (self.disks[k] for k in sorted(self.disks))]
-        return '\n\n'.join(sections) + '\n'
 
     def pretty_report(self, all=True):
         output = [
@@ -974,17 +937,5 @@ class Disk(object):
 
     def json_report(self):
         output = {k.strip('_'): v for k, v in vars(self).items()}
-        if not getattr(conf, 'debug', False):
-            # 'raw' (literal `gpart show` output lines) is debug-only
-            # noise in normal reports -- strip it out of the copy we
-            # hand back, without touching the live sys_api dict that
-            # get_gpart_info()/_evaluate_availability() rely on.
-            sys_api = dict(output.get('sys_api', {}))
-            gpart = sys_api.get('gpart')
-            if isinstance(gpart, dict) and 'raw' in gpart:
-                gpart = dict(gpart)
-                gpart.pop('raw', None)
-                sys_api['gpart'] = gpart
-            output['sys_api'] = sys_api
         return output
 
