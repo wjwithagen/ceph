@@ -9,9 +9,24 @@ fi
 : ${BUILD_DIR:=build}
 : ${CEPH_GIT_DIR:=..}
 
+ALLOW_EXISTING=0
+ARGS=""
+for arg in "$@"; do
+    if [ "$arg" = "--allow-existing-builddir" ]; then
+        ALLOW_EXISTING=1
+    else
+        ARGS="$ARGS $arg"
+    fi
+done
+set -- $ARGS
+
 if [ -e $BUILD_DIR ]; then
-    echo "'$BUILD_DIR' dir already exists; either rm -rf '$BUILD_DIR' and re-run, or set BUILD_DIR env var to a different directory name"
-    exit 1
+    if [ "$ALLOW_EXISTING" = "1" ]; then
+        echo "'$BUILD_DIR' dir already exists; --allow-existing-builddir given, reusing it"
+    else
+        echo "'$BUILD_DIR' dir already exists; either rm -rf '$BUILD_DIR' and re-run, or set BUILD_DIR env var to a different directory name"
+        exit 1
+    fi
 fi
 
 PYBUILD="3"
