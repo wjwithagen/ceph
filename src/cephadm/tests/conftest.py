@@ -42,5 +42,6 @@ def pytest_configure(config):
     config.addinivalue_line(
         'filterwarnings',
         'ignore:Exception ignored in.*_TemporaryFileCloser.*:'
-        'pytest.PytestUnraisableExceptionWarning
+        'pytest.PytestUnraisableExceptionWarning',
+    )
 
