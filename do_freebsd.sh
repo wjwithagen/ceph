@@ -3,11 +3,29 @@ export NPROC=`sysctl -n hw.ncpu`
 
 $SUDO
 
-CLEAN=1
-if [ x"$1"x = x"--incremental"x ]; then
-    CLEAN=0
-    shift
-fi
+ALLOW_FLAG=""
+RUN_TESTS=1
+
+while [ x"$1"x != xx ]; do
+    case "$1" in
+        --jenkins)
+            ALLOW_FLAG="--allow-existing-builddir"
+            RUN_TESTS=0
+            shift
+            ;;
+        --incremental)
+            ALLOW_FLAG="--allow-existing-builddir"
+            shift
+            ;;
+        --build-only)
+            RUN_TESTS=0
+            shift
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
 
 if [ x"$1"x = x"--deps"x ]; then
     $SUDO ./install-deps.sh
@@ -24,100 +42,96 @@ COMPILE_FLAGS="-O0 -g -Wno-unused-command-line-argument"
 CMAKE_CXX_FLAGS_DEBUG="$CXX_FLAGS_DEBUG $COMPILE_FLAGS"
 CMAKE_C_FLAGS_DEBUG="$C_FLAGS_DEBUG $COMPILE_FLAGS"
 
-[ -z "$BUILD_DIR" ] && BUILD_DIR=build
+: ${BUILD_DIR:=build}
+export BUILD_DIR
 
-if [ "$CLEAN" = "1" ]; then
-    echo "Full clean build requested"
+if [ -z "$ALLOW_FLAG" ]; then
+    echo "Keeping the old build"
     if [ -d ${BUILD_DIR}.old ]; then
         $SUDO mv ${BUILD_DIR}.old ${BUILD_DIR}.del
-        $SUDO rm -rf ${BUILD_DIR}.del &
+        $SUDO rm -rf ${BUILD_DIR}.del
     fi
     if [ -d ${BUILD_DIR} ]; then
         $SUDO mv ${BUILD_DIR} ${BUILD_DIR}.old
     fi
-
-    ./do_cmake.sh "$*" \
-            -D WITH_CCACHE=ON \
-            -D CMAKE_BUILD_TYPE=Debug \
-            -D CMAKE_CXX_FLAGS_DEBUG="$CMAKE_CXX_FLAGS_DEBUG" \
-            -D CMAKE_C_FLAGS_DEBUG="$CMAKE_C_FLAGS_DEBUG" \
-            -D ENABLE_GIT_VERSION=OFF \
-            -D WITH_SYSTEMD=OFF \
-            -D WITH_SYSTEM_BOOST=ON \
-            -D WITH_SYSTEM_NPM=ON \
-            -D WITH_LTTNG=OFF \
-            -D WITH_BABELTRACE=OFF \
-            -D WITH_CRIMSON=OFF \
-            -D WITH_FUSE=OFF \
-            -D WITH_KRBD=OFF \
-            -D WITH_XFS=OFF \
-            -D WITH_KVS=ON \
-            -D CEPH_MAN_DIR=man \
-            -D WITH_LIBCEPHFS=ON -D WITH_LIBCEPHFS_PROXY=OFF \
-            -D WITH_CEPHFS=ON \
-            -D WITH_MGR=ON -D WITH_MGR_DASHBOARD_FRONTEND=OFF \
-            -D WITH_RDMA=OFF \
-            -D WITH_SPDK=OFF \
-            -D WITH_JAEGER=OFF \
-            -D WITH_BREAKPAD=OFF \
-            -D WITH_LIBURING=OFF \
-            -D WITH_RADOSGW_AMQP_ENDPOINT=OFF \
-            -D WITH_RADOSGW_KAFKA_ENDPOINT=OFF \
-            -D WITH_RADOSGW_ARROW_FLIGHT=OFF \
-            -D WITH_RADOSGW_SELECT_PARQUET=OFF \
-            -D WITH_RADOSGW_POSIX=OFF \
-            -D WITH_NVMEOF_GATEWAY_MONITOR_CLIENT=OFF \
-            -D WITH_QATLIB=OFF -D WITH_QATZIP=OFF \
-            2>&1 | tee cmake.log
-else
-    echo "Incremental build requested — skipping cmake reconfigure"
 fi
+
+./do_cmake.sh $ALLOW_FLAG "$*" \
+        -D WITH_CCACHE=ON \
+        -D CMAKE_BUILD_TYPE=Debug \
+        -D CMAKE_CXX_FLAGS_DEBUG="$CMAKE_CXX_FLAGS_DEBUG" \
+        -D CMAKE_C_FLAGS_DEBUG="$CMAKE_C_FLAGS_DEBUG" \
+        -D ENABLE_GIT_VERSION=OFF \
+        -D WITH_SYSTEMD=OFF \
+        -D WITH_SYSTEM_BOOST=ON \
+        -D WITH_SYSTEM_NPM=ON \
+        -D WITH_LTTNG=OFF \
+        -D WITH_BABELTRACE=OFF \
+        -D WITH_CRIMSON=OFF \
+        -D WITH_FUSE=OFF \
+        -D WITH_KRBD=OFF \
+        -D WITH_XFS=OFF \
+        -D WITH_KVS=ON \
+        -D CEPH_MAN_DIR=man \
+        -D WITH_LIBCEPHFS=ON -D WITH_LIBCEPHFS_PROXY=OFF \
+        -D WITH_CEPHFS=ON \
+        -D WITH_MGR=ON -D WITH_MGR_DASHBOARD_FRONTEND=OFF \
+        -D WITH_RDMA=OFF \
+        -D WITH_SPDK=OFF \
+        -D WITH_JAEGER=OFF \
+        -D WITH_BREAKPAD=OFF \
+        -D WITH_LIBURING=OFF \
+        -D WITH_RADOSGW_AMQP_ENDPOINT=OFF \
+        -D WITH_RADOSGW_KAFKA_ENDPOINT=OFF \
+        -D WITH_RADOSGW_ARROW_FLIGHT=OFF \
+        -D WITH_RADOSGW_SELECT_PARQUET=OFF \
+        -D WITH_RADOSGW_POSIX=OFF \
+        -D WITH_NVMEOF_GATEWAY_MONITOR_CLIENT=OFF \
+        -D WITH_QATLIB=OFF -D WITH_QATZIP=OFF \
+        2>&1 | tee cmake.log
 
 echo -n "start building: "; date
 printenv
 
 cd ${BUILD_DIR}
-
-BUILD_STATUS=0
 if [ -f build.ninja ]; then
-    ninja -j${NPROC} 2>&1 | tee ../build.log || BUILD_STATUS=1
-    ninja tests 2>&1 | tee -a ../build.log || BUILD_STATUS=1
+  ninja -j${NPROC}
+  ninja tests
 else
-    gmake -j${NPROC} V=1 VERBOSE=1 2>&1 | tee ../build.log || BUILD_STATUS=1
-    gmake tests 2>&1 | tee -a ../build.log || BUILD_STATUS=1
+  gmake -j${NPROC} V=1 VERBOSE=1
+  gmake tests
 fi
 
-if [ ${BUILD_STATUS} -ne 0 ]; then
-    echo "BUILD FAILED — see build.log — skipping tests"
-    exit ${BUILD_STATUS}
+if [ "$RUN_TESTS" = "0" ]; then
+    echo "Skipping tests (--jenkins or --build-only given)"
+    echo -n "Ended: "; date
+    exit 0
 fi
 
 echo -n "start testing: "; date
+RETEST=0
+ctest -j ${NPROC} || RETEST=1
 
-TEST_STATUS=0
-ctest -j ${NPROC} --output-on-failure 2>&1 | tee ../ctest.log || TEST_STATUS=1
+echo "Testing result, retest: = " $RETEST
 
-if [ ${TEST_STATUS} -ne 0 ]; then
-    echo "Some tests failed, cleaning up leftovers and retrying failed tests"
-    killall ceph-osd 2>/dev/null || true
-    killall ceph-mgr 2>/dev/null || true
-    killall ceph-mds 2>/dev/null || true
-    killall ceph-mon 2>/dev/null || true
-    rm -rf td/* /tmp/td src/test/td/* 2>/dev/null || true
-    rm -rf /tmp/ceph-asok.* /tmp/cores.* /tmp/*.core 2>/dev/null || true
+if [ $RETEST -eq 1 ]; then
+    killall ceph-osd || true
+    killall ceph-mgr || true
+    killall ceph-mds || true
+    killall ceph-mon || true
+    rm -rf td/* /tmp/td src/test/td/* || true
+    rm -rf /tmp/ceph-asok.* || true
+    rm -rf /tmp/cores.* || true
+    rm -rf /tmp/*.core || true
 
-    ctest --output-on-failure --rerun-failed 2>&1 | tee -a ../ctest.log || TEST_STATUS=1
+    ctest --output-on-failure --rerun-failed || RETEST=1
 fi
 
-rm -rf /tmp/tmp* /tmp/foo /tmp/pip* /tmp/big* /tmp/pymp* $TMPDIR 2>/dev/null || true
+STATUS=$RETEST
+
+rm -rf /tmp/tmp* /tmp/foo /tmp/pip* /tmp/big* /tmp/pymp* $TMPDIR || true
 
 echo -n "Ended: "; date
 
-if [ ${TEST_STATUS} -ne 0 ]; then
-    echo "FINAL RESULT: TESTS FAILED"
-    exit 1
-fi
-
-echo "FINAL RESULT: SUCCESS"
-exit 0
+exit $STATUS
 
