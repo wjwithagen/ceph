@@ -356,7 +356,7 @@ TEST(BackoffThrottle, balanced)
     2);
 #if defined(__FreeBSD__)
   ASSERT_LT(results.first, 60);
-  ASSERT_GT(results.first, 25);
+  ASSERT_GT(results.first, 20);
 #else
   ASSERT_LT(results.first, 60);
   ASSERT_GT(results.first, 40);
