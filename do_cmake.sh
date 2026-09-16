@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 export PS4='+ $BASH_SOURCE:$LINENO: '
-set -exv
+set -e
+set -xv
 
 if [ -d .git ]; then
     git submodule update --init --recursive --recommend-shallow
@@ -10,15 +11,10 @@ fi
 : ${CEPH_GIT_DIR:=..}
 
 ALLOW_EXISTING=0
-ARGS=""
-for arg in "$@"; do
-    if [ "$arg" = "--allow-existing-builddir" ]; then
-        ALLOW_EXISTING=1
-    else
-        ARGS="$ARGS $arg"
-    fi
-done
-set -- $ARGS
+if [ "$1" = "--allow-existing-builddir" ]; then
+    ALLOW_EXISTING=1
+    shift
+fi
 
 if [ -e $BUILD_DIR ]; then
     if [ "$ALLOW_EXISTING" = "1" ]; then
@@ -111,7 +107,7 @@ fi
 ARGS+=" -DCMAKE_CXX_COMPILER=$cxx_compiler"
 ARGS+=" -DCMAKE_C_COMPILER=$c_compiler"
 
-mkdir $BUILD_DIR
+mkdir -p $BUILD_DIR
 cd $BUILD_DIR
 
 # Only set CMAKE variable if not already set by user/environment.

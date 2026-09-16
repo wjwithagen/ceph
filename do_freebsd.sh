@@ -91,7 +91,6 @@ fi
         2>&1 | tee cmake.log
 
 echo -n "start building: "; date
-printenv
 
 cd ${BUILD_DIR}
 if [ -f build.ninja ]; then
