@@ -1093,6 +1093,7 @@ def parseXmlToJson(xml):
   return response
 
 @pytest.mark.fails_on_aws
+@pytest.mark.fails_on_dbstore
 def test_account_usage():
     # boto3.set_stream_logger(name='botocore')
     client = get_client()
@@ -6889,7 +6890,7 @@ def test_multipart_sse_c_get_part():
     assert status == 404
     assert error_code == 'NoSuchKey'
 
-    res = client.complete_multipart_upload(Bucket=bucket_name, Key=key, UploadId=upload_id, MultipartUpload={'Parts': parts}, **get_args)
+    res = client.complete_multipart_upload(Bucket=bucket_name, Key=key, UploadId=upload_id, MultipartUpload={'Parts': parts})
     assert len(parts) == part_count
 
     for part, size in zip(parts, part_sizes):
@@ -6911,6 +6912,40 @@ def test_multipart_sse_c_get_part():
     status, error_code = _get_status_and_error_code(e.response)
     assert status == 400
     assert error_code == 'InvalidPart'
+
+@pytest.mark.encryption
+@pytest.mark.checksum
+@pytest.mark.fails_on_dbstore
+def test_multipart_sse_c_checksum_complete():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    key = "mymultipart"
+    sse_args = {
+        'SSECustomerAlgorithm': 'AES256',
+        'SSECustomerKey': 'pO3upElrwuEXSoFwCfnZPdSsmt/xWeFa0N9KgDijwVs=',
+        'SSECustomerKeyMD5': 'DWygnHRtgiJ77HCm+1rvHw==',
+    }
+
+    response = client.create_multipart_upload(Bucket=bucket_name, Key=key, ChecksumAlgorithm='SHA256', **sse_args)
+    upload_id = response['UploadId']
+
+    body = FakeWriteFile(1024, 'A')
+    part_sha256sum = 'arcu6553sHVAiX4MjW0j7I7vD4w6R+Gz9Ok0Q9lTa+0='
+    response = client.upload_part(UploadId=upload_id, Bucket=bucket_name, Key=key, PartNumber=1, Body=body,
+                                  ChecksumAlgorithm='SHA256', ChecksumSHA256=part_sha256sum, **sse_args)
+    parts = [{'ETag': response['ETag'].strip('"'), 'ChecksumSHA256': response['ChecksumSHA256'], 'PartNumber': 1}]
+
+    # the key headers are required to complete a checksummed sse-c upload
+    e = assert_raises(ClientError, client.complete_multipart_upload,
+                      Bucket=bucket_name, Key=key, UploadId=upload_id, MultipartUpload={'Parts': parts})
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 400
+    assert error_code == 'InvalidArgument'
+
+    composite_sha256sum = 'Ok6Cs5b96ux6+MWQkJO7UBT5sKPBeXBLwvj/hK89smg=-1'
+    response = client.complete_multipart_upload(Bucket=bucket_name, Key=key, UploadId=upload_id,
+                                                MultipartUpload={'Parts': parts}, **sse_args)
+    assert composite_sha256sum == response['ChecksumSHA256']
 
 @pytest.mark.fails_on_dbstore
 def test_multipart_single_get_part():
@@ -15664,6 +15699,116 @@ def test_object_checksum_sha256():
     assert error_code == 'BadDigest'
 
 @pytest.mark.checksum
+def test_object_checksum_sha512():
+    bucket = get_new_bucket()
+    client = get_client()
+
+    key = "myobj"
+    size = 1024
+    body = FakeWriteFile(size, 'A')
+    sha512sum = 'bO7Eq5ubilg55mUGSAieJjtmRdS+PhkSv4Z8Dj4XT5dqOfVEbEvR1X2DfWMZsSMQP+L+4vWQOAqD/k0O2YCZ7w=='
+    response = client.put_object(Bucket=bucket, Key=key, Body=body, ChecksumAlgorithm='SHA512', ChecksumSHA512=sha512sum)
+    assert sha512sum == response['ChecksumSHA512']
+
+    response = client.head_object(Bucket=bucket, Key=key)
+    assert 'ChecksumSHA512' not in response
+    response = client.head_object(Bucket=bucket, Key=key, ChecksumMode='ENABLED')
+    assert sha512sum == response['ChecksumSHA512']
+
+    e = assert_raises(ClientError, client.put_object, Bucket=bucket, Key=key, Body=body, ChecksumAlgorithm='SHA512', ChecksumSHA512='bad')
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 400
+    assert error_code == 'BadDigest'
+
+@pytest.mark.checksum
+def test_object_checksum_xxhash3():
+    bucket = get_new_bucket()
+    client = get_client()
+
+    key = "myobj"
+    size = 1024
+    body = FakeWriteFile(size, 'A')
+    xxhash3sum = 'TTWtCOnXfA0='
+    response = client.put_object(Bucket=bucket, Key=key, Body=body, ChecksumAlgorithm='XXHASH3', ChecksumXXHASH3=xxhash3sum)
+    assert xxhash3sum == response['ChecksumXXHASH3']
+
+    response = client.head_object(Bucket=bucket, Key=key)
+    assert 'ChecksumXXHASH3' not in response
+    response = client.head_object(Bucket=bucket, Key=key, ChecksumMode='ENABLED')
+    assert xxhash3sum == response['ChecksumXXHASH3']
+
+    e = assert_raises(ClientError, client.put_object, Bucket=bucket, Key=key, Body=body, ChecksumAlgorithm='XXHASH3', ChecksumXXHASH3='bad')
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 400
+    assert error_code == 'BadDigest'
+
+@pytest.mark.checksum
+def test_object_checksum_xxhash64():
+    bucket = get_new_bucket()
+    client = get_client()
+
+    key = "myobj"
+    size = 1024
+    body = FakeWriteFile(size, 'A')
+    xxhash64sum = 'Np5GGlTsOCc='
+    response = client.put_object(Bucket=bucket, Key=key, Body=body, ChecksumAlgorithm='XXHASH64', ChecksumXXHASH64=xxhash64sum)
+    assert xxhash64sum == response['ChecksumXXHASH64']
+
+    response = client.head_object(Bucket=bucket, Key=key)
+    assert 'ChecksumXXHASH64' not in response
+    response = client.head_object(Bucket=bucket, Key=key, ChecksumMode='ENABLED')
+    assert xxhash64sum == response['ChecksumXXHASH64']
+
+    e = assert_raises(ClientError, client.put_object, Bucket=bucket, Key=key, Body=body, ChecksumAlgorithm='XXHASH64', ChecksumXXHASH64='bad')
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 400
+    assert error_code == 'BadDigest'
+
+@pytest.mark.checksum
+def test_object_checksum_xxhash128():
+    bucket = get_new_bucket()
+    client = get_client()
+
+    key = "myobj"
+    size = 1024
+    body = FakeWriteFile(size, 'A')
+    xxhash128sum = 'kZHSD0DXTkZNNa0I6dd8DQ=='
+    response = client.put_object(Bucket=bucket, Key=key, Body=body, ChecksumAlgorithm='XXHASH128', ChecksumXXHASH128=xxhash128sum)
+    assert xxhash128sum == response['ChecksumXXHASH128']
+
+    response = client.head_object(Bucket=bucket, Key=key)
+    assert 'ChecksumXXHASH128' not in response
+    response = client.head_object(Bucket=bucket, Key=key, ChecksumMode='ENABLED')
+    assert xxhash128sum == response['ChecksumXXHASH128']
+
+    e = assert_raises(ClientError, client.put_object, Bucket=bucket, Key=key, Body=body, ChecksumAlgorithm='XXHASH128', ChecksumXXHASH128='bad')
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 400
+    assert error_code == 'BadDigest'
+
+@pytest.mark.checksum
+def test_object_checksum_md5():
+    bucket = get_new_bucket()
+    client = get_client()
+
+    key = "myobj"
+    size = 1024
+    body = FakeWriteFile(size, 'A')
+    md5sum = '1HsSe8LeLWh93ILaw1TEFQ=='
+    response = client.put_object(Bucket=bucket, Key=key, Body=body, ChecksumAlgorithm='MD5', ChecksumMD5=md5sum)
+    assert md5sum == response['ChecksumMD5']
+
+    response = client.head_object(Bucket=bucket, Key=key)
+    assert 'ChecksumMD5' not in response
+    response = client.head_object(Bucket=bucket, Key=key, ChecksumMode='ENABLED')
+    assert md5sum == response['ChecksumMD5']
+
+    e = assert_raises(ClientError, client.put_object, Bucket=bucket, Key=key, Body=body, ChecksumAlgorithm='MD5', ChecksumMD5='bad')
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 400
+    assert error_code == 'BadDigest'
+
+@pytest.mark.checksum
 def test_object_checksum_crc64nvme():
     bucket = get_new_bucket()
     client = get_client()
@@ -21335,14 +21480,6 @@ def _test_copy_part_enc(file_size, source_mode_key, dest_mode_key, source_sc=Non
     })
 
     if dest_mode_key == 'sse-c':
-        # make sure api is verifying the SSE-C headers
-        e = assert_raises(ClientError, client.complete_multipart_upload,
-                          Bucket=dest_bucket_name, Key='testobj2',
-                          UploadId=upload_id, MultipartUpload={'Parts': parts})
-        status, _ = _get_status_and_error_code(e.response)
-        assert status == 400
-
-        # and the key would be the same as the one used in upload part
         # use the source key to complete the upload
         # this is not allowed, so we expect an error
         source_sse_c_args = _copy_enc_source_modes['sse-c']['args']

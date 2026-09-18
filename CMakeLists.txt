@@ -608,6 +608,7 @@ option(WITH_RADOSGW_RADOS "RADOS backend for Rados Gateway" ON)
 option(WITH_RADOSGW_SELECT_PARQUET "Support for s3 select on parquet objects" ON)
 option(WITH_RADOSGW_ARROW_FLIGHT "Build arrow flight when not using system-provided arrow" OFF)
 option(WITH_RADOSGW_BACKTRACE_LOGGING "Enable backtraces in rgw logs" OFF)
+option(WITH_RADOSGW_LANCEDB "Enable lancedb support in RADOS Gateway" ON)
 
 option(WITH_SYSTEM_ARROW "Use system-provided arrow" OFF)
 option(WITH_SYSTEM_UTF8PROC "Use system-provided utf8proc" OFF)
@@ -666,6 +667,13 @@ if(WITH_RADOSGW)
   endif()
   message(STATUS "ssl soname: ${LIBSSL_SONAME}")
   message(STATUS "crypto soname: ${LIBCRYPTO_SONAME}")
+  if(WITH_RADOSGW_LANCEDB)
+    find_package(Cargo 1.91)
+    if(NOT Cargo_FOUND)
+      message(FATAL_ERROR "lancedb requires cargo >= 1.91. run install-deps.sh to install it, "
+        "or build with -DWITH_RADOSGW_LANCEDB=OFF")
+    endif()
+  endif(WITH_RADOSGW_LANCEDB)
 endif (WITH_RADOSGW)
 
 if(WITH_RADOSGW_FDB)
@@ -810,7 +818,17 @@ endif()
 # Rocksdb
 option(WITH_SYSTEM_ROCKSDB "require and build with system rocksdb" OFF)
 if (WITH_SYSTEM_ROCKSDB)
-  find_package(RocksDB 5.14 REQUIRED)
+  find_package(RocksDB 9.10 REQUIRED)
+else()
+  # westmere is the oldest microarchitecture with the SSE4.2 and PCLMULQDQ
+  # that RocksDB's CRC32C needs. set to ON to target the x86-64 baseline.
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+    set(ROCKSDB_PORTABLE "westmere" CACHE STRING
+      "oldest CPU microarchitecture targeted by the bundled RocksDB")
+  else()
+    set(ROCKSDB_PORTABLE "ON" CACHE STRING
+      "oldest CPU microarchitecture targeted by the bundled RocksDB")
+  endif()
 endif()
 
 # Boost
@@ -900,16 +918,16 @@ endif()
 
 # dashboard angular2 frontend
 option(WITH_MGR_DASHBOARD_FRONTEND "Build the mgr/dashboard frontend using `npm`" ON)
-if(WITH_MGR_DASHBOARD_FRONTEND)
-  option(WITH_SYSTEM_NPM "Assume that dashboard build tools already installed through packages" OFF)
-  if(WITH_SYSTEM_NPM)
-    find_program(NPM_EXECUTABLE npm
-      REQUIRED)
-  endif()
-  set(DASHBOARD_FRONTEND_LANGS "ALL" CACHE STRING
-    "List of comma separated ceph-dashboard frontend languages to build. \
-    Use value `ALL` to build all languages")
-endif(WITH_MGR_DASHBOARD_FRONTEND)
+CMAKE_DEPENDENT_OPTION(WITH_SYSTEM_NPM
+  "Assume that dashboard build tools already installed through packages" OFF
+  "WITH_MGR_DASHBOARD_FRONTEND" OFF)
+if(WITH_SYSTEM_NPM)
+  find_program(NPM_EXECUTABLE npm
+    REQUIRED)
+endif()
+set(DASHBOARD_FRONTEND_LANGS "ALL" CACHE STRING
+  "List of comma separated ceph-dashboard frontend languages to build. \
+  Use value `ALL` to build all languages")
 CMAKE_DEPENDENT_OPTION(WITH_MGR_ROOK_CLIENT "Enable the mgr's Rook support" ON
   "WITH_MGR" OFF)
 

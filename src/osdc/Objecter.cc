@@ -254,6 +254,8 @@ void Objecter::handle_conf_change(const ConfigProxy& conf,
   if (changed.count("osd_min_split_replica_read_size")) {
     min_split_replica_read_size
       = conf.get_val<uint64_t>("osd_min_split_replica_read_size");
+    ceph_assert(min_split_replica_read_size >= SplitOp::REPLICA_MIN_SPLIT_SIZE ||
+                min_split_replica_read_size == 0);
   }
   if (changed.count("rados_replica_read_policy")) {
     auto read_policy = conf.get_val<std::string>("rados_replica_read_policy");
@@ -3148,6 +3150,13 @@ int Objecter::_calc_target(op_target_t *t, bool any_change)
     }
   }
 
+  // Strip balanced and localized read flags if the target pool does not support non-primary reads.
+  // This ensures that even when flags are added via global configuration (e.g. rados_replica_read_policy),
+  // ops targeting a tiered or deduped pool will not attempt replica/balanced reads.
+  if (!pi->allows_nonprimary_reads()) {
+    t->flags &= ~(CEPH_OSD_FLAG_BALANCE_READS | CEPH_OSD_FLAG_LOCALIZE_READS);
+  }
+
   pg_t pgid;
   if (t->precalc_pgid) {
     ceph_assert(t->flags & CEPH_OSD_FLAG_IGNORE_OVERLAY);
@@ -5484,6 +5493,8 @@ Objecter::Objecter(CephContext *cct,
   osd_timeout = cct->_conf.get_val<std::chrono::seconds>("rados_osd_op_timeout");
   min_split_replica_read_size
     = cct->_conf.get_val<uint64_t>("osd_min_split_replica_read_size");
+  ceph_assert(min_split_replica_read_size >= SplitOp::REPLICA_MIN_SPLIT_SIZE ||
+              min_split_replica_read_size == 0);
 
   auto read_policy = cct->_conf.get_val<std::string>("rados_replica_read_policy");
   if (read_policy == "localize") {

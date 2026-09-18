@@ -260,4 +260,3 @@ public:
                                const rgw::auth::StrategyRegistry&,
                                const std::string&) override;
 };
-

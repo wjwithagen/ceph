@@ -847,6 +847,8 @@ set(ceph_osd_srcs
   ceph_osd.cc)
 
 add_executable(ceph-osd ${ceph_osd_srcs})
+set_target_properties(ceph-osd PROPERTIES
+  JOB_POOL_LINK heavy_link_job_pool)
 add_dependencies(ceph-osd erasure_code_plugins extblkdev_plugins)
 target_link_libraries(ceph-osd osd os global-static common
   ${ALLOC_LIBS}
@@ -946,6 +948,7 @@ install(FILES
 install(PROGRAMS
   ceph_common.sh
   ceph-osd-prestart.sh
+  block-device-health
   DESTINATION ${CMAKE_INSTALL_LIBEXECDIR}/ceph)
 
 install(PROGRAMS

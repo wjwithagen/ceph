@@ -7053,7 +7053,7 @@ void RGWPutLC::execute(optional_yield y)
   }
 
   bufferlist bl;
-  
+
   RGWLifecycleConfiguration_S3 config(s->cct);
   RGWXMLParser parser;
   RGWLifecycleConfiguration_S3 new_config(s->cct);
@@ -7738,6 +7738,11 @@ void RGWCompleteMultipart::execute(optional_yield y)
   if (op_ret < 0) {
     ldpp_dout(this, 0) << "ERROR: failed to get obj attrs, obj=" << meta_obj
 		     << " ret=" << op_ret << dendl;
+    return;
+  }
+
+  op_ret = verify_encryption(meta_obj->get_attrs(), upload->cksum_type);
+  if (op_ret < 0) {
     return;
   }
   s->trace->SetAttribute(tracing::rgw::UPLOAD_ID, upload_id);

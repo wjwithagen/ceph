@@ -203,7 +203,7 @@ from cephadmlib.cluster_ops import (
 )
 from cephadmlib.firewalld import Firewalld, update_firewalld
 from cephadmlib import templating
-from cephadmlib.daemons.ceph import get_ceph_mounts_for_type, ceph_daemons
+from cephadmlib.daemons.ceph import get_ceph_mounts_for_type, ceph_daemons, update_osd_bluestore_affinity
 from cephadmlib.daemons import (
     Ceph,
     CephExporter,
@@ -2144,6 +2144,7 @@ def _pull_image(ctx, image, insecure=False):
         'error creating read-write layer with ID',
         'net/http: TLS handshake timeout',
         'Digest did not match, expected',
+        'failed to copy: httpReadSeeker: failed open: failed to do request',
     ]
 
     cmd = pull_command(ctx, image, insecure=insecure)
@@ -2202,6 +2203,18 @@ def get_image_info_from_inspect(out, image):
 ##################################
 
 
+def _check_mon_ip_vs_public_network(mon_ip: str, public_network: str) -> None:
+    if not ip_in_subnets(mon_ip, public_network):
+        raise Error(f'The provided --mon-ip {mon_ip} does not belong to any public_network(s) {public_network}')
+
+
+def _check_mon_addrv_vs_public_network(mon_addrv: str, public_network: str) -> None:
+    addrv_args = parse_mon_addrv(mon_addrv)
+    for addrv in addrv_args:
+        if not ip_in_subnets(addrv.ip, public_network):
+            raise Error(f'The provided --mon-addrv {addrv.ip} ip does not belong to any public_network(s) {public_network}')
+
+
 def get_public_net_from_cfg(ctx: CephadmContext) -> Optional[str]:
     """Get mon public network from configuration file."""
     cp = read_config(ctx.config)
@@ -2230,18 +2243,91 @@ def get_public_net_from_cfg(ctx: CephadmContext) -> Optional[str]:
     if not valid_public_net:
         raise Error(f'None of the public CIDR network(s) {configured_subnets} (from -c conf file) is configured locally.')
 
-    # Ensure public_network is compatible with the provided mon-ip (or mon-addrv)
+    # Ensure public_network is compatible with the provided mon address (--mon-ip, --mon-addrv, or --mon-net)
     if ctx.mon_ip:
-        if not ip_in_subnets(ctx.mon_ip, public_network):
-            raise Error(f'The provided --mon-ip {ctx.mon_ip} does not belong to any public_network(s) {public_network}')
+        _check_mon_ip_vs_public_network(ctx.mon_ip, public_network)
     elif ctx.mon_addrv:
-        addrv_args = parse_mon_addrv(ctx.mon_addrv)
-        for addrv in addrv_args:
-            if not ip_in_subnets(addrv.ip, public_network):
-                raise Error(f'The provided --mon-addrv {addrv.ip} ip does not belong to any public_network(s) {public_network}')
+        _check_mon_addrv_vs_public_network(ctx.mon_addrv, public_network)
 
     logger.debug(f'Using mon public network from configuration file {public_network}')
     return public_network
+
+
+def _parse_network(
+    net_str: str
+) -> Optional[Union[ipaddress.IPv4Network, ipaddress.IPv6Network]]:
+    """
+    Parse a CIDR string into a network object.
+
+    :param net_str: CIDR network string (e.g., '192.168.1.0/24' or 'fd00::/64')
+    :return: IPv4Network or IPv6Network on success, None if the string is not a valid CIDR
+    """
+    try:
+        return ipaddress.ip_network(net_str)
+    except ValueError:
+        return None
+
+
+def _parse_ip(
+    ip_str: str
+) -> Optional[Union[ipaddress.IPv4Address, ipaddress.IPv6Address]]:
+    """
+    Parse an IP address string into an address object.
+
+    :param ip_str: IP address string (e.g., '192.168.1.1' or 'fd00::1')
+    :return: IPv4Address or IPv6Address on success, None if the string is not a valid IP address
+    """
+    try:
+        return ipaddress.ip_address(ip_str)
+    except ValueError:
+        return None
+
+
+def select_ip_from_network(ctx: CephadmContext, network: str) -> str:
+    """
+    Given a CIDR network, select an appropriate IP from local interfaces
+    in that network. Supports both IPv4 and IPv6 networks.
+
+    :param ctx: CephadmContext
+    :param network: CIDR network string (e.g., '192.168.1.0/24' for IPv4 or 'fd00::/64' for IPv6)
+    :return: Selected IP address string (IPv4 unchanged, IPv6 wrapped in brackets)
+    :raises Error: if no suitable IP found in the network or invalid CIDR format
+    """
+    net = _parse_network(network)
+    if net is None:
+        raise Error(f'Invalid network CIDR {network}')
+
+    # local_networks = {'192.168.100.0/24': {'ens3': {'192.168.100.100'}}, 'fe80::/64': {'ens3': {'fe80::5054:ff:fe83:9e8f'}}}
+    local_networks = list_networks(ctx)
+    candidates = []
+    for local_net, ifaces in local_networks.items():
+        local_net_obj = _parse_network(local_net)
+        if local_net_obj is None:
+            logger.debug(f'Skipping invalid local network {local_net}')
+            continue
+        if local_net_obj.version != net.version:
+            logger.debug(f'Skipping local network {local_net} due to IP version mismatch with requested network {network}')
+            continue
+        if not local_net_obj.overlaps(net):
+            logger.debug(f'Skipping local network {local_net} as it does not overlap with requested network {network}')
+            continue
+        for _, ips in ifaces.items():
+            for ip in ips:
+                ip_obj = _parse_ip(ip)
+                if ip_obj is None:
+                    logger.debug(f'Skipping invalid IP address {ip} on local network {local_net}')
+                    continue
+                if ip_obj in net:
+                    candidates.append(ip)
+
+    if not candidates:
+        raise Error(f'No local IP found in network {network}. Local networks: {list(local_networks.keys())}')
+
+    candidates = sorted(set(candidates), key=ipaddress.ip_address)
+    selected_ip = wrap_ipv6(candidates[0]) if is_ipv6(candidates[0]) else candidates[0]
+
+    logger.info(f'Selected IP {selected_ip} from network {network}')
+    return selected_ip
 
 
 def infer_mon_network(ctx: CephadmContext, mon_eps: List[EndPoint]) -> Optional[str]:
@@ -2288,8 +2374,12 @@ def prepare_mon_addresses(ctx: CephadmContext) -> Tuple[str, bool, Optional[str]
         ipv6 = ctx.mon_addrv.count('[') > 1
         addrv_args = parse_mon_addrv(ctx.mon_addrv)
         mon_addrv = ctx.mon_addrv
-    else:
-        raise Error('must specify --mon-ip or --mon-addrv')
+    elif ctx.mon_net:
+        selected_ip = select_ip_from_network(ctx, ctx.mon_net)
+        ctx.mon_ip = selected_ip
+        ipv6 = is_ipv6(selected_ip)
+        addrv_args = parse_mon_ip(selected_ip)
+        mon_addrv = build_addrv_params(addrv_args)
 
     if addrv_args:
         for end_point in addrv_args:
@@ -4372,6 +4462,30 @@ def _zap_osds(ctx: CephadmContext) -> None:
             # id isn't part of the output here!)
             logger.warning(f'Not zapping LVs (not implemented): {lv_names}')
 
+    c = get_ceph_volume_container(ctx,
+                                  args=['raw', 'list', '--format', 'json'],
+                                  volume_mounts=mounts,
+                                  envs=ctx.env)
+    out, err, code = call_throws(ctx, c.run_cmd())
+    if code:
+        raise Error('failed to list raw osds')
+    try:
+        raw_ls = json.loads(out)
+    except ValueError as e:
+        raise Error(f'Invalid JSON in ceph-volume raw list: {e}')
+    if not isinstance(raw_ls, dict):
+        raise Error('Invalid JSON in ceph-volume raw list: expected object')
+
+    seen = set()
+    for details in raw_ls.values():
+        if not isinstance(details, dict) or details.get('ceph_fsid') != ctx.fsid:
+            continue
+        for key in ('device', 'device_db', 'device_wal'):
+            path = details.get(key)
+            if path and path not in seen:
+                seen.add(path)
+                _zap(ctx, path)
+
 
 def command_zap_osds(ctx: CephadmContext) -> None:
     if not ctx.force:
@@ -4743,13 +4857,21 @@ def update_service_for_daemon(ctx: CephadmContext,
     # check if all the daemon names are valid
     if not set(update_daemons).issubset(set(available_daemons)):
         raise Error(f'Error EINVAL: one or more daemons of {update_daemons} does not exist on this host')
+    # osdspec_affinity stores the bare service id (e.g. "foobar"), not the
+    # full service name (e.g. "osd.foobar"), consistent with how ceph-volume
+    # writes it at OSD creation time via CEPH_VOLUME_OSDSPEC_AFFINITY.
+    _, _, service_id = ctx.service_name.partition('.')
+    if not service_id:
+        service_id = ctx.service_name
     for name in update_daemons:
         path = os.path.join(ctx.data_dir, ctx.fsid, name, 'unit.meta')
         update_meta_file(path, data)
+        update_osd_bluestore_affinity(ctx, name, service_id)
         print(f'Successfully updated daemon {name} with service {ctx.service_name}')
 
 
 @infer_fsid
+@infer_image
 def command_update_osd_service(ctx: CephadmContext) -> int:
     """update service for provided daemon"""
     update_daemons = [f'osd.{osd_id}' for osd_id in ctx.osd_ids.split(',')]
@@ -5617,13 +5739,16 @@ def _get_parser():
         '--mon-id',
         required=False,
         help='mon id (default: local hostname)')
-    group = parser_bootstrap.add_mutually_exclusive_group()
+    group = parser_bootstrap.add_mutually_exclusive_group(required=True)
     group.add_argument(
         '--mon-addrv',
         help='mon IPs (e.g., [v2:localipaddr:3300,v1:localipaddr:6789])')
     group.add_argument(
         '--mon-ip',
         help='mon IP')
+    group.add_argument(
+        '--mon-net',
+        help='mon network CIDR (e.g., 192.168.1.0/24) - will select first available IP from network')
     parser_bootstrap.add_argument(
         '--mgr-id',
         required=False,

@@ -193,9 +193,9 @@ int rgw_rest_get_json_input(CephContext *cct, req_state *s, T& out,
 //
 // The called function must return an integer, negative on error. In
 // general, they should just return op_ret.
-template<typename F>
+template<typename F, typename B=rgw::sal::Bucket>
 int retry_raced_bucket_write(const DoutPrefixProvider *dpp,
-                             rgw::sal::Bucket *b,
+                             B* b,
                              const F &f,
                              optional_yield y) {
   auto r = f();
@@ -262,6 +262,8 @@ public:
   virtual ~RGWOp() override;
 
   int get_ret() const { return op_ret; }
+  req_state* get_req_state() const { return s; }
+  rgw::sal::User* get_user() const { return s ? s->user.get() : nullptr; }
 
   virtual int init_processing(optional_yield y) {
     if (dialect_handler->supports_quota()) {
@@ -2125,6 +2127,8 @@ public:
   void complete() override;
 
   virtual int get_params(optional_yield y) = 0;
+  virtual int verify_encryption(std::map<std::string, bufferlist>& attrs,
+                                rgw::cksum::Type cksum_type) { return 0; }
   void send_response() override = 0;
   const char* name() const override { return "complete_multipart"; }
   std::string canonical_name() const override { return fmt::format("REST.{}.UPLOAD", s->info.method); }

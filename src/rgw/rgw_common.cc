@@ -876,7 +876,7 @@ int RGWHTTPArgs::parse(const DoutPrefixProvider *dpp)
     int fpos = str.find('&', pos);
     if (fpos  < pos) {
        end = true;
-       fpos = str.size(); 
+       fpos = str.size();
     }
     std::string nameval = url_decode(str.substr(pos, fpos - pos), true);
     NameVal nv(std::move(nameval));
@@ -907,7 +907,7 @@ int RGWHTTPArgs::parse(const DoutPrefixProvider *dpp)
       append(name, val);
     }
 
-    pos = fpos + 1;  
+    pos = fpos + 1;
   }
 
   return 0;
@@ -1734,7 +1734,7 @@ int verify_object_lock(const DoutPrefixProvider* dpp, const rgw::sal::Attrs& att
       return -EACCES;
     }
   }
-  
+
   return 0;
 }
 
