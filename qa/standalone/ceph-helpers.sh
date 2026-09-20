@@ -1068,7 +1068,10 @@ function test_activate_osd_skip_benchmark() {
 
 ##
 # Wait until the OSD **id** is either up or down, as specified by
-# **state**. It fails after $TIMEOUT seconds.
+# **state**. 
+# It fails 
+#    if it was not running
+#    if it is not reported up after $TIMEOUT seconds.
 #
 # @param state either up or down
 # @param id osd identifier
@@ -1077,17 +1080,26 @@ function test_activate_osd_skip_benchmark() {
 function wait_for_osd() {
     local state=$1
     local id=$2
+    xtrace_state=$(set +o | grep xtrace)
 
     status=1
-    for ((i=0; i < $TIMEOUT; i++)); do
-        echo $i
-        if ! ceph osd dump | grep "osd.$id $state"; then
-            sleep 1
-        else
-            status=0
-            break
-        fi
-    done
+    # first check if the OSD is up
+    if pgrep -f "ceph-osd.*-i[[:space:]]${id}" >/dev/null 2>&1; then
+        echo "osd.${id} is running"
+        # now wait for it to be reported up
+        for ((i=0; i < $TIMEOUT; i++)); do
+            echo $i
+            if ! ceph osd dump | grep "osd.$id $state"; then
+                sleep 1
+            else
+                status=0
+                break
+            fi
+        done
+    else
+        echo "osd.${id} is NOT running"
+    fi
+    eval "$xtrace_state"
     return $status
 }
 
