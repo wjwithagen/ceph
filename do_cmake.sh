@@ -71,8 +71,8 @@ if [ -r /etc/os-release ]; then
   esac
 elif [ "$(uname)" == FreeBSD ] ; then
   PYBUILD="3"
-  ARGS+=" -DWITH_RADOSGW_AMQP_ENDPOINT=OFF"
-  ARGS+=" -DWITH_RADOSGW_KAFKA_ENDPOINT=OFF"
+  ARGS+=" -DCMAKE_CXX_COMPILER=$cxx_compiler"
+  ARGS+=" -DCMAKE_C_COMPILER=$c_compiler"
 else
   echo Unknown release
   exit 1
@@ -98,15 +98,14 @@ if [ "$(uname)" != FreeBSD ] ; then
 		c_compiler="gcc-$i"
 		break
 	  fi
+	ARGS+=" -DCMAKE_CXX_COMPILER=$cxx_compiler"
+	ARGS+=" -DCMAKE_C_COMPILER=$c_compiler"
 	done
 else
 	# To force Clang (default behavior on FreeBSD)
 	export CC=clang
 	export CXX=clang++
 fi
-ARGS+=" -DCMAKE_CXX_COMPILER=$cxx_compiler"
-ARGS+=" -DCMAKE_C_COMPILER=$c_compiler"
-
 mkdir -p $BUILD_DIR
 cd $BUILD_DIR
 
