@@ -696,6 +696,8 @@ endif()
 #option for CephFS
 option(WITH_CEPHFS "CephFS is enabled" ON)
 
+option(CEPH_PYTHON_SYSTEM_SITE "Build tox/venv-based tests against system site-packages" OFF)
+
 if(NOT WIN32)
 # Please specify 3.x if you want to build with a certain version of python3.
 set(WITH_PYTHON3 "3" CACHE STRING "build with specified python3 version")

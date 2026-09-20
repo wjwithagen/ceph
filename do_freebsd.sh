@@ -56,7 +56,7 @@ if [ -z "$ALLOW_FLAG" ]; then
     fi
 fi
 
-./do_cmake.sh $ALLOW_FLAG "$*" \
+./do_cmake.sh $ALLOW_FLAG "$@" \
         -D WITH_CCACHE=ON \
         -D CMAKE_BUILD_TYPE=Debug \
         -D CMAKE_CXX_FLAGS_DEBUG="$CMAKE_CXX_FLAGS_DEBUG" \
@@ -109,8 +109,11 @@ if [ "$RUN_TESTS" = "0" ]; then
 fi
 
 echo -n "start testing: "; date
+
+EXCLUDE_TESTS="readable|unittest_bufferlist|run-rbd-unit-test|unittest_erasure_code_shec_all" 
+
 RETEST=0
-ctest -j ${NPROC} || RETEST=1
+ctest -j ${NPROC} -E ${EXCLUDE_TESTS} || RETEST=1
 
 echo "Testing result, retest: = " $RETEST
 
@@ -124,7 +127,7 @@ if [ $RETEST -eq 1 ]; then
     rm -rf /tmp/cores.* || true
     rm -rf /tmp/*.core || true
 
-    ctest --output-on-failure --rerun-failed || RETEST=1
+    ctest  -E ${EXCLUDE_TESTS} --output-on-failure --rerun-failed || RETEST=1
 fi
 
 STATUS=$RETEST

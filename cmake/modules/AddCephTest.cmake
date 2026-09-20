@@ -92,6 +92,12 @@ function(add_ceph_unittest unittest_name)
   target_link_libraries(${unittest_name} ${UNITTEST_LIBS})
 endfunction()
 
+if(CEPH_PYTHON_SYSTEM_SITE)
+  set(_ceph_python_system_site "true")
+else()
+  set(_ceph_python_system_site "false")
+endif()
+
 function(add_tox_test name)
   set(test_name run-tox-${name})
   set(venv_path ${CEPH_BUILD_VIRTUALENV}/${name}-virtualenv)
@@ -112,7 +118,8 @@ function(add_tox_test name)
     COMMAND ${CMAKE_SOURCE_DIR}/src/tools/setup-virtualenv.sh --python=${Python3_EXECUTABLE} ${venv_path}
     WORKING_DIRECTORY ${tox_path})
   set_tests_properties(setup-venv-for-${name} PROPERTIES
-    FIXTURES_SETUP venv-for-${name})
+    FIXTURES_SETUP venv-for-${name}
+    ENVIRONMENT "CEPH_PYTHON_SYSTEM_SITE=${_ceph_python_system_site}")
   add_test(
     NAME teardown-venv-for-${name}
     COMMAND ${CMAKE_COMMAND} -E remove_directory ${venv_path})
