@@ -1,3 +1,4 @@
+import errno
 import pytest
 
 import smb.enums
@@ -158,7 +159,7 @@ def test_error_result_std():
         ),
     )
     er = smb.results.ErrorResult(share, msg='Whoops share fell down')
-    assert er.mgr_return_value() == -11
+    assert er.mgr_return_value() == -errno.EAGAIN
     assert 'for details' in er.mgr_status_value()
     dump = er.to_simplified()
     assert set(dump) == {'success', 'resource', 'msg'}
@@ -198,7 +199,7 @@ def test_error_result_good_keys():
         msg='Scruffled by notha clusta',
         status={'cluster_id': 'foo', 'other_cluster_id': 'oof'},
     )
-    assert er.mgr_return_value() == -11
+    assert er.mgr_return_value() == -errno.EAGAIN
     assert 'for details' in er.mgr_status_value()
     dump = er.to_simplified()
     assert set(dump) == {
@@ -224,7 +225,7 @@ def test_invalid_resource_result_std():
         },
         msg='That aint a real thing',
     )
-    assert irr.mgr_return_value() == -11
+    assert irr.mgr_return_value() == -errno.EAGAIN
     assert 'for details' in irr.mgr_status_value()
     dump = irr.to_simplified()
     assert dump['success'] is False
@@ -346,7 +347,7 @@ def test_result_group_two_bad():
         ]
     )
 
-    assert rg.mgr_return_value() == -11
+    assert rg.mgr_return_value() == -errno.EAGAIN
     assert '2 resources' in rg.mgr_status_value()
     dump = rg.to_simplified()
     assert set(dump) == {'success', 'results'}
@@ -622,7 +623,7 @@ def test_result_group_convert_mixed_content():
     rg2 = rg.convert_results(
         (smb.enums.PasswordFilter.NONE, smb.enums.PasswordFilter.BASE64)
     )
-    assert rg.mgr_return_value() == -11
+    assert rg.mgr_return_value() == -errno.EAGAIN
     assert '1 resource' in rg.mgr_status_value()
     dump = rg.to_simplified()
     assert set(dump) == {'success', 'results'}
@@ -972,7 +973,7 @@ def test_qos_batch_result_unhandled():
     )
 
     assert qbr.success is False
-    assert qbr.mgr_return_value() == -11
+    assert qbr.mgr_return_value() == -errno.EAGAIN
     assert 'Something strange' in qbr.mgr_status_value()
     dump = qbr.to_simplified()
     assert dump['success'] is False
