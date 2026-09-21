@@ -1,4 +1,5 @@
 import errno
+
 import pytest
 
 import smb.enums
