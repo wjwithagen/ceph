@@ -845,6 +845,9 @@ add_executable(unittest_bufferlist
   )
 add_ceph_unittest(unittest_bufferlist --gtest_filter=-*Bench*:*bench*:*Perf*:*perf*)
 target_link_libraries(unittest_bufferlist global)
+add_ceph_test(unittest_bufferlist_bench 
+  "$<TARGET_FILE:unittest_bufferlist>" --gtest_filter=*Bench*:*bench*:*Perf*:*perf*
+  )
 
 # compiletest_cxx11_client
 add_executable(compiletest_cxx11_client
