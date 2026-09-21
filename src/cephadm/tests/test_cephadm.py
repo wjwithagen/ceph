@@ -3603,6 +3603,11 @@ class TestRmClusterConfigCleanup(fake_filesystem_unittest.TestCase):
         if not fake_filesystem.is_root():
             fake_filesystem.set_uid(0)
 
+        # fakefs + shutil.rmtree breaks on py3.12
+        patcher = mock.patch('shutil.rmtree')
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
         # Create directories that _rm_cluster expects
         self.fs.create_dir('/var/lib/ceph')
         self.fs.create_dir('/var/log/ceph')
