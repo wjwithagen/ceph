@@ -181,8 +181,8 @@ static constexpr std::array<__s32, 256> make_hostos_to_ceph_conv() {
         H2C_ERRNO(EPROGUNAVAIL, EPERM); /* RPC prog. not avail */
         H2C_ERRNO(EPROGMISMATCH, EPERM);/* Program version wrong */
         H2C_ERRNO(EPROCUNAVAIL, EPERM); /* Bad procedure for program */
-        H2C_ERRNO(ENOLCK,       EPERM); /* No locks available */
-        H2C_ERRNO(ENOSYS,       EPERM);    /* Function not implemented  => ENOSYS on FreeBSD */
+        H2C_ERRNO(ENOLCK,       37);    /* No locks available */
+        H2C_ERRNO(ENOSYS,       38);    /* Function not implemented  => ENOSYS on FreeBSD */
         H2C_ERRNO(EFTYPE,       EPERM); /* Inappropriate file type or format */
         H2C_ERRNO(EAUTH,        EPERM); /* Authentication error */
         H2C_ERRNO(ENEEDAUTH,    EPERM); /* Need authenticator */
