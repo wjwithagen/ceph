@@ -31,7 +31,7 @@ setup(
     include_package_data=True,
     keywords='ceph-volume-zfs',
     name='ceph-volume-zfs',
-    packages=find_packages(include=['ceph_volume_zfs']),
+    packages=find_packages(include=['ceph_volume_zfs', 'ceph_volume_zfs.*']),
     setup_requires=setup_requirements,
     url='https://github.com/ceph/ceph/src/ceph-volume/plugin/zfs',
     version='0.1.0',
