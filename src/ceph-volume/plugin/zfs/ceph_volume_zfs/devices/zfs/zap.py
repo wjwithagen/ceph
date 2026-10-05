@@ -254,11 +254,26 @@ class Zap(object):
         # that's expected, not a reason to stop. It can't leave the
         # disk worse off either way.
         for cmd in commands_labelclear:
-            out, err, rc = process.call(cmd)
-            if rc != 0:
+            # verbose_on_failure=False: with no label to clear zpool says
+            # "failed to clear label" on stderr. That is the expected
+            # outcome here, so it is only shown with -v.
+            out, err, rc = process.call(cmd, verbose_on_failure=False)
+            if rc == 0:
+                continue
+            if any('failed to clear label' in line for line in err):
                 terminal.warning(
                     '/dev/{}: labelclear on {} found nothing to clear (rc={}), continuing.'.format(
                         diskname, cmd[-1], rc
+                    )
+                )
+                for line in err:
+                    self._vlog('    stderr: {}'.format(line))
+            else:
+                # Anything else (no such device, permission denied...) is
+                # a real problem; show what zpool said.
+                terminal.warning(
+                    '/dev/{}: labelclear on {} failed (rc={}), continuing: {}'.format(
+                        diskname, cmd[-1], rc, ' '.join(err).strip()
                     )
                 )
 
