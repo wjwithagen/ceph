@@ -682,6 +682,23 @@ class Zfs(BaseObjectStore):
             )
         )
 
+    def _create_osd_id(self) -> str:
+        """
+        Ask the monitors for an OSD id with "ceph osd new" and make sure
+        one came back. A missing --osd-id must reach ceph-volume as None,
+        not as an empty string, and an answer that is not a plain number
+        would only fail later, in a path or a pool name.
+        """
+        osd_id = prepare_utils.create_id(
+            self.osd_fsid, json.dumps(self.secrets), self.osd_id or None)
+        osd_id = str(osd_id).strip()
+        if not osd_id.isdigit():
+            raise RuntimeError(
+                'ceph osd new did not return an OSD id (got {}); check '
+                '"ceph osd ls" for an entry that was created without one'.format(
+                    repr(osd_id)))
+        return osd_id
+
     @decorators.needs_root
     def prepare(self) -> None:
         if getattr(self.args, 'dmcrypt', False):
@@ -774,8 +791,7 @@ class Zfs(BaseObjectStore):
                 )
             )
         else:
-            self.osd_id = prepare_utils.create_id(
-                self.osd_fsid, json.dumps(self.secrets), self.osd_id or None)
+            self.osd_id = self._create_osd_id()
 
         # prepare_data_device() creates the pool, then the db/wal
         # zvols, then the block zvol sized against what remains.
