@@ -5,7 +5,7 @@ from ceph_volume import process
 from ceph_volume import sys_info
 
 report_template = """
-/dev/{geomname:<16} {mediasize:<16} {rotational!s:<7} {available:<6} {descr}  {reason}"""
+{geomname:<21} {mediasize:<16} {rotational!s:<7} {available:<6} {descr}  {reason}"""
 
 
 def camcontrol_devlist_parser():
@@ -748,6 +748,13 @@ class Disks(object):
             output.append(self.disks[disk].report())
         return ''.join(output)
 
+    def verbose_report(self):
+        """
+        Detailed report for -v: one block per disk with its status, the
+        reasons it is not available, its partitions and mount state.
+        """
+        return '\n\n'.join(self.disks[disk].describe() for disk in sorted(self.disks))
+
     def json_report(self):
         output = []
         for disk in sorted(self.disks):
@@ -871,7 +878,7 @@ class Disk(object):
             available_str = 'False'
             reason_str = '(' + self.reject_reasons[0] + ')' if self.reject_reasons else ''
         return report_template.format(
-            geomname=self.sys_api.get('geomname', self.path),
+            geomname='/dev/' + self.sys_api.get('geomname', self.path).replace('/dev/', ''),
             mediasize=human_readable_size(self._safe_int(self.sys_api.get('mediasize'))),
             rotational=self._safe_int(self.sys_api.get('rotationrate')) != 0,
             available=available_str,
