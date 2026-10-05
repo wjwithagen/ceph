@@ -775,7 +775,7 @@ class Zfs(BaseObjectStore):
             )
         else:
             self.osd_id = prepare_utils.create_id(
-                self.osd_fsid, json.dumps(self.secrets), self.osd_id)
+                self.osd_fsid, json.dumps(self.secrets), self.osd_id or None)
 
         # prepare_data_device() creates the pool, then the db/wal
         # zvols, then the block zvol sized against what remains.
