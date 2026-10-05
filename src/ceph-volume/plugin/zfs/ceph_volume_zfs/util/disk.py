@@ -690,8 +690,7 @@ def list_ceph_zpools():
 
 
 def get_disks():
-    command = ['/sbin/geom', 'disk', 'status', '-s']
-    out, err, rc = process.call(command)
+    cam_devices = camcontrol_devlist_parser()
     disks = {}
     for dsk, cam_info in cam_devices.items():
         if re.match(r'^cd\d+$', dsk):
