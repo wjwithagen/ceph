@@ -184,7 +184,95 @@ def get_partitions(diskname):
         m = re.search(r'p(\d+)$', p['name'])
         return int(m.group(1)) if m else 0
     partitions.sort(key=_part_index)
+    # `gpart show` does not print the label, the raw uuid or whether the
+    # partition is open; `gpart list` does. Add them when available.
+    details = get_partition_details(diskname)
+    for part in partitions:
+        part.update(details.get(part['name'], {}))
     return partitions
+
+
+def get_partition_details(diskname):
+    """
+    Runs `gpart list <diskname>` and returns, per partition, what
+    `gpart show` does not print: the GPT label, the raw uuid (what a
+    gptid/<uuid> device name is made of) and the GEOM open mode:
+
+      {'da4p3': {'label': 'zfs0', 'rawuuid': 'fa257269-...', 'mode': 'r1w1e2'}}
+
+    The mode is how GEOM says that something has the partition open, for
+    instance an imported zpool. r0w0e0 is idle; anything else is in use.
+    Returns an empty dict when there is no partition table.
+    """
+    command = ['/sbin/gpart', 'list', diskname]
+    out, err, rc = process.call(command, verbose_on_failure=False)
+    details = {}
+    if rc != 0 or not out:
+        return details
+    in_providers = False
+    current = None
+    for line in out:
+        text = line.strip()
+        if text == 'Providers:':
+            in_providers = True
+            current = None
+            continue
+        if text == 'Consumers:':
+            in_providers = False
+            current = None
+            continue
+        if not in_providers:
+            continue
+        m = re.match(r'^\d+\.\s+Name:\s+(\S+)$', text)
+        if m:
+            current = details.setdefault(m.group(1), {})
+            continue
+        if current is None:
+            continue
+        m = re.match(r'^(label|rawuuid|Mode):\s+(\S+)$', text)
+        if m:
+            key, value = m.groups()
+            if key == 'Mode':
+                current['mode'] = value
+            elif value != '(null)':
+                current[key] = value
+    return details
+
+
+def get_label_aliases(partitions=None):
+    """
+    Maps GEOM label names (gpt/zfs0, gptid/fa257269-..., diskid/DISK-...)
+    to the device they stand for ('da4p3'). zpool, mount and swap often
+    use these names, so comparing only with /dev/daNpM misses them.
+
+    Built from `glabel status`, plus the label and raw uuid of the given
+    partitions for the cases glabel does not list.
+    """
+    aliases = {}
+    out, err, rc = process.call(['/sbin/glabel', 'status'], verbose_on_failure=False)
+    if rc == 0:
+        for line in out:
+            fields = line.split()
+            if len(fields) >= 3 and fields[0] != 'Name':
+                aliases[fields[0]] = fields[2]
+    for part in partitions or []:
+        if part.get('label'):
+            aliases.setdefault('gpt/' + part['label'], part['name'])
+        if part.get('rawuuid'):
+            aliases.setdefault('gptid/' + part['rawuuid'], part['name'])
+    return aliases
+
+
+def resolve_device(path, aliases):
+    """'/dev/gptid/fa257269-...' -> 'da4p3'; plain names are returned as they are."""
+    name = re.sub(r'^/dev/', '', path)
+    return aliases.get(name, name)
+
+
+def _device_on_disk(name, diskname):
+    """'da4p3' -> 'da4p3' when it is the disk or one of its partitions, else None."""
+    m = re.match(r'^(' + re.escape(diskname) + r'(p\d+)?)$', name)
+    return m.group(1) if m else None
 
 
 def get_gpart_info(diskname):
@@ -235,126 +323,133 @@ def get_gpart_info(diskname):
     return info
 
 
-def _walk_vdevs(vdevs, diskname, pool_name, found, parent_name=None):
+def _vdev_type(name):
+    """'raidz2-0' -> 'raidz2', 'mirror-1' -> 'mirror', anything else as it is."""
+    if 'raidz' in name:
+        return name.split('-')[0]
+    if 'mirror' in name:
+        return 'mirror'
+    return name
+
+
+def _collect_leaf_vdevs(vdevs, pool_name, parent_name, leaves):
     """
-    Recursively walks the 'vdevs' dict from `zpool status -j` output
-    (which nests: root -> mirror/raidz/normal -> leaf disks) looking
-    for a leaf vdev whose 'path' matches this disk, bare or
-    partitioned (e.g. /dev/ada0 or /dev/ada0p3).
-    Also captures the immediate parent vdev name (raidz2-0 etc.).
+    Walks the nested 'vdevs' of `zpool status -j` (root -> mirror/raidz ->
+    leaf disks) and collects every leaf, with the group it sits in.
     """
-    if found['in_pool']:
-        return
     for name, vdev in vdevs.items():
-        path = vdev.get('path', '')
-        if re.match(r"^/dev/" + re.escape(diskname) + r"(p\d+)?$", path):
-            found['in_pool'] = True
-            found['pool_name'] = pool_name
-            # if parent_name == pool_name, the disk is a direct child
-            # of the pool root -- no real vdev group, that's a stripe
-            if parent_name and parent_name != pool_name:
-                found['vdev_name'] = parent_name
-                if 'raidz' in parent_name:
-                    found['vdev_type'] = parent_name.split('-')[0]
-                elif 'mirror' in parent_name:
-                    found['vdev_type'] = 'mirror'
-                else:
-                    found['vdev_type'] = parent_name
-            else:
-                found['vdev_name'] = None
-                found['vdev_type'] = 'stripe'
-            return
         children = vdev.get('vdevs')
         if children:
-            _walk_vdevs(children, diskname, pool_name, found, parent_name=name)
-            if found['in_pool']:
-                return
+            _collect_leaf_vdevs(children, pool_name, name, leaves)
+        elif vdev.get('path'):
+            grouped = parent_name and parent_name != pool_name
+            leaves.append({
+                'pool_name': pool_name,
+                'vdev_name': parent_name if grouped else None,
+                'vdev_type': _vdev_type(parent_name) if grouped else 'stripe',
+                'path': vdev['path'],
+            })
 
 
-def _get_zpool_membership_plaintext(diskname):
+def _zpool_leaf_vdevs_plaintext():
     """
-    Fallback plaintext parser for `zpool status` when `-j` is not
-    supported (OpenZFS < 2.3, e.g. ZFS 2.2.x on FreeBSD 14).
-    Scrapes the indented vdev tree for lines containing the diskname,
-    and also captures the vdev name (raidz2-0, mirror-1, etc.) the
-    disk belongs to.
+    Fallback for `zpool status -j` (OpenZFS < 2.3, e.g. ZFS 2.2.x on
+    FreeBSD 14): reads `zpool status -P`, where a leaf vdev is a line that
+    starts with a full device path. Indentation tells a leaf of a group
+    (mirror-0, raidz2-0, logs, cache, spares) from a direct child of the
+    pool.
     """
     command = ['/sbin/zpool', 'status', '-P']
     out, err, rc = process.call(command, verbose_on_failure=False)
-    result = {'in_pool': False, 'pool_name': None, 'vdev_name': None, 'vdev_type': None}
+    leaves = []
     if rc != 0 or not out:
-        return result
-    current_pool = None
-    current_vdev = None
-    current_vdev_type = None
+        return leaves
+    pool = None
+    group = None
+    group_indent = -1
     for line in out:
         stripped = line.strip()
+        indent = len(line) - len(line.lstrip())
         m = re.match(r'^pool:\s+(\S+)', stripped)
         if m:
-            current_pool = m.group(1)
-            current_vdev = None
-            current_vdev_type = None
+            pool = m.group(1)
+            group = None
+            group_indent = -1
             continue
-        # vdev group lines: raidz2-0, mirror-1, etc.
-        m = re.match(r'^(raidz\d*-\d+|mirror-\d+|stripe|logs|cache|spares)\s', stripped)
+        m = re.match(r'^(raidz\d*-\d+|mirror-\d+|logs|cache|spares)\s', stripped)
         if m:
-            current_vdev = m.group(1)
-            # derive the type from the name prefix
-            if 'raidz' in current_vdev:
-                current_vdev_type = current_vdev.split('-')[0]  # raidz1, raidz2 etc
-            elif 'mirror' in current_vdev:
-                current_vdev_type = 'mirror'
-            else:
-                current_vdev_type = current_vdev
+            group = m.group(1)
+            group_indent = indent
             continue
-        if current_pool and re.search(
-                r'(^|/)' + re.escape(diskname) + r'(p\d+)?\s', stripped):
-            result['in_pool'] = True
-            result['pool_name'] = current_pool
-            result['vdev_name'] = current_vdev
-            # no vdev group line seen = direct child of pool = stripe
-            result['vdev_type'] = current_vdev_type or 'stripe'
-            break
-        if current_pool and re.match(
-                re.escape(diskname) + r'(p\d+)?\s', stripped):
-            result['in_pool'] = True
-            result['pool_name'] = current_pool
-            result['vdev_name'] = current_vdev
-            result['vdev_type'] = current_vdev_type or 'stripe'
-            break
-    return result
+        fields = stripped.split()
+        if not pool or not fields or not fields[0].startswith('/'):
+            continue
+        grouped = group is not None and indent > group_indent
+        leaves.append({
+            'pool_name': pool,
+            'vdev_name': group if grouped else None,
+            'vdev_type': _vdev_type(group) if grouped else 'stripe',
+            'path': fields[0],
+        })
+    return leaves
 
 
-def get_zpool_membership(diskname):
+def get_zpool_leaf_vdevs():
     """
-    Checks whether this disk (or any gpart partition on it) is
-    already a member of a zpool.
-
-    Tries `zpool status -j` (JSON, OpenZFS >= 2.3) first for reliable
-    structured parsing; falls back to `zpool status -P` plaintext
-    scraping on older versions (e.g. ZFS 2.2.x on FreeBSD 14) where
-    -j is not supported.
-
-    Returns a dict: {'in_pool': bool, 'pool_name': str or None}.
+    Every leaf vdev of every imported pool:
+    [{'pool_name': 'zroot', 'vdev_name': 'mirror-0', 'vdev_type': 'mirror',
+      'path': '/dev/gptid/fa257269-...'}, ...]
+    vdev_name is None for a plain stripe member.
     """
     import json
     command = ['/sbin/zpool', 'status', '-j']
     out, err, rc = process.call(command, verbose_on_failure=False)
-    result = {'in_pool': False, 'pool_name': None, 'vdev_name': None, 'vdev_type': None}
-    if rc != 0:
-        # -j not supported -- fall back to plaintext
-        return _get_zpool_membership_plaintext(diskname)
-    if not out:
+    if rc == 0 and out:
+        try:
+            data = json.loads(''.join(out))
+        except (ValueError, TypeError):
+            data = None
+        if data is not None:
+            leaves = []
+            for pool_name, pool in data.get('pools', {}).items():
+                for key in ('vdevs', 'logs', 'l2cache', 'spares'):
+                    _collect_leaf_vdevs(pool.get(key) or {}, pool_name, pool_name, leaves)
+            return leaves
+    return _zpool_leaf_vdevs_plaintext()
+
+
+def get_zpool_membership(diskname, partitions=None):
+    """
+    Checks whether this disk (or any gpart partition on it) is a member of
+    an imported zpool. A pool names its devices as it was created: by
+    /dev/daNpM, but just as often by label (gpt/zfs0) or by gptid
+    (gptid/<uuid>), so every vdev path is resolved to the device it stands
+    for before it is compared with this disk.
+
+    Returns a dict:
+      {'in_pool': bool, 'pool_name': str or None, 'vdev_name': str or None,
+       'vdev_type': str or None,
+       'partitions': {'da4p3': {'pool_name': ..., 'vdev_name': ..., 'vdev_type': ...}}}
+    The first four describe the first match; 'partitions' has every
+    partition (or the bare disk) that is a member.
+    """
+    result = {'in_pool': False, 'pool_name': None, 'vdev_name': None,
+              'vdev_type': None, 'partitions': {}}
+    leaves = get_zpool_leaf_vdevs()
+    if not leaves:
         return result
-    try:
-        data = json.loads(''.join(out))
-    except (ValueError, TypeError):
-        return _get_zpool_membership_plaintext(diskname)
-    for pool_name, pool in data.get('pools', {}).items():
-        top_vdevs = pool.get('vdevs', {})
-        _walk_vdevs(top_vdevs, diskname, pool_name, result)
-        if result['in_pool']:
-            break
+    if partitions is None:
+        partitions = get_partitions(diskname)
+    aliases = get_label_aliases(partitions)
+    for leaf in leaves:
+        matched = _device_on_disk(resolve_device(leaf['path'], aliases), diskname)
+        if not matched:
+            continue
+        member = {'pool_name': leaf['pool_name'], 'vdev_name': leaf['vdev_name'],
+                  'vdev_type': leaf['vdev_type']}
+        result['partitions'][matched] = member
+        if not result['in_pool']:
+            result.update(in_pool=True, **member)
     return result
 
 
@@ -381,10 +476,8 @@ def get_mount_info(diskname, partitions=None):
         },
       }
 
-    Known gap: gpt-label/gptid mounts (/dev/gpt/somelabel,
-    /dev/gptid/...) won't match here, only plain /dev/adaN /
-    /dev/adaNpM device paths. Worth extending if this box mounts by
-    label rather than raw device path.
+    A mount by label (/dev/gpt/somelabel) or by gptid (/dev/gptid/...)
+    is resolved to the partition it stands for first.
     """
     command = ['/sbin/mount', '-p']
     out, err, rc = process.call(command)
@@ -394,16 +487,18 @@ def get_mount_info(diskname, partitions=None):
         result['by_partition'][part['name']] = {'mounted': False, 'mountpoint': None}
     if rc != 0:
         return result
+    aliases = get_label_aliases(partitions)
     for line in out:
         fields = line.split()
         if not fields:
             continue
         device = fields[0]
         mountpoint = fields[1] if len(fields) > 1 else None
-        m = re.match(r"^/dev/(" + re.escape(diskname) + r"(p\d+)?)$", device)
-        if not m:
+        if not device.startswith('/dev/'):
             continue
-        matched_name = m.group(1)
+        matched_name = _device_on_disk(resolve_device(device, aliases), diskname)
+        if not matched_name:
+            continue
         result['mounted'] = True
         if mountpoint:
             result['mountpoints'].append(mountpoint)
@@ -456,15 +551,17 @@ def get_swap_info(diskname, partitions=None):
         result['by_partition'][part['name']] = {'active': False}
     if rc != 0 or not out:
         return result
+    aliases = get_label_aliases(partitions)
     for line in out[1:]:  # first line is the header: "Device  1K-blocks  Used"
         fields = line.split()
         if not fields:
             continue
         device = fields[0]
-        m = re.match(r"^/dev/(" + re.escape(diskname) + r"(p\d+)?)$", device)
-        if not m:
+        if not device.startswith('/dev/'):
             continue
-        matched_name = m.group(1)
+        matched_name = _device_on_disk(resolve_device(device, aliases), diskname)
+        if not matched_name:
+            continue
         result['active'] = True
         result['devices'].append(device)
         result['by_partition'][matched_name] = {'active': True}
@@ -715,7 +812,7 @@ def get_disks():
                     disk.update(cam_id)
         disk['cam'] = cam_info
         disk['gpart'] = get_gpart_info(dsk)
-        disk['zpool'] = get_zpool_membership(dsk)
+        disk['zpool'] = get_zpool_membership(dsk, partitions=disk['gpart'].get('partitions'))
         disk['mount'] = get_mount_info(dsk, partitions=disk['gpart'].get('partitions'))
         disk['swap'] = get_swap_info(dsk, partitions=disk['gpart'].get('partitions'))
         disks['/dev/' + dsk] = disk
@@ -921,25 +1018,45 @@ class Disk(object):
                 lines.append('  partitions: none (disk is empty)')
         else:
             lines.append('  partitions:')
-            mount = self.sys_api.get('mount', {})
-            swap = self.sys_api.get('swap', {})
-            mount_by_partition = mount.get('by_partition', {})
-            swap_by_partition = swap.get('by_partition', {})
             for part in partitions:
-                info = mount_by_partition.get(part['name'], {})
-                if info.get('mounted'):
-                    mount_desc = 'mounted at {}'.format(info.get('mountpoint'))
-                elif swap_by_partition.get(part['name'], {}).get('active'):
-                    mount_desc = 'active swap'
-                else:
-                    mount_desc = 'not mounted'
-                lines.append('    {name}  {type}  {size}  ({mount})'.format(
+                lines.append('    {name}  {type}  {size}{label}  ({state})'.format(
                     name=part['name'],
                     type=part['type'],
                     size=part['size_human'],
-                    mount=mount_desc,
+                    label='  [{}]'.format(part['label']) if part.get('label') else '',
+                    state=self._partition_state(part),
                 ))
         return '\n'.join(lines)
+
+    def _partition_state(self, part):
+        """
+        What this partition is being used for: a mount, active swap,
+        membership of an imported pool, or - failing those - what its type
+        says it is. "not mounted" would be wrong for a ZFS partition, which
+        is never in `mount -p`, and for boot code and swap, which are not
+        filesystems at all.
+        """
+        name = part['name']
+        mount = self.sys_api.get('mount', {}).get('by_partition', {}).get(name, {})
+        swap = self.sys_api.get('swap', {}).get('by_partition', {}).get(name, {})
+        member = self.sys_api.get('zpool', {}).get('partitions', {}).get(name)
+        if mount.get('mounted'):
+            return 'mounted at {}'.format(mount.get('mountpoint'))
+        if swap.get('active'):
+            return 'active swap'
+        if member:
+            where = 'zpool "{}"'.format(member.get('pool_name'))
+            if member.get('vdev_name'):
+                where = '{} in {}'.format(member['vdev_name'], where)
+            return 'member of {}'.format(where)
+        if part.get('type') == 'freebsd-boot':
+            return 'boot code, not a filesystem'
+        if part.get('type') == 'freebsd-swap':
+            return 'swap, not active'
+        mode = part.get('mode')
+        if mode and mode != 'r0w0e0':
+            return 'in use, open {}'.format(mode)
+        return 'not in use'
 
     def json_report(self):
         output = {k.strip('_'): v for k, v in vars(self).items()}
