@@ -530,6 +530,21 @@ int KernelDevice::detect_ebd(std::string& id)
   return -ENOENT;
 }
 
+static inline bool bdev_buffered(bool buffered)
+{
+  // FreeBSD has no buffered block devices: every disk is a character device
+  // and all I/O goes straight through physio(9)/GEOM, which requires the
+  // offset and the length of *each iovec* to be a multiple of the sector size.
+  // The "buffered" fd therefore is just a second direct fd, but without the
+  // alignment handling of the direct path (direct_read_unaligned(),
+  // rebuild_aligned_size_and_memory()).  Force all I/O onto the direct path.
+#if defined(__FreeBSD__)
+  return false;
+#else
+  return buffered;
+#endif
+}
+
 int KernelDevice::choose_fd(bool buffered, int write_hint) const
 {
 #if defined(F_SET_FILE_RW_HINT)
@@ -1161,6 +1176,7 @@ int KernelDevice::write(
   bool buffered,
   int write_hint)
 {
+  buffered = bdev_buffered(buffered);
   uint64_t len = bl.length();
   dout(20) << __func__ << " 0x" << std::hex << off << "~" << len << std::dec
 	   << " " << buffermode(buffered) 
@@ -1190,6 +1206,7 @@ int KernelDevice::aio_write(
   bool buffered,
   int write_hint)
 {
+  buffered = bdev_buffered(buffered);
   uint64_t len = bl.length();
   dout(20) << __func__ << " 0x" << std::hex << off << "~" << len << std::dec
 	   << " " << buffermode(buffered)
@@ -1472,6 +1489,7 @@ int KernelDevice::read(uint64_t off, uint64_t len, bufferlist *pbl,
 		      IOContext *ioc,
 		      bool buffered)
 {
+  buffered = bdev_buffered(buffered);
   dout(5) << __func__ << " 0x" << std::hex << off << "~" << len << std::dec
 	  << " " << buffermode(buffered)
 	  << dendl;
@@ -1591,6 +1609,7 @@ int KernelDevice::direct_read_unaligned(uint64_t off, uint64_t len, char *buf)
 int KernelDevice::read_random(uint64_t off, uint64_t len, char *buf,
                        bool buffered)
 {
+  buffered = bdev_buffered(buffered);
   dout(5) << __func__ << " 0x" << std::hex << off << "~" << len << std::dec
           << "buffered " << buffered
 	  << dendl;
