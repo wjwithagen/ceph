@@ -136,6 +136,24 @@ class Prepare(object):
             ),
         )
         parser.add_argument(
+            '--zvol-props',
+            default=None,
+            help=(
+                'ZFS properties for the data zvol, given to "zfs create -o": '
+                'property=value, separated by spaces or commas, e.g. '
+                '"volblocksize=4K,logbias=throughput,compression=off,'
+                'primarycache=metadata". volblocksize can only be set now, '
+                'not afterwards.'
+            ),
+        )
+        parser.add_argument(
+            '--db-zvol-props',
+            default=None,
+            help=(
+                'The same, for the db and wal zvols (--block.db, --block.wal).'
+            ),
+        )
+        parser.add_argument(
             '--no-tmpfs',
             action='store_true',
             default=False,

@@ -2,6 +2,7 @@ import base64
 import json
 import logging
 import os
+import re
 import time
 from typing import Optional, TYPE_CHECKING
 
@@ -22,6 +23,12 @@ if TYPE_CHECKING:
     import argparse
 
 logger = logging.getLogger(__name__)
+
+# One "property=value" for zfs create -o. A user property (with a colon) is
+# fine too. Whitespace, commas and a second '=' in a value are not accepted.
+_ZVOL_PROP_RE = re.compile(r'^([A-Za-z][A-Za-z0-9_.-]*(:[A-Za-z0-9_.:-]+)?)=([^\s,=]+)$')
+# Set by the plugin itself, or fixed by the zvol being a volume.
+_ZVOL_PROP_FORBIDDEN = frozenset(['volsize', 'mountpoint', 'canmount', 'readonly'])
 
 
 class Zfs(BaseObjectStore):
@@ -261,8 +268,9 @@ class Zfs(BaseObjectStore):
             # /<poolname> cluttering the root filesystem.
             ['/sbin/zpool', 'create', '-f', '-m', 'none',
              self.pool_name, '/dev/{}'.format(diskname)],
-            ['/sbin/zfs', 'create', '-V', '<remaining pool space, computed after creation>',
-             zvol_path_name],
+            ['/sbin/zfs', 'create'] + self._zvol_props('block') + [
+                '-V', '<remaining pool space, computed after creation>',
+                zvol_path_name],
         ]
 
     def prepare_data_device(self, device_type: str, osd_uuid: str) -> str:
@@ -298,9 +306,40 @@ class Zfs(BaseObjectStore):
         self._tag_zpool()
         return self.block_device_path
 
-    def _zvol_create_cmd(self, size: str, dataset: str) -> list:
+    def _zvol_props(self, kind: str) -> list:
         """
-        Builds a `zfs create -V` command. By default the zvol is
+        The "-o property=value" arguments for a zvol, from --zvol-props
+        (kind 'block', the data zvol) or --db-zvol-props (kind 'meta', the
+        db and wal zvols). The option takes properties separated by
+        spaces or commas, e.g. "volblocksize=4K logbias=throughput".
+        Raises RuntimeError for anything that is not property=value.
+        """
+        opt = 'zvol_props' if kind == 'block' else 'db_zvol_props'
+        flag = '--zvol-props' if kind == 'block' else '--db-zvol-props'
+        text = getattr(self.args, opt, None) or ''
+        out = []
+        seen = set()
+        for item in text.replace(',', ' ').split():
+            match = _ZVOL_PROP_RE.match(item)
+            if not match:
+                raise RuntimeError(
+                    '{}: "{}" is not property=value'.format(flag, item))
+            name = match.group(1)
+            if name in _ZVOL_PROP_FORBIDDEN:
+                raise RuntimeError(
+                    '{}: property {} is not allowed here'.format(flag, name))
+            if name in seen:
+                raise RuntimeError(
+                    '{}: property {} is given twice'.format(flag, name))
+            seen.add(name)
+            out.extend(['-o', item])
+        return out
+
+    def _zvol_create_cmd(self, size: str, dataset: str, kind: str = 'block') -> list:
+        """
+        Builds a `zfs create -V` command, with the -o properties of
+        --zvol-props (kind 'block') or --db-zvol-props (kind 'meta').
+ By default the zvol is
         space-reserved (thick): ZFS sets a refreservation covering the
         full volsize, so the pool cannot be oversubscribed and
         bluestore never sees a write fail because the pool ran out
@@ -314,6 +353,7 @@ class Zfs(BaseObjectStore):
         cmd = ['/sbin/zfs', 'create']
         if getattr(self.args, 'thin', False):
             cmd.append('-s')
+        cmd.extend(self._zvol_props(kind))
         cmd.extend(['-V', size, dataset])
         return cmd
 
@@ -358,7 +398,7 @@ class Zfs(BaseObjectStore):
                 pool = self.pool_name
                 dataset = '{}/osd-{}-{}'.format(pool, device_type, osd_uuid)
                 self._vlog('Creating {} zvol {} in the block pool'.format(device_type, dataset))
-                process.run(self._zvol_create_cmd(size, dataset))
+                process.run(self._zvol_create_cmd(size, dataset, 'meta'))
             else:
                 diskname = device.replace('/dev/', '')
                 pool = '{}-{}'.format(self.pool_name, device_type)
@@ -369,7 +409,7 @@ class Zfs(BaseObjectStore):
                 if not size:
                     size = self._pool_fraction_size(pool)
                 self._vlog('Creating {} zvol {} ({})'.format(device_type, dataset, size))
-                process.run(self._zvol_create_cmd(size, dataset))
+                process.run(self._zvol_create_cmd(size, dataset, 'meta'))
                 self._tag_zpool(pool_name=pool, device_type=device_type)
 
             self._metadata_datasets[device_type] = dataset
@@ -704,6 +744,9 @@ class Zfs(BaseObjectStore):
         if getattr(self.args, 'dmcrypt', False):
             raise RuntimeError('--dmcrypt is not yet supported by the zfs backend')
 
+        # Reject bad zvol properties before anything is created.
+        self._zvol_props('block')
+        self._zvol_props('meta')
         self.precondition_all_devices()
 
         self.osd_fsid = self.osd_fsid or system.generate_uuid()
@@ -767,8 +810,9 @@ class Zfs(BaseObjectStore):
                     terminal.warning('    /sbin/zpool create -f -m none {} {}'.format(
                         pool, device))
                 ds = '{}/osd-{}-{}'.format(pool, device_type, self.osd_fsid)
-                terminal.warning('    /sbin/zfs create {}-V {} {}'.format(
+                terminal.warning('    /sbin/zfs create {}{}-V {} {}'.format(
                     '-s ' if getattr(self.args, 'thin', False) else '',
+                    ''.join(o + ' ' for o in self._zvol_props('meta')),
                     size or '<95% of pool, computed after creation>', ds))
                 terminal.warning('    (plus ceph:* properties on {})'.format(ds))
                 terminal.warning('  block.{} device: /dev/zvol/{}'.format(device_type, ds))
