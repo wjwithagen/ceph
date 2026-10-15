@@ -234,9 +234,10 @@ int KernelDevice::open(const string& p)
   if (r) {
     r = -r;
     if (r == -ENODEV || r == -EOPNOTSUPP) {
-      // posix_fadvise() is advisory and tunes an OS page cache that some
-      // backing stores do not have -- FreeBSD returns ENODEV for ZFS zvols.
-      // There is no readahead to disable, so this is a no-op, not a failure.
+      // posix_fadvise() is advisory. FreeBSD only implements it for
+      // regular files and returns ENODEV for anything else, which includes
+      // every disk device (disks are character devices there). There is no
+      // readahead to tune, so this is a no-op, not a failure.
       dout(10) << __func__ << " posix_fadvise not supported on this device, "
                << "ignoring: " << cpp_strerror(r) << dendl;
       r = 0;
@@ -1726,13 +1727,14 @@ int KernelDevice::invalidate_cache(uint64_t off, uint64_t len)
   if (r) {
     r = -r;
     if (r == -ENODEV || r == -EOPNOTSUPP) {
-      // No page cache to drop (e.g. a ZFS zvol); nothing to do.
+      // No page cache to drop: FreeBSD returns ENODEV for anything that
+      // is not a regular file, including all disk devices.
       dout(20) << __func__ << " 0x" << std::hex << off << "~" << len << std::dec
                << " posix_fadvise not supported on this device, ignoring" << dendl;
       return 0;
     }
     derr << __func__ << " 0x" << std::hex << off << "~" << len << std::dec
-         << " error: " << cpp_strerror(r) << dendl;
+	 << " error: " << cpp_strerror(r) << dendl;
   }
   return r;
 }

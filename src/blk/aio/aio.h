@@ -23,9 +23,9 @@ struct aio_t {
   struct iocb iocb{};  // must be first element; see shenanigans in aio_queue_t
 #elif defined(HAVE_POSIXAIO)
   // A single aiocb carrying the iov array, submitted with
-  // aio_writev()/aio_readv() (FreeBSD > 13.0+). One aiocb per aio_t,
-  // mirroring the libaio path's io_prep_pwritev() shape -- no per-segment
-  // aiocb array, no lio_listio(), no allocation.
+  // aio_writev()/aio_readv(). One aiocb per aio_t, mirroring the libaio path's
+  //  io_prep_pwritev() shape -- no per-segment aiocb array, no lio_listio(), 
+  // no allocation.
   struct aiocb aio{};
 #endif
   void *priv;
@@ -140,7 +140,7 @@ struct io_queue_t {
   virtual int init(std::vector<int> &fds) = 0;
   virtual void shutdown() = 0;
   virtual int submit_batch(aio_iter begin, aio_iter end,
-                           void *priv, int *retries, int submit_retries, int initial_delay_us) = 0;
+			   void *priv, int *retries, int submit_retries, int initial_delay_us) = 0;
   virtual int get_next_completed(int timeout_ms, aio_t **paio, int max) = 0;
   /// Submit one aio_t again (the rest of a request that completed short).
   /// Only the POSIX AIO queue implements this.
@@ -174,8 +174,8 @@ struct aio_queue_t final : public io_queue_t {
     int r = io_setup(max_iodepth, &ctx);
     if (r < 0) {
       if (ctx) {
-        io_destroy(ctx);
-        ctx = 0;
+	io_destroy(ctx);
+	ctx = 0;
       }
     }
     return r;
@@ -200,9 +200,8 @@ struct aio_queue_t final : public io_queue_t {
   }
 
   int submit_batch(aio_iter begin, aio_iter end,
-                   void *priv, int *retries, int submit_retries, int initial_delay_us) final;
+		   void *priv, int *retries, int submit_retries, int initial_delay_us) final;
   int get_next_completed(int timeout_ms, aio_t **paio, int max) final;
   int resubmit(aio_t *a, int *retries,
                int submit_retries, int initial_delay_us) final;
 };
-
