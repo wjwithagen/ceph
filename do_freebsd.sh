@@ -66,6 +66,7 @@ fi
         -D WITH_SYSTEMD=OFF \
         -D WITH_SYSTEM_BOOST=ON \
         -D WITH_SYSTEM_NPM=ON \
+	-D CEPH_PYTHON_SYSTEM_SITE=ON \
         -D WITH_LTTNG=OFF \
         -D WITH_BABELTRACE=OFF \
         -D WITH_CRIMSON=OFF \
