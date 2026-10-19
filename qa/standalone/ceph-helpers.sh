@@ -1701,7 +1701,7 @@ function is_pg_clean() {
 
 #######################################################################
 
-calc() { $AWK "BEGIN{print $*}"; }
+calc() { $AWK "BEGIN{print ($*) }"; }
 
 ##
 # Return a list of numbers that are increasingly larger and whose
