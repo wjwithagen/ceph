@@ -18,6 +18,7 @@ from .utils import (
     NonFatalError,
     available_clusters,
     conf_obj_name,
+    get_nfs_spec_for_cluster,
     restart_nfs_service,
     redeploy_nfs_service,
     user_conf_obj_name,
@@ -202,6 +203,7 @@ class NFSCluster:
             port: Optional[int] = None,
             cluster_qos_config: Optional[Dict[str, Union[str, bool, int]]] = None,
             enable_nfsv3: bool = False,
+            enable_nfs_metrics: bool = False,
             ssl: bool = False,
             ssl_cert: Optional[str] = None,
             ssl_key: Optional[str] = None,
@@ -255,6 +257,7 @@ class NFSCluster:
                                   enable_haproxy_protocol=enable_haproxy_protocol,
                                   cluster_qos_config=cluster_qos_config,
                                   enable_nfsv3=enable_nfsv3,
+                                  enable_nfs_metrics=enable_nfs_metrics,
                                   ssl=ssl,
                                   ssl_cert=ssl_cert,
                                   ssl_key=ssl_key,
@@ -288,6 +291,7 @@ class NFSCluster:
                                   port=port,
                                   cluster_qos_config=cluster_qos_config,
                                   enable_nfsv3=enable_nfsv3,
+                                  enable_nfs_metrics=enable_nfs_metrics,
                                   ssl=ssl,
                                   ssl_cert=ssl_cert,
                                   ssl_key=ssl_key,
@@ -326,6 +330,7 @@ class NFSCluster:
             port: Optional[int] = None,
             cluster_qos_config: Optional[Dict[str, Union[str, bool, int]]] = None,
             enable_nfsv3: bool = False,
+            enable_nfs_metrics: bool = False,
             ssl: bool = False,
             ssl_cert: Optional[str] = None,
             ssl_key: Optional[str] = None,
@@ -371,6 +376,7 @@ class NFSCluster:
                     port,
                     cluster_qos_config=cluster_qos_config,
                     enable_nfsv3=enable_nfsv3,
+                    enable_nfs_metrics=enable_nfs_metrics,
                     ssl=ssl,
                     ssl_cert=ssl_cert,
                     ssl_key=ssl_key,
@@ -401,6 +407,15 @@ class NFSCluster:
                 orchestrator.raise_if_exception(completion)
                 completion = self.mgr.remove_service('nfs.' + cluster_id)
                 orchestrator.raise_if_exception(completion)
+                self.delete_config_obj(cluster_id)
+                return
+            # The NFS service may have already been removed via 'ceph orch rm'.
+            # Check if orphaned RADOS config objects remain and clean them up.
+            if self._rados(cluster_id).has_objects():
+                log.warning(
+                    f"NFS cluster '{cluster_id}' not found in orchestrator but RADOS objects "
+                    f"still exist. Cleaning up orphaned objects."
+                )
                 self.delete_config_obj(cluster_id)
                 return
             raise NonFatalError("Cluster does not exist")
@@ -658,16 +673,13 @@ class NFSCluster:
 
         deployment_type = "standalone"
         placement = None
+        enable_rdma = False
 
-        nfs_sc = self.mgr.describe_service(
-            service_type='nfs',
-            service_name=f'nfs.{cluster_id}'
-        )
-        nfs_services = orchestrator.raise_if_exception(nfs_sc)
-        for svc in nfs_services:
-            if svc.spec.service_id == cluster_id:
-                placement = svc.spec.placement
-                break
+        # Use the same spec lookup as export creation so enable_rdma is consistent.
+        nfs_spec = get_nfs_spec_for_cluster(self.mgr, cluster_id)
+        if nfs_spec:
+            placement = nfs_spec.placement
+            enable_rdma = bool(getattr(nfs_spec, 'enable_rdma', False))
 
         if ingress_mode:
             if placement and placement.count and placement.count > 1:
@@ -682,6 +694,7 @@ class NFSCluster:
             'virtual_ip': virtual_ip,
             'backend': backends,
             'placement': placement.to_json() if placement else {},
+            'enable_rdma': enable_rdma,
         }
 
         if ingress_mode:

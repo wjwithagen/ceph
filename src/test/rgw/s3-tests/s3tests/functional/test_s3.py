@@ -8463,6 +8463,68 @@ def test_versioning_multi_object_delete_with_marker():
     assert not 'Versions' in response
     assert not 'DeleteMarkers' in response
 
+@pytest.mark.versioning
+def test_versioning_multi_object_delete_last_missing():
+    bucket_name = get_new_bucket()
+    client = get_client()
+
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+
+    key = 'key'
+    num_versions = 2
+
+    (version_ids, contents) = create_multiple_versions(client, bucket_name, key, num_versions)
+    assert len(version_ids) == num_versions
+
+    # delete the current version, then a version that does not exist
+    objects = [{'Key': key, 'VersionId': version_ids[1]},
+               {'Key': key, 'VersionId': 'doesnotexist'}]
+    client.delete_objects(Bucket=bucket_name, Delete={'Objects': objects})
+
+    # check the deleted version before any read of the current version
+    e = assert_raises(ClientError, client.get_object, Bucket=bucket_name, Key=key, VersionId=version_ids[1])
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 404
+
+    response = client.list_object_versions(Bucket=bucket_name)
+    assert [v['VersionId'] for v in response['Versions']] == [version_ids[0]]
+
+    response = client.get_object(Bucket=bucket_name, Key=key)
+    assert _get_body(response) == contents[0]
+
+@pytest.mark.fails_on_aws # only supported for directory buckets
+@pytest.mark.conditional_write
+@pytest.mark.fails_on_dbstore
+@pytest.mark.versioning
+def test_versioning_multi_object_delete_last_precondition_failed():
+    bucket_name = get_new_bucket()
+    client = get_client()
+
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+
+    key = 'key'
+    num_versions = 2
+
+    (version_ids, contents) = create_multiple_versions(client, bucket_name, key, num_versions)
+    assert len(version_ids) == num_versions
+
+    # delete the current version, then fail the older one on its etag
+    objects = [{'Key': key, 'VersionId': version_ids[1]},
+               {'Key': key, 'VersionId': version_ids[0], 'ETag': 'badetag'}]
+    response = client.delete_objects(Bucket=bucket_name, Delete={'Objects': objects})
+    assert 'PreconditionFailed' == response['Errors'][0]['Code']
+
+    # check the deleted version before any read of the current version
+    e = assert_raises(ClientError, client.get_object, Bucket=bucket_name, Key=key, VersionId=version_ids[1])
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 404
+
+    response = client.list_object_versions(Bucket=bucket_name)
+    assert [v['VersionId'] for v in response['Versions']] == [version_ids[0]]
+
+    response = client.get_object(Bucket=bucket_name, Key=key)
+    assert _get_body(response) == contents[0]
+
 @pytest.mark.fails_on_dbstore
 @pytest.mark.versioning
 def test_versioning_multi_object_delete_with_marker_create():
@@ -18409,6 +18471,51 @@ def test_bucket_logging_put_concurrency():
     assert _verify_records(body, src_bucket_name, 'REST.PUT.OBJECT', src_keys, record_type, num_keys)
 
 
+@pytest.mark.bucket_logging
+@pytest.mark.fails_on_aws
+def test_bucket_logging_put_failure():
+    src_bucket_name = get_new_bucket()
+    log_bucket_name = get_new_bucket_name()
+    log_bucket = get_new_bucket_resource(name=log_bucket_name)
+    client = get_client()
+    alt_client = get_alt_client()
+    has_extensions = _has_bucket_logging_extension()
+    prefix = 'log/'
+    _set_log_bucket_policy(client, log_bucket_name, [src_bucket_name], [prefix])
+    key = 'test-put'
+
+    # minimal configuration
+    logging_enabled = {'TargetBucket': log_bucket_name, 'TargetPrefix': prefix}
+    if has_extensions:
+        logging_enabled['LoggingType'] = 'Standard'
+    response = client.put_bucket_logging(Bucket=src_bucket_name, BucketLoggingStatus={
+        'LoggingEnabled': logging_enabled,
+    })
+    assert response['ResponseMetadata']['HTTPStatusCode'] == 200
+
+    e = assert_raises(ClientError, alt_client.put_object, Bucket=src_bucket_name, Key=key, Body=randcontent())
+    assert (403, 'AccessDenied') == _get_status_and_error_code(e.response)
+
+    response = client.list_objects_v2(Bucket=src_bucket_name)
+    src_keys = _get_keys(response)
+
+    flushed_obj = _flush_logs(client, src_bucket_name)
+
+    response = client.list_objects_v2(Bucket=log_bucket_name)
+    keys = _get_keys(response)
+    assert len(keys) == 1
+
+    record_type = 'Standard' if not has_extensions else 'Journal'
+
+    if flushed_obj is not None:
+      assert keys[0] == flushed_obj
+
+    assert keys[0].startswith('log/')
+    response = client.get_object(Bucket=log_bucket_name, Key=keys[0])
+    body = _get_body(response)
+    assert _verify_records(body, src_bucket_name, 'REST.PUT.OBJECT', key, "Standard", 1)
+    assert _verify_record_field(body, src_bucket_name, 'REST.PUT.OBJECT', key, "Standard", "ErrorCode", "AccessDenied")
+
 def _bucket_logging_delete_objects(versioned):
     src_bucket_name = get_new_bucket()
     if versioned:
@@ -19369,6 +19476,9 @@ def _bucket_logging_cleanup(cleanup_type, logging_type, single_prefix, concurren
     else:
         if single_prefix and logging_type == 'Journal' and cleanup_type not in ['target', 'updating']:
             assert len(keys) == 1
+        elif single_prefix and logging_type == 'Standard' and cleanup_type == 'disabling':
+            # A single shared log record is committed but the PutLogging op is not logged
+            assert len(keys) == 1
         else:
             assert len(keys) == num_buckets
 
@@ -19627,7 +19737,7 @@ def _bucket_logging_partial_cleanup(cleanup_type, logging_type, concurrency):
     log_bucket = get_new_bucket_resource(name=log_bucket_name)
     client = get_client()
 
-    num_buckets = 3
+    num_buckets = 5
     buckets = []
     log_prefixes = []
     longer_time = expected_object_roll_time*10
@@ -19724,11 +19834,10 @@ def _bucket_logging_partial_cleanup(cleanup_type, logging_type, concurrency):
         assert len(keys) >= 1 and len(keys) <= num_buckets
     elif cleanup_type == 'updating':
         assert len(keys) == num_buckets
-    elif logging_type == 'Standard':
-        # 1st deleted/disabled source write the bucket_deletion/put_bucket_logging record
+    elif logging_type == 'Standard' and cleanup_type == 'deletion':
         assert len(keys) == num_buckets
     else:
-        assert len(keys) == num_buckets - 1
+        assert len(keys) == 2
 
 
     prefixes = []

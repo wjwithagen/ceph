@@ -59,6 +59,7 @@
 #include "osd/scrubber/pg_scrubber.h"
 #include "ECInject.h"
 
+#include "BloomHitSet.h"
 #include "OSD.h"
 #include "OpRequest.h"
 #include "PG.h"
@@ -6700,10 +6701,22 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
       break;
 
     case CEPH_OSD_OP_GET_INTERNAL_VERSIONS: {
+      ++ctx->num_read;
       std::map<shard_id_t, eversion_t> out;
       result = get_internal_versions(soid, &out);
       if (result >= 0) {
         encode(out, osd_op.outdata);
+      }
+    }
+    break;
+
+    case CEPH_OSD_OP_GET_INTERNAL_VERSIONS_V2: {
+      ++ctx->num_read;
+      std::map<shard_id_t, eversion_t> out;
+      result = get_internal_versions_v2(soid, &out);
+      if (result >= 0) {
+        internal_versions_v2_response_t response{out};
+        encode(response, osd_op.outdata);
       }
     }
     break;
@@ -15981,15 +15994,13 @@ bool PrimaryLogPG::_range_available_for_scrub(const hobject_t& begin,
 int PrimaryLogPG::rep_repair_primary_object(const hobject_t& soid, OpContext *ctx)
 {
   OpRequestRef op = ctx->op;
-  // Only supports replicated pools
-  ceph_assert(!pool.info.is_erasure());
 
-  if (!is_primary()) {
-    // Must be a balanced/localized read that has failed on a replica.
-    // Replicas cannot run recovery, so the request need to be
+  if (!is_primary() || pool.info.is_erasure()) {
+    // Must be a balanced/localized read that has failed on a replica, or
+    // an EC direct read. Neither can run recovery, so the request needs to be
     // failed with EAGAIN to the client which will then retry the
     // request to the primary
-    dout(10) << __func__ << " not primary, failing op with EAGAIN" << dendl;
+    dout(10) << __func__ << " not primary or EC direct, failing op with EAGAIN" << dendl;
     osd->reply_op_error(op, -EAGAIN);
     return -EAGAIN;
   }
@@ -16319,6 +16330,27 @@ int PrimaryLogPG::get_internal_versions(const hobject_t& soid,
     }
   } else {
     (*out)[pg_whoami.shard] = obc->obs.oi.version;
+  }
+  return 0;
+}
+
+int PrimaryLogPG::get_internal_versions_v2(const hobject_t& soid,
+                                           std::map<shard_id_t, eversion_t>* out) {
+  ObjectContextRef obc = get_object_context(soid, false);
+
+  if (!obc || !obc->obs.exists) {
+    return -ENOENT;
+  }
+
+  if (pool.info.is_erasure()) {
+    for (unsigned int i = 0; i < pool.info.get_size(); ++i) {
+      (*out)[shard_id_t(i)] = obc->obs.oi.version;
+    }
+    for (const auto& [shard, version] : obc->obs.oi.shard_versions) {
+      out->at(shard) = version;
+    }
+  } else {
+    (*out)[shard_id_t::NO_SHARD] = obc->obs.oi.version;
   }
   return 0;
 }

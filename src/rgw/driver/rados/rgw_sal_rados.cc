@@ -671,10 +671,28 @@ int RadosVectorBucket::remove(const DoutPrefixProvider* dpp,
 
 #ifdef WITH_RADOSGW_LANCEDB
   {
+    // the namespace of the vector bucket takes the place of the tenant in its key
+    rgw::s3vector::bucket_namespace_t ns;
+    if (const auto* account_id = std::get_if<rgw_account_id>(&info.owner); account_id) {
+      // the tenant of the vector bucket is the one of the account that owns it
+      RGWAccountInfo account;
+      Attrs account_attrs;
+      RGWObjVersionTracker account_objv;
+      if (const int r = store->load_account_by_id(dpp, y, *account_id, account,
+                                                  account_attrs, account_objv); r < 0) {
+        ldpp_dout(dpp, 1) << "ERROR: failed to load account " << *account_id <<
+          " of s3vector bucket " << info.bucket << ". error: " << r << dendl;
+        return r;
+      }
+      ns.account = *account_id;
+      ns.tenant = account.tenant;
+    } else {
+      ns.tenant = info.bucket.tenant;
+    }
     // the indexes hold the data of a vector bucket, like the objects of an ordinary
     // one: they are removed only when the caller asks for it, and prevent the removal
     // of the vector bucket otherwise
-    const int r = rgw::s3vector::remove_indexes(dpp, store, &info.bucket.tenant,
+    const int r = rgw::s3vector::remove_indexes(dpp, store, ns,
                                                 info.bucket.name, delete_children, y);
     if (r == -ENOENT) {
       // the backend of the vector bucket does not exist. this happens when the bucket
@@ -686,7 +704,7 @@ int RadosVectorBucket::remove(const DoutPrefixProvider* dpp,
       return r;
     }
     // the data of the vector bucket is gone, and so should be its cached session
-    rgw::s3vector::notify_session_delete(dpp, info.bucket.tenant, info.bucket.name);
+    rgw::s3vector::notify_session_delete(dpp, ns, info.bucket.name);
   }
 #endif
 
@@ -2959,14 +2977,15 @@ int RadosStore::load_vector_bucket(const DoutPrefixProvider* dpp, const rgw_buck
 }
 
 int RadosStore::list_vector_buckets(const DoutPrefixProvider* dpp,
-			     const rgw_owner& owner, const std::string& tenant,
+			     const rgw_owner& owner, const std::string& ns,
 			     const std::string& marker, const std::string& end_marker,
 			     uint64_t max, BucketList& listing,
 			     optional_yield y) {
   librados::Rados& rados = *getRados()->get_rados_handle();
   const rgw_raw_obj& obj = get_owner_vector_buckets_obj(svc()->user, svc()->zone, owner);
 
-  return rgwrados::buckets::list(dpp, y, rados, obj, tenant,
+  // the namespace takes the place of the tenant in the keys of the vector buckets
+  return rgwrados::buckets::list(dpp, y, rados, obj, ns,
                                     marker, end_marker, max, listing);
 }
 
@@ -3137,6 +3156,34 @@ int RadosObject::load_obj_state(const DoutPrefixProvider* dpp, optional_yield y,
   return ret;
 }
 
+int RadosObject::update_olh(const DoutPrefixProvider* dpp, optional_yield y, uint32_t flags)
+{
+  RGWObjState* s = nullptr;
+  int r = store->getRados()->get_obj_state(dpp, rados_ctx, bucket->get_info(), get_obj(),
+                                           &s, nullptr, false, y);
+  if (r < 0) {
+    ldpp_dout(dpp, 0) << "ERROR: failed to read olh state for obj=" << get_key()
+                      << ": " << cpp_strerror(-r) << dendl;
+    return r;
+  }
+  if (!s->is_olh) {
+    return 0;
+  }
+  auto iter = s->attrset.lower_bound(RGW_ATTR_OLH_PENDING_PREFIX);
+  if (iter == s->attrset.end() ||
+      !boost::algorithm::starts_with(iter->first, RGW_ATTR_OLH_PENDING_PREFIX)) {
+    return 0;
+  }
+  r = store->getRados()->update_olh(dpp, *rados_ctx, s, bucket->get_info(), get_obj(), y,
+                                    nullptr, false, flags & FLAG_LOG_OP);
+  if (r < 0 && r != -ECANCELED) {
+    ldpp_dout(dpp, 0) << "ERROR: failed to apply pending olh log for obj=" << get_key()
+                      << ": " << cpp_strerror(-r) << dendl;
+    return r;
+  }
+  return 0;
+}
+
 int RadosObject::read_attrs(const DoutPrefixProvider* dpp, RGWRados::Object::Read &read_op, optional_yield y, rgw_obj* target_obj)
 {
   read_op.params.attrs = &state.attrset;
@@ -3154,7 +3201,7 @@ int RadosObject::set_obj_attrs(const DoutPrefixProvider* dpp, Attrs* setattrs, A
   const bool log_op = flags & rgw::sal::FLAG_LOG_OP;
   // make a tiny adjustment to the existing mtime so that fetch_remote_obj()
   // won't return ERR_NOT_MODIFIED when syncing the modified object
-  const ceph::real_time mtime = log_op ? ceph::real_time(state.mtime + std::chrono::nanoseconds(1)) : state.mtime;
+  const auto mtime = log_op ? state.mtime + ceph::timespan{std::chrono::nanoseconds{1}} : state.mtime;
   return store->getRados()->set_attrs(dpp, rados_ctx,
 			bucket->get_info(),
 			get_obj(),

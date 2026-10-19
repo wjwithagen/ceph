@@ -113,7 +113,7 @@ if(NOT MSVC)
   add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wno-ignored-qualifiers>)
 endif()
 
-if (CMAKE_CXX_COMPILER_ID STREQUAL Clang)
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wsign-compare>)
 endif()
 
@@ -162,7 +162,7 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL GNU)
       string(APPEND CMAKE_EXE_LINKER_FLAGS " -pie")
     endif()
   endif()
-elseif(CMAKE_CXX_COMPILER_ID STREQUAL Clang)
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 16)
     message(FATAL_ERROR "C++20 support requires a minimum Clang version of 16.")
   endif()
@@ -543,6 +543,9 @@ set(libcommon_files
   include/filepath.cc
   include/invoke_date.cc
   include/object.cc
+  include/client_t.cc
+  include/errorcode32.cc
+  include/shard_id.cc
   include/types.cc
   include/utime.cc
   include/uuid.cc
@@ -570,6 +573,7 @@ set(libcommon_files
   osd/OpRequest.cc
   osd/ClassHandler.cc
   osd/osd_op_util.cc
+  osd/osd_types.cc
   osdc/Striper.cc
   osdc/Objecter.cc
   osdc/error_code.cc
@@ -659,15 +663,6 @@ endif()
 if(WIN32)
   list(APPEND ceph_common_deps ws2_32 mswsock iphlpapi bcrypt)
   list(APPEND ceph_common_deps dlfcn_win32)
-endif()
-
-if(WITH_RBD_RWL)
-  if(WITH_SYSTEM_PMDK)
-    find_package(pmdk 1.8 REQUIRED COMPONENTS pmemobj)
-  else()
-    include(Buildpmdk)
-    build_pmdk()
-  endif()
 endif()
 
 if(WITH_BREAKPAD)

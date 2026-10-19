@@ -240,6 +240,7 @@ static int init_fscrypt()
 
   libcephfs_test_set_mount_call(do_fscrypt_mount);
   libcephfs_test_set_dir_prefix(fscrypt_dir);
+  libcephfs_test_set_is_encrypted(true);
   std::clog << __func__ << "(): init fscrypt done" << std::endl;
 
   return 0;
@@ -591,10 +592,10 @@ TEST(FSCrypt, LockedListDir) {
       file_path.append(result->d_name);
 
       //check that we can get stat info
-      struct stat st;
-      ceph_stat(cmount, file_path.c_str(), &st);
+      struct ceph_statx stx;
+      ceph_statx(cmount, file_path.c_str(), &stx, CEPH_SETATTR_SIZE, 0);
 
-      ASSERT_EQ(sizeof(fscrypt_key), st.st_size);
+      ASSERT_EQ(sizeof(fscrypt_key), stx.stx_size);
       goto done;
     }
   }

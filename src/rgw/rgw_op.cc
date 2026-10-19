@@ -2,6 +2,8 @@
 // vim: ts=8 sw=2 sts=2 expandtab ft=cpp
 
 #include <cerrno>
+#include <array>
+#include <concepts>
 #include <optional>
 #include <cstdlib>
 #include <system_error>
@@ -2697,18 +2699,34 @@ int RGWGetObj::get_data_cb(bufferlist& bl, off_t bl_ofs, off_t bl_len)
   return send_response_data(bl, bl_ofs, bl_len);
 }
 
-int RGWGetObj::get_lua_filter(std::unique_ptr<RGWGetObj_Filter>* filter, RGWGetObj_Filter* cb) {
-  const auto [script, rc] = rgw::lua::read_script_or_bytecode(s, s->penv.lua.manager.get(),
-                                                              s->bucket_tenant, s->yield, rgw::lua::context::getData);
-  if (rc == -ENOENT) {
-    // no script, nothing to do
+template <typename LuaFilterT, typename BaseFilterT>
+requires std::derived_from<LuaFilterT, BaseFilterT>
+static int make_lua_data_filter(req_state * const s,
+                                const DoutPrefixProvider * const dpp,
+                                const rgw::lua::context ctx,
+                                std::unique_ptr<BaseFilterT>& filter,
+                                BaseFilterT * const cb)
+{
+  const auto [script, rc] = rgw::lua::read_script_or_bytecode(
+    s, s->penv.lua.manager.get(), s->bucket_tenant, s->yield, ctx);
+
+  if (-ENOENT == rc) {
     return 0;
-  } else if (rc < 0) {
-    ldpp_dout(this, 5) << "WARNING: failed to read data script. error: " << rc << dendl;
+  }
+
+  if (rc < 0) {
+    ldpp_dout(dpp, 5) << "WARNING: failed to read data script. error: " << rc << dendl;
     return rc;
   }
-  filter->reset(new rgw::lua::RGWGetObjFilter(s, script, cb));
+
+  filter = std::make_unique<LuaFilterT>(s, script, cb);
   return 0;
+}
+
+int RGWGetObj::get_lua_filter(std::unique_ptr<RGWGetObj_Filter>* filter, RGWGetObj_Filter* cb)
+{
+  return make_lua_data_filter<rgw::lua::RGWGetObjFilter>(
+    s, this, rgw::lua::context::getData, *filter, cb);
 }
 
 bool RGWGetObj::prefetch_data()
@@ -4821,18 +4839,10 @@ auto RGWPutObj::get_torrent_filter(rgw::sal::DataProcessor* cb)
   return RGWPutObj_Torrent{cb, max_len, piece_len};
 }
 
-int RGWPutObj::get_lua_filter(std::unique_ptr<rgw::sal::DataProcessor>* filter, rgw::sal::DataProcessor* cb) {
-  const auto [script, rc] = rgw::lua::read_script_or_bytecode(s, s->penv.lua.manager.get(),
-                                                              s->bucket_tenant, s->yield, rgw::lua::context::putData);
-  if (rc == -ENOENT) {
-    // no script, nothing to do
-    return 0;
-  } else if (rc < 0) {
-    ldpp_dout(this, 5) << "WARNING: failed to read data script. error: " << rc << dendl;
-    return rc;
-  }
-  filter->reset(new rgw::lua::RGWPutObjFilter(s, script, cb));
-  return 0;
+int RGWPutObj::get_lua_filter(std::unique_ptr<rgw::sal::DataProcessor>* filter, rgw::sal::DataProcessor* cb)
+{
+  return make_lua_data_filter<rgw::lua::RGWPutObjFilter>(
+    s, this, rgw::lua::context::putData, *filter, cb);
 }
 
 void RGWPutObj::execute(optional_yield y)
@@ -5296,6 +5306,7 @@ void RGWPutObj::execute(optional_yield y)
 
   populate_with_generic_attrs(s, attrs);
   op_ret = rgw_get_request_metadata(this, s->cct, s->info, attrs);
+
   if (op_ret < 0) {
     return;
   }
@@ -5346,24 +5357,8 @@ void RGWPutObj::execute(optional_yield y)
   if (op_ret < 0) {
     return;
   }
-
-  auto ret = rgw::bucketlogging::log_record(driver,
-      rgw::bucketlogging::LoggingType::Standard,
-      s->object.get(),
-      s,
-      (multipart ? "REST.PUT.PART" : canonical_name()),
-      etag,
-      s->object->get_size(),
-      this,
-      y,
-      true,
-      false);
-  if (ret  < 0) {
-    ldpp_dout(this, 5) << "WARNING: in Standard mode, put object operation ignores bucket logging failure: " << ret << dendl;
- }
-
   // send request to notification manager
-  ret = res->publish_commit(this, s->obj_size, mtime, etag, s->object->get_instance());
+  auto ret = res->publish_commit(this, s->obj_size, mtime, etag, s->object->get_instance());
   if (ret < 0) {
     ldpp_dout(this, 1) << "ERROR: publishing notification failed, with error: " << ret << dendl;
     // too late to rollback operation, hence op_ret is not set here
@@ -6765,7 +6760,6 @@ void RGWCopyObj::execute(optional_yield y)
   if (ret < 0) {
     ldpp_dout(this, 5) << "WARNING: COPY operation ignores bucket logging failure of the GET part: " << ret << dendl;
   }
-
   if (op_ret < 0) {
     return;
   }
@@ -7917,17 +7911,13 @@ void RGWCompleteMultipart::execute(optional_yield y)
     upload->complete(this, y, s->cct, parts->parts, remove_objs, accounted_size,
                      compressed, cs_info, ofs, s->req_id, s->owner, olh_epoch,
                      s->object.get(), processed_prefixes, if_match, if_nomatch);
+
   if (op_ret < 0) {
     ldpp_dout(this, 0) << "ERROR: upload complete failed ret=" << op_ret << dendl;
     return;
   }
 
-  // size is logged in stadared mode
-  int ret = rgw::bucketlogging::log_record(driver, rgw::bucketlogging::LoggingType::Standard, s->object.get(), s, canonical_name(), "", ofs, this, y, true, false);
-  if (ret < 0) {
-    ldpp_dout(this, 5) << "WARNING: in Standard mode, complete MPU operation ignores bucket logging failure: " << ret << dendl;
-  }
-
+  s->obj_size = ofs;
   remove_objs.clear();
 
   // use cls_version_check() when deleting the meta object to detect part uploads that raced
@@ -7973,7 +7963,7 @@ void RGWCompleteMultipart::execute(optional_yield y)
   etag = s->object->get_attrs()[RGW_ATTR_ETAG].to_str();
 
   // send request to notification manager
-  ret = res->publish_commit(this, ofs, upload_time, etag, s->object->get_instance());
+  auto ret = res->publish_commit(this, ofs, upload_time, etag, s->object->get_instance());
   if (ret < 0) {
     ldpp_dout(this, 1) << "ERROR: publishing notification failed, with error: " << ret << dendl;
     // too late to rollback operation, hence op_ret is not set here
@@ -8291,10 +8281,11 @@ void RGWDeleteMultiObj::write_ops_log_entry(rgw_log_entry& entry) const {
 }
 
 int RGWDeleteMultiObj::run_lua_script(rgw::lua::context ctx,
-                                      const rgw::sal::Object* multi_delete_obj)
+                                      const rgw::sal::Object* multi_delete_obj,
+                                      optional_yield y)
 {
   auto [lua_script, rc] = rgw::lua::read_script_or_bytecode(s, s->penv.lua.manager.get(),
-                                                  s->bucket_tenant, s->yield, ctx);
+                                                  s->bucket_tenant, y, ctx);
   if (rc == -ENOENT) {
     // no script, nothing to do
   } else if (rc < 0) {
@@ -8304,7 +8295,7 @@ int RGWDeleteMultiObj::run_lua_script(rgw::lua::context ctx,
   } else {
     int script_return_code = 0;
     rc = rgw::lua::request::execute(s->penv.rest, s->penv.olog.get(), s, this,
-                                    lua_script, script_return_code, const_cast<rgw::sal::Object*>(multi_delete_obj));
+                                    lua_script, script_return_code, multi_delete_obj);
 
     if (rc < 0) {
       ldpp_dout(this, 5) <<
@@ -8413,7 +8404,7 @@ void RGWDeleteMultiObj::handle_individual_object(const RGWMultiDelObject& object
   del_op->params.size_match = object.get_size_match();
 
   // allow skipping deletion of the current object when the Lua postAuth script returns RGW_ABORT_REQUEST
-  int script_return_code = run_lua_script(rgw::lua::context::postAuth, obj.get());
+  int script_return_code = run_lua_script(rgw::lua::context::postAuth, obj.get(), y);
   if (script_return_code != -EPERM) {
     r = del_op->delete_obj(dpp, y,
                           rgw::sal::FLAG_LOG_OP | (skip_olh_obj_update ? rgw::sal::FLAG_SKIP_UPDATE_OLH : 0));
@@ -8421,7 +8412,7 @@ void RGWDeleteMultiObj::handle_individual_object(const RGWMultiDelObject& object
       r = 0;
     }
   }
-  std::ignore = run_lua_script(rgw::lua::context::postRequest, obj.get());
+  std::ignore = run_lua_script(rgw::lua::context::postRequest, obj.get(), y);
 
   if (auto ret = rgw::bucketlogging::log_record(driver, rgw::bucketlogging::LoggingType::Any, obj.get(), s, canonical_name(), etag, obj_size, this, y, true, false); ret < 0) {
     // don't reply with an error in case of failed delete logging
@@ -8468,6 +8459,9 @@ void RGWDeleteMultiObj::handle_objects(const std::vector<RGWMultiDelObject>& obj
                         bool skip_update_olh,
                         boost::asio::yield_context y) {
         handle_individual_object(objects[item.index], y, skip_update_olh);
+      },
+      [this] (const rgw_obj_key& key, boost::asio::yield_context y) {
+        bucket->get_object(key)->update_olh(this, y, rgw::sal::FLAG_LOG_OP);
       },
       [this] {
         rgw_flush_formatter(s, s->formatter);
@@ -9378,7 +9372,8 @@ void RGWGetObjLayout::execute(optional_yield y)
 
 int RGWConfigBucketMetaSearch::verify_permission(optional_yield y)
 {
-  if (!s->auth.identity->is_owner_of(s->bucket_owner.id)) {
+  if (!verify_owner_permission(*s->auth.identity, s->perm_mask,
+                               s->bucket_owner.id, RGW_PERM_WRITE)) {
     return -EACCES;
   }
 
@@ -9411,7 +9406,8 @@ void RGWConfigBucketMetaSearch::execute(optional_yield y)
 
 int RGWGetBucketMetaSearch::verify_permission(optional_yield y)
 {
-  if (!s->auth.identity->is_owner_of(s->bucket_owner.id)) {
+  if (!verify_owner_permission(*s->auth.identity, s->perm_mask,
+                               s->bucket_owner.id, RGW_PERM_READ)) {
     return -EACCES;
   }
 
@@ -9425,7 +9421,8 @@ void RGWGetBucketMetaSearch::pre_exec()
 
 int RGWDelBucketMetaSearch::verify_permission(optional_yield y)
 {
-  if (!s->auth.identity->is_owner_of(s->bucket_owner.id)) {
+  if (!verify_owner_permission(*s->auth.identity, s->perm_mask,
+                               s->bucket_owner.id, RGW_PERM_WRITE)) {
     return -EACCES;
   }
 
@@ -10539,7 +10536,7 @@ int get_decrypt_filter(
 
   // in case of a multipart upload, we need to know the part lengths to
   // correctly decrypt across part boundaries
-  std::vector<size_t> parts_len;
+  std::vector<uint64_t> parts_len;
 
   // Read (S3 part number, GCM salt) pairs from the attribute (set by Complete).
   std::vector<std::pair<uint32_t, std::string>> part_keys;
@@ -10615,7 +10612,7 @@ int get_decrypt_filter(
   if (encrypted_total_size == 0 &&
       block_crypt->get_block_size() != block_crypt->get_encrypted_block_size()) {
     if (!parts_len.empty()) {
-      for (size_t part_len : parts_len) {
+      for (uint64_t part_len : parts_len) {
         encrypted_total_size += part_len;
       }
     } else if (!attrs.count(RGW_ATTR_COMPRESSION)) {

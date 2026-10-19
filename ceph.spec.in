@@ -29,21 +29,7 @@
 %bcond_without tcmalloc
 %endif
 %bcond_without rbd_ssd_cache
-%ifarch x86_64
-%bcond_without rbd_rwl_cache
-%else
-%bcond_with rbd_rwl_cache
-%endif
 %if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler} || 0%{?openruyi}
-%if 0%{?openEuler} || 0%{?openruyi}
-%bcond_with system_pmdk
-%else
-%ifarch s390x aarch64
-%bcond_with system_pmdk
-%else
-%bcond_without system_pmdk
-%endif
-%endif
 %if 0%{?openruyi}
 %bcond_with selinux
 %else
@@ -54,17 +40,16 @@
 %bcond_without lttng
 %bcond_without libradosstriper
 %bcond_without ocf
+%ifarch x86_64 aarch64 loongarch64
 %bcond_without lancedb
+%else
+%bcond_with lancedb
+%endif
 %global luarocks_package_name luarocks
 %bcond_without lua_packages
 %global _remote_tarball_prefix https://download.ceph.com/tarballs/
 %endif
 %if 0%{?suse_version}
-%ifarch s390x
-%bcond_with system_pmdk
-%else
-%bcond_without system_pmdk
-%endif
 %bcond_with amqp_endpoint
 %bcond_with cephfs_java
 %bcond_with kafka_endpoint
@@ -180,18 +165,6 @@
   [ $jobs -lt 1 ] && jobs=1 \
   echo $jobs )
 
-# $1==1: fresh install; $1==0: removal. Skip try-restart on upgrade ($1>1).
-%define ceph_mgr_module_scripts() \
-%post %1\
-if [ $1 -eq 1 ] ; then\
-    /usr/bin/systemctl try-restart ceph-mgr.target >/dev/null 2>&1 || :\
-fi\
-\
-%postun %1\
-if [ $1 -eq 1 ] ; then\
-    /usr/bin/systemctl try-restart ceph-mgr.target >/dev/null 2>&1 || :\
-fi
-
 %if 0%{?_smp_ncpus_max} == 0
 %if 0%{?__isa_bits} == 32
 # 32-bit builds can use 3G memory max, which is not enough even for -j2
@@ -248,6 +221,7 @@ ExclusiveArch:  x86_64 aarch64 ppc64le s390x riscv64
 Requires:       ceph-osd = %{_epoch_prefix}%{version}-%{release}
 Requires:       ceph-mds = %{_epoch_prefix}%{version}-%{release}
 Requires:       ceph-mgr = %{_epoch_prefix}%{version}-%{release}
+Requires:       ceph-mgr-modules-standard = %{_epoch_prefix}%{version}-%{release}
 Requires:       ceph-mon = %{_epoch_prefix}%{version}-%{release}
 Requires(post):	binutils
 %if 0%{with cephfs_java}
@@ -386,9 +360,6 @@ BuildRequires:  bison
 BuildRequires:  flex
 BuildRequires:	pkgconfig(nlohmann_json)
 BuildRequires:  pkgconfig(libevent)
-%endif
-%if 0%{with system_pmdk}
-BuildRequires:  pkgconfig(libpmemobj) >= 1.8
 %endif
 %if 0%{with system_arrow}
 BuildRequires:  pkgconfig(arrow)
@@ -1836,14 +1807,8 @@ cmake .. \
 %if 0%{with cmake_verbose_logging}
     -DCMAKE_VERBOSE_MAKEFILE:BOOL=ON \
 %endif
-%if 0%{with rbd_rwl_cache}
-    -DWITH_RBD_RWL:BOOL=ON \
-%endif
 %if 0%{with rbd_ssd_cache}
     -DWITH_RBD_SSD_CACHE:BOOL=ON \
-%endif
-%if 0%{with system_pmdk}
-    -DWITH_SYSTEM_PMDK:BOOL=ON \
 %endif
 %if 0%{with system_rdkafka}
     -DWITH_SYSTEM_RDKAFKA:BOOL=ON \
@@ -2318,12 +2283,8 @@ fi
 %files mgr-dashboard
 %{_datadir}/ceph/mgr/dashboard
 
-%ceph_mgr_module_scripts mgr-dashboard
-
 %files mgr-diskprediction-local
 %{_datadir}/ceph/mgr/diskprediction_local
-
-%ceph_mgr_module_scripts mgr-diskprediction-local
 
 %files mgr-modules-core
 %dir %{_datadir}/ceph/mgr
@@ -2343,117 +2304,71 @@ fi
 %files mgr-alerts
 %{_datadir}/ceph/mgr/alerts
 
-%ceph_mgr_module_scripts mgr-alerts
-
 %files mgr-influx
 %{_datadir}/ceph/mgr/influx
-
-%ceph_mgr_module_scripts mgr-influx
 
 %files mgr-insights
 %{_datadir}/ceph/mgr/insights
 
-%ceph_mgr_module_scripts mgr-insights
-
 %files mgr-iostat
 %{_datadir}/ceph/mgr/iostat
-
-%ceph_mgr_module_scripts mgr-iostat
 
 %files mgr-localpool
 %{_datadir}/ceph/mgr/localpool
 
-%ceph_mgr_module_scripts mgr-localpool
-
 %files mgr-mds-autoscaler
 %{_datadir}/ceph/mgr/mds_autoscaler
-
-%ceph_mgr_module_scripts mgr-mds-autoscaler
 
 %files mgr-mirroring
 %{_datadir}/ceph/mgr/mirroring
 
-%ceph_mgr_module_scripts mgr-mirroring
-
 %files mgr-nfs
 %{_datadir}/ceph/mgr/nfs
-
-%ceph_mgr_module_scripts mgr-nfs
 
 %files mgr-nvmeof
 %{_datadir}/ceph/mgr/nvmeof
 
-%ceph_mgr_module_scripts mgr-nvmeof
-
 %files mgr-osd-perf-query
 %{_datadir}/ceph/mgr/osd_perf_query
-
-%ceph_mgr_module_scripts mgr-osd-perf-query
 
 %files mgr-osd-support
 %{_datadir}/ceph/mgr/osd_support
 
-%ceph_mgr_module_scripts mgr-osd-support
-
 %files mgr-prometheus
 %{_datadir}/ceph/mgr/prometheus
-
-%ceph_mgr_module_scripts mgr-prometheus
 
 %files mgr-rgw
 %{_datadir}/ceph/mgr/rgw
 
-%ceph_mgr_module_scripts mgr-rgw
-
 %files mgr-selftest
 %{_datadir}/ceph/mgr/selftest
-
-%ceph_mgr_module_scripts mgr-selftest
 
 %files mgr-smb
 %{_datadir}/ceph/mgr/smb
 
-%ceph_mgr_module_scripts mgr-smb
-
 %files mgr-snap-schedule
 %{_datadir}/ceph/mgr/snap_schedule
-
-%ceph_mgr_module_scripts mgr-snap-schedule
 
 %files mgr-stats
 %{_datadir}/ceph/mgr/stats
 
-%ceph_mgr_module_scripts mgr-stats
-
 %files mgr-telegraf
 %{_datadir}/ceph/mgr/telegraf
-
-%ceph_mgr_module_scripts mgr-telegraf
 
 %files mgr-test-orchestrator
 %{_datadir}/ceph/mgr/test_orchestrator
 
-%ceph_mgr_module_scripts mgr-test-orchestrator
-
 %files mgr-rook
 %{_datadir}/ceph/mgr/rook
-
-%ceph_mgr_module_scripts mgr-rook
 
 %files mgr-k8sevents
 %{_datadir}/ceph/mgr/k8sevents
 
-%ceph_mgr_module_scripts mgr-k8sevents
-
 %files mgr-cephadm
 %{_datadir}/ceph/mgr/cephadm
 
-%ceph_mgr_module_scripts mgr-cephadm
-
 %files mgr-cli-api
 %{_datadir}/ceph/mgr/cli_api
-
-%ceph_mgr_module_scripts mgr-cli-api
 
 %files mon
 %{_bindir}/ceph-mon

@@ -60,6 +60,31 @@ MID_UPGRADE_MUTED_WARNINGS = [
     'AUTH_INSECURE_ROTATING_SERVICE_KEY_TYPE'
 ]
 
+# Minimum x86-64 microarchitecture level required to run the official builds
+# of a given major release. Hosts whose CPUs do not support that level will
+# crash with SIGILL when running the release's binaries, so upgrades to it
+# are blocked while any such host is present. Later majors inherit the
+# highest requirement of all earlier entries. Levels are compared against
+# the 'cpu_isa_level' host fact gathered by cephadm (e.g. 'x86-64-v2').
+UPGRADE_MIN_X86_64_ISA_LEVEL: Dict[int, int] = {
+    21: 3,  # umbrella containers/packages are built for x86-64-v3
+}
+
+
+def x86_64_isa_level_to_int(level: Optional[str]) -> Optional[int]:
+    """Parse an x86-64 microarchitecture level string (e.g. 'x86-64-v3')
+    into its numeric level; return None if missing or unparseable.
+    """
+    if not isinstance(level, str):
+        return None
+    prefix = 'x86-64-v'
+    if not level.startswith(prefix):
+        return None
+    try:
+        return int(level[len(prefix):])
+    except ValueError:
+        return None
+
 
 def normalize_image_digest(digest: str, default_registry: str) -> str:
     """
@@ -309,7 +334,8 @@ class CephadmUpgrade:
         'UPGRADE_OFFLINE_HOST',
         'UPGRADE_INVALID_CRUSH_BUCKET',
         'UPGRADE_OSD_NO_VERSION',
-        'UPGRADE_KEY_ROTATION'
+        'UPGRADE_KEY_ROTATION',
+        'UPGRADE_INCOMPATIBLE_HOST_CPU'
     ]
 
     def __init__(self, mgr: "CephadmOrchestrator"):
@@ -412,10 +438,20 @@ class CephadmUpgrade:
         # filtering parameters (or all daemons in upgrade order if no filtering
         # parameter are set).
         assert self.upgrade_state is not None
-        if self.upgrade_state.daemon_types is not None:
+        if self._upgrade_uses_ok_to_upgrade_for_osds():
+            logger.debug(
+                f'Filtering OSD daemons to upgrade in CRUSH bucket '
+                f'{self.upgrade_state.crush_bucket_type}='
+                f'{self.upgrade_state.crush_bucket_name!r}')
+            daemons = self._get_bucket_scoped_osd_daemons()
+        elif self.upgrade_state.daemon_types is not None:
+            logger.debug(
+                f'Filtering daemons to upgrade by daemon types: {self.upgrade_state.daemon_types}')
             daemons = [d for d in self.mgr.cache.get_daemons(
             ) if d.daemon_type in self.upgrade_state.daemon_types]
         elif self.upgrade_state.services is not None:
+            logger.debug(
+                f'Filtering daemons to upgrade by services: {self.upgrade_state.services}')
             daemons = []
             for service in self.upgrade_state.services:
                 daemons += self.mgr.cache.get_daemons_by_service(service)
@@ -423,8 +459,75 @@ class CephadmUpgrade:
             daemons = [d for d in self.mgr.cache.get_daemons(
             ) if d.daemon_type in CEPH_UPGRADE_ORDER]
         if self.upgrade_state.hosts is not None:
+            logger.debug(
+                f'Filtering daemons to upgrade by hosts: {self.upgrade_state.hosts}')
             daemons = [d for d in daemons if d.hostname in self.upgrade_state.hosts]
         return daemons
+
+    def _get_bucket_scoped_osd_daemons(self) -> List[DaemonDescription]:
+        assert self.upgrade_state is not None
+        bset = self._get_osds_in_crush_bucket_names()
+
+        if bset is None:
+            logger.warning(
+                'Upgrade: could not determine OSDs in CRUSH bucket %r, '
+                'returning empty daemon list',
+                self.upgrade_state.crush_bucket_name)
+            return []
+
+        if not bset:
+            logger.info(
+                'Upgrade: CRUSH bucket %r contains no OSDs',
+                self.upgrade_state.crush_bucket_name)
+            return []
+
+        return [
+            d for d in self.mgr.cache.get_daemons()
+            if d.daemon_type == 'osd' and d.name() in bset]
+
+    def _get_osds_in_crush_bucket_names(self) -> Optional[Set[str]]:
+        """
+        Return ``osd.<id>`` names for OSDs under the upgrade CRUSH bucket.
+        """
+        # Return the cached value if it exists from an earlier ok-to-upgrade batch
+        if self._ok_to_upgrade_osds_in_crush_bucket is not None:
+            return self._ok_to_upgrade_osds_in_crush_bucket
+
+        # Otherwise, refresh the cache using ok-to-upgrade with max_osds=0
+        if self._refresh_osds_in_crush_bucket_for_upgrade_status():
+            return self._ok_to_upgrade_osds_in_crush_bucket
+        return None
+
+    def _refresh_osds_in_crush_bucket_for_upgrade_status(self) -> bool:
+        """
+        Populate bucket OSD cache for upgrade status using ``osd ok-to-upgrade``
+        with max_osds=0.
+        """
+        assert self.upgrade_state is not None
+
+        if not self._upgrade_uses_ok_to_upgrade_for_osds():
+            return False
+
+        crush_bucket_name = self.upgrade_state.crush_bucket_name
+        target_version_short = self.upgrade_state.target_version
+
+        if not crush_bucket_name or not target_version_short:
+            return False
+        try:
+            ok_to_upgrade_report = request_osd_ok_to_upgrade_report(
+                self.mgr,
+                crush_bucket_name,
+                target_version_short,
+                max_osds=0,
+            )
+        except (json.JSONDecodeError, MonCommandFailed) as err:
+            logger.debug(
+                'Upgrade: could not refresh osds_in_crush_bucket for upgrade status: %s',
+                err)
+            return False
+        self._cache_osds_in_crush_bucket_from_ok_to_upgrade_report(
+            ok_to_upgrade_report)
+        return self._ok_to_upgrade_osds_in_crush_bucket is not None
 
     def _get_current_version(self) -> Tuple[int, int, str]:
         current_version = self.mgr.version.split('ceph version ')[1]
@@ -466,6 +569,50 @@ class CephadmUpgrade:
             return f'require_osd_release ({osd_min_name} or {osd_min}) < target {major} - 2; first complete an upgrade to an earlier release'
 
         return None
+
+    def check_host_cpu_isa_level(self, target_version: str,
+                                 hosts: Optional[List[str]] = None) -> List[str]:
+        """Verify host CPUs can run the binaries of the target release.
+
+        Returns one error string per host whose CPU does not support the
+        x86-64 microarchitecture level the target release's official builds
+        are compiled for. Hosts whose ISA level is unknown (no facts yet,
+        non-x86 architecture, or a pre-existing cephadm that does not gather
+        the 'cpu_isa_level' fact) are skipped. An empty list means no
+        incompatibility was detected.
+        """
+        if not self.mgr.upgrade_cpu_isa_check:
+            return []
+        try:
+            target_major = int(target_version.split('.', 1)[0])
+        except ValueError:
+            return []
+        required = max((level for major, level in UPGRADE_MIN_X86_64_ISA_LEVEL.items()
+                        if target_major >= major), default=None)
+        if required is None:
+            return []
+        errors: List[str] = []
+        for host in sorted(self.mgr.inventory.keys()):
+            if hosts is not None and host not in hosts:
+                continue
+            facts = self.mgr.cache.get_facts(host)
+            host_level = x86_64_isa_level_to_int(facts.get('cpu_isa_level'))
+            if host_level is not None and host_level < required:
+                cpu_model = facts.get('cpu_model', 'unknown CPU')
+                errors.append(
+                    f'host {host} ({cpu_model}) only supports '
+                    f'{facts.get("cpu_isa_level")}, but ceph {target_major}.x '
+                    f'requires a CPU supporting x86-64-v{required}')
+        return errors
+
+    def _host_cpu_isa_error_detail(self, errors: List[str]) -> List[str]:
+        return errors + [
+            'Running ceph on these hosts would crash with an illegal '
+            'instruction (SIGILL) error. Replace or remove the hosts before '
+            'upgrading, or, if you are using custom-built images targeting '
+            'an older CPU generation, disable this check with '
+            "'ceph config set mgr mgr/cephadm/upgrade_cpu_isa_check false'"
+        ]
 
     def upgrade_ls(self, image: Optional[str], tags: bool, show_all_versions: Optional[bool]) -> Dict:
         if not image:
@@ -631,6 +778,12 @@ class CephadmUpgrade:
             version_error = self._check_target_version(version)
             if version_error:
                 raise OrchestratorError(version_error)
+            isa_errors = self.check_host_cpu_isa_level(version, hosts=hosts)
+            if isa_errors:
+                raise OrchestratorError(
+                    'Cannot start upgrade. Found host(s) with a CPU that '
+                    f'cannot run ceph version {version}:\n'
+                    + '\n'.join(self._host_cpu_isa_error_detail(isa_errors)))
             target_name = self.mgr.container_image_base + ':v' + version
         elif image:
             target_name = normalize_image_digest(image, self.mgr.default_registry)
@@ -941,6 +1094,10 @@ class CephadmUpgrade:
     def _cache_osds_in_crush_bucket_from_ok_to_upgrade_report(
             self, report: OkToUpgradeMonReport) -> None:
         ids = report.osds_in_crush_bucket
+        if not ids:
+            # set empty set to indicate no OSDs in CRUSH bucket
+            self._ok_to_upgrade_osds_in_crush_bucket = set()
+            return
         self._ok_to_upgrade_osds_in_crush_bucket = {
             f'osd.{osd_id}' for osd_id in ids
         }
@@ -2152,29 +2309,26 @@ class CephadmUpgrade:
             })
             return
 
+        isa_errors = self.check_host_cpu_isa_level(
+            target_version, hosts=self.upgrade_state.hosts)
+        if isa_errors:
+            self._fail_upgrade('UPGRADE_INCOMPATIBLE_HOST_CPU', {
+                'severity': 'error',
+                'summary': f'Upgrade: {len(isa_errors)} host(s) have a CPU '
+                           f'that cannot run ceph version {target_version}',
+                'count': len(isa_errors),
+                'detail': self._host_cpu_isa_error_detail(isa_errors),
+            })
+            return
+
         image_settings = self.get_distinct_container_image_settings()
 
-        if self.upgrade_state.daemon_types is not None:
-            logger.debug(
-                f'Filtering daemons to upgrade by daemon types: {self.upgrade_state.daemon_types}')
-            daemons = [d for d in self.mgr.cache.get_daemons(
-            ) if d.daemon_type in self.upgrade_state.daemon_types]
-        elif self.upgrade_state.services is not None:
-            logger.debug(
-                f'Filtering daemons to upgrade by services: {self.upgrade_state.daemon_types}')
-            daemons = []
-            for service in self.upgrade_state.services:
-                daemons += self.mgr.cache.get_daemons_by_service(service)
-        else:
-            daemons = [d for d in self.mgr.cache.get_daemons(
-            ) if d.daemon_type in CEPH_UPGRADE_ORDER]
-        if self.upgrade_state.hosts is not None:
-            logger.debug(f'Filtering daemons to upgrade by hosts: {self.upgrade_state.hosts}')
-            daemons = [d for d in daemons if d.hostname in self.upgrade_state.hosts]
         if not self.upgrade_state.health_warnings_muted:
             self._mute_upgrade_related_health_warnings()
             self.upgrade_state.health_warnings_muted = True
             self._save_upgrade_state()
+        daemons = self._get_filtered_daemons()
+
         upgraded_daemon_count: int = 0
         for daemon_type in CEPH_UPGRADE_ORDER:
             if self.upgrade_state.remaining_count is not None and self.upgrade_state.remaining_count <= 0:
@@ -2229,10 +2383,15 @@ class CephadmUpgrade:
                     _, n1, n2, __ = self._detect_need_upgrade(ceph_daemons, target_digests, target_image)
                     if not n1 and not n2:
                         # no ceph daemons need upgrade
+                        need_upgrade_names = [d[0].name() for d in need_upgrade] + \
+                            [d[0].name() for d in need_upgrade_deployer]
                         dds = [d for d in self.mgr.cache.get_daemons_by_type(
                             daemon_type) if d.name() not in need_upgrade_names]
                         _, ___, n2, ____ = self._detect_need_upgrade(dds, target_digests, target_image)
                         need_upgrade_deployer += n2
+                    else:
+                        # don't upgrade if ceph image daemons are not yet fully upgraded.
+                        need_upgrade_deployer = []
 
             if any(d in target_digests for d in self.mgr.get_active_mgr_digests()):
                 # only after the mgr itself is upgraded can we expect daemons to have

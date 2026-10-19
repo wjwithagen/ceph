@@ -103,6 +103,20 @@ def simplified_keyring(entity: str, contents: str) -> str:
     return keyring
 
 
+def _get_dashboard_server_addr(svc: 'CephadmService', daemon_id: str, hostname: str) -> str:
+    """Get the address where the dashboard listens for a given mgr daemon.
+
+    Reads the dashboard module's server_addr config (per-daemon first, then
+    global fallback via the localized option lookup). If the address is a
+    wildcard (``::`` or ``0.0.0.0``) or not configured, returns the host's
+    FQDN from the cephadm inventory.
+    """
+    server_addr = svc.mgr._ceph_get_module_option('dashboard', 'server_addr', daemon_id)
+    if server_addr and str(server_addr) not in ('::', '0.0.0.0'):
+        return str(server_addr)
+    return svc.mgr.get_fqdn(hostname)
+
+
 def get_dashboard_endpoints(svc: 'CephadmService') -> Tuple[List[str], Optional[str]]:
     dashboard_endpoints: List[str] = []
     port = None
@@ -113,14 +127,12 @@ def get_dashboard_endpoints(svc: 'CephadmService') -> Tuple[List[str], Optional[
         p_result = urlparse(url.rstrip('/'))
         protocol = p_result.scheme
         port = p_result.port
-        # assume that they are all dashboards on the same port as the active mgr.
         for dd in svc.mgr.cache.get_daemons_by_service('mgr'):
             if not port:
                 continue
             assert dd.hostname is not None
-            # fqdn may already be a name or numeric address; ensure IPv6
-            # literals are bracketed.
-            addr = svc.mgr.get_fqdn(dd.hostname)
+            assert dd.daemon_id is not None
+            addr = _get_dashboard_server_addr(svc, dd.daemon_id, dd.hostname)
             dashboard_endpoints.append(f'{wrap_ipv6(addr)}:{port}')
 
     return dashboard_endpoints, protocol
@@ -135,7 +147,11 @@ def get_dashboard_urls(svc: 'CephadmService') -> List[str]:
     url = mgr_map.get('services', {}).get('dashboard', None)
     if url:
         p_result = urlparse(url.rstrip('/'))
-        hostname = socket.getfqdn(p_result.hostname)
+        server_addr = svc.mgr._ceph_get_module_option('dashboard', 'server_addr', svc.mgr.get_mgr_id())
+        if server_addr and str(server_addr) not in ('::', '0.0.0.0'):
+            hostname = str(server_addr)
+        else:
+            hostname = socket.getfqdn(p_result.hostname)
         try:
             ip = ipaddress.ip_address(hostname)
         except ValueError:
@@ -154,7 +170,8 @@ def get_dashboard_urls(svc: 'CephadmService') -> List[str]:
         if dd.daemon_id == svc.mgr.get_mgr_id():
             continue
         assert dd.hostname is not None
-        addr = svc.mgr.get_fqdn(dd.hostname)
+        assert dd.daemon_id is not None
+        addr = _get_dashboard_server_addr(svc, dd.daemon_id, dd.hostname)
         dashboard_urls.append(build_url(scheme=proto, host=addr, port=port).rstrip('/'))
 
     return dashboard_urls
@@ -1546,6 +1563,27 @@ class RgwService(CephService):
     def allow_colo(self) -> bool:
         return True
 
+    def choose_next_action(
+        self,
+        scheduled_action: utils.Action,
+        daemon_type: Optional[str],
+        spec: Optional[ServiceSpec],
+        curr_deps: List[str],
+        last_deps: List[str],
+        daemon: Optional[DaemonDescription] = None,
+    ) -> utils.NextDaemonStep:
+        step = super().choose_next_action(
+            scheduled_action, daemon_type, spec, curr_deps, last_deps
+        )
+        # Only REDEPLOY when frontend config changed, as rgw_frontends
+        # can't be updated at runtime other changes like ssl
+        # certs can be applied via reconfig without a restart.
+        if step.action is utils.Action.RECONFIG:
+            changed = set(curr_deps).symmetric_difference(last_deps)
+            if any(d.startswith('frontend:') for d in changed):
+                return utils.NextDaemonStep(utils.Action.REDEPLOY)
+        return step
+
     @classmethod
     def _get_service_dependencies(
         cls,
@@ -1563,6 +1601,17 @@ class RgwService(CephService):
             if isinstance(ssl_cert, list):
                 ssl_cert = '\n'.join(ssl_cert)
             deps.append(f'ssl-cert:{utils.config_hash(ssl_cert)}')
+
+        if rgw_spec:
+            frontend_parts = []
+            if rgw_spec.rgw_frontend_type:
+                frontend_parts.append(f'type={rgw_spec.rgw_frontend_type}')
+            if rgw_spec.rgw_frontend_extra_args:
+                frontend_parts.append(
+                    f'extra_args={sorted(rgw_spec.rgw_frontend_extra_args)}')
+            allow_reuse = getattr(rgw_spec, 'allow_port_reuse', False)
+            frontend_parts.append(f'allow_port_reuse={allow_reuse}')
+            deps.append(f'frontend:{utils.config_hash(str(sorted(frontend_parts)))}')
 
         return sorted(deps)
 
@@ -2356,6 +2405,7 @@ def next_action_for_mgmt_stack_service(
         'node-exporter',
         'alertmanager',
         'ceph-exporter',
+        'pushgateway',
     ]
     REDEPLOY_TRIGGERS = ['secure_monitoring_stack', 'mgmt-gateway']
     # [from: JJM, to: Redo] in different commits you added calls to

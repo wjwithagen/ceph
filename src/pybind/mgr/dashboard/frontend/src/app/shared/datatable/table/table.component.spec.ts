@@ -858,6 +858,22 @@ describe('TableComponent', () => {
     });
   });
 
+  describe('column toggle button', () => {
+    const getColumnToggleButton = () =>
+      fixture.debugElement.query(By.css('[data-testid="column-toggle-button"]'));
+
+    it('should show the column toggle button by default', () => {
+      expect(component.showColumnToggle).toBe(true);
+      expect(getColumnToggleButton()).not.toBeNull();
+    });
+
+    it('should hide the column toggle button when showColumnToggle is false', () => {
+      fixture.componentRef.setInput('showColumnToggle', false);
+      fixture.detectChanges();
+      expect(getColumnToggleButton()).toBeNull();
+    });
+  });
+
   describe('useCustomClass', () => {
     beforeEach(() => {
       component.customCss = {
@@ -870,7 +886,7 @@ describe('TableComponent', () => {
 
     it('should throw an error if custom classes are not set', () => {
       component.customCss = undefined;
-      expect(() => component.useCustomClass('active')).toThrowError('Custom classes are not set!');
+      expect(() => component.useCustomClass('active')).toThrow('Custom classes are not set!');
     });
 
     it('should not return any class', () => {

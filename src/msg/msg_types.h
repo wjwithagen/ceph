@@ -503,11 +503,7 @@ struct entity_addr_t {
       }
 #endif
       encode(ss_family, bl);
-      elen -= sizeof(u.sa.sa_family);
-#if defined(__FreeBSD__) || defined(__APPLE__)
-      elen -= sizeof(u.sa.sa_len);
-#endif
-      bl.append(u.sa.sa_data, elen);
+      bl.append(u.sa.sa_data, elen - offsetof(struct sockaddr, sa_data));
     }
     ENCODE_FINISH(bl);
   }
@@ -542,7 +538,7 @@ struct entity_addr_t {
 #endif
       u.sa.sa_family = ss_family;
       elen -= sizeof(ss_family);
-      if (elen > get_sockaddr_len() - sizeof(u.sa.sa_family)) {
+      if (elen > get_sockaddr_len() - offsetof(struct sockaddr, sa_data)) {
 	throw ceph::buffer::malformed_input("elen exceeds sockaddr len");
       }
       bl.copy(elen, u.sa.sa_data);

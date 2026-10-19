@@ -2496,7 +2496,7 @@ do_punch_hole(unsigned offset, unsigned length)
 		return;
 	}
 
-	if (file_size <= (loff_t)offset) {
+	if (file_size <= (off_t)offset) {
 		if (!quiet && testcalls > simulatedopcount)
 			prt("skipping hole punch off the end of the file\n");
 		log4(OP_SKIPPED, OP_PUNCH_HOLE, offset, length);

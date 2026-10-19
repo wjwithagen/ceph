@@ -108,11 +108,12 @@ int main(int argc, char *argv[])
   DoutPrefix dp(cct.get(), dout_subsys, "rgw main: ");
   rgw::AppMain main(&dp);
 
-#if defined(HAVE_KEYUTIL)
+#if defined(__linux__)
+  // defined in keyring.cc under the same guard
   LinuxKeyringSecret::initialize_process_keyring();
 #else
-    // Log een waarschuwing dat deze feature wordt overgeslagen op dit platform
-    generic_dout(0) << "De Linux kernel keyring wordt niet ondersteund op dit platform." << dendl;
+  ldpp_dout(&dp, 0) << "the Linux kernel keyring is not available on this "
+		    << "platform, so the SSE-KMS key cache is disabled" << dendl;
 #endif
 
   main.init_frontends1(rgw::InstanceType::Daemon, rgw::ProtocolType::HTTP_S3);

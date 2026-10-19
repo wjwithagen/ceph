@@ -85,6 +85,7 @@ using namespace std::literals::string_view_literals;
 #include "messages/MFSMapUser.h"
 #include "messages/MMDSMap.h"
 #include "messages/MOSDMap.h"
+#include "messages/MQuarantineDisable.h"
 
 #include "mds/flock.h"
 #include "mds/fscrypt.h"
@@ -123,6 +124,8 @@ using namespace std::literals::string_view_literals;
 #include "include/stat.h"
 
 #include "include/cephfs/ceph_ll_client.h"
+
+#include "auth/KeyRing.h"
 
 #if HAVE_GETGROUPLIST
 #include <grp.h>
@@ -1347,6 +1350,10 @@ bool Client::_wrap_name(Inode& diri, std::string& dname, std::string& alternate_
   ceph_assert(dname.size() > 0);
   alternate_name = "";
 
+  if (dname.size() > NAME_MAX) {
+    return -ENAMETOOLONG;
+  }
+
   if (dname == cct->_conf->client_snapdir) {
     ldout(cct, 25) << __func__ << ": is special name" << dendl;
     return true;
@@ -1450,6 +1457,10 @@ bool Client::_wrap_name(Inode& diri, std::string& dname, std::string& alternate_
     }
   }
 #endif
+
+  if (dname.size() > NAME_MAX) {
+    return -ENAMETOOLONG;
+  }
 
   return true;
 }
@@ -3286,6 +3297,9 @@ Dispatcher::dispatch_result_t Client::ms_dispatch2(const MessageRef &m)
   case CEPH_MSG_CLIENT_QUOTA:
     handle_quota(ref_cast<MClientQuota>(m));
     break;
+  case CEPH_MSG_CLIENT_QUARANTINE_DISABLE:
+    handle_quarantine_disable(ref_cast<MQuarantineDisable>(m));
+    break;
 
   default:
     return Dispatcher::UNHANDLED();
@@ -4058,7 +4072,7 @@ int Client::get_caps(Fh *fh, int need, int want, int *phave, loff_t endoff)
 	  return 0;
 	}
       }
-      ldout(cct, 10) << "waiting for caps " << *in << " need " << ccap_string(need) << " want " << ccap_string(want) << dendl;
+      ldout(cct, 10) << "waiting for caps " << *in << " have " << ccap_string(have) << " need " << ccap_string(need) << " want " << ccap_string(want) << dendl;
       waitfor_caps = true;
     }
 
@@ -4072,9 +4086,12 @@ int Client::get_caps(Fh *fh, int need, int want, int *phave, loff_t endoff)
       return -EROFS;
 
     if (in->flags & I_CAP_DROPPED) {
+      ldout(cct, 10) << "  I_CAP_DROPPED" << dendl;
       int mds_wanted = in->caps_mds_wanted();
       if ((mds_wanted & need) != need) {
+        ldout(cct, 10) << "  renewing caps" << dendl;
 	int ret = _renew_caps(in);
+        ldout(cct, 10) << "  renew caps returned " << ret << dendl;
 	if (ret < 0)
 	  return ret;
 	continue;
@@ -4083,10 +4100,13 @@ int Client::get_caps(Fh *fh, int need, int want, int *phave, loff_t endoff)
 	in->flags &= ~I_CAP_DROPPED;
     }
 
-    if (waitfor_caps)
+    if (waitfor_caps) {
+      ldout(cct, 10) << "  waitfor_caps" << dendl;
       wait_on_context_list(in->waitfor_caps);
-    else if (waitfor_commit)
+    } else if (waitfor_commit) {
+      ldout(cct, 10) << "  waitfor_commit" << dendl;
       wait_on_context_list(in->waitfor_commit);
+    }
   }
 }
 
@@ -5706,6 +5726,21 @@ void Client::handle_quota(const MConstRef<MClientQuota>& m)
   }
 }
 
+void Client::handle_quarantine_disable(const MConstRef<MQuarantineDisable>& m)
+{
+  std::scoped_lock cl(client_lock);
+  vinodeno_t vino(m->ino, CEPH_NOSNAP);
+  if (auto it = inode_map.find(vino); it != inode_map.end()) {
+    ldout(cct, 20) << __func__ << " disabling quarantine for inode " << m->ino << dendl;
+    Inode *in = it->second;
+    in->qtine_errno = 0;
+    in->del_quarantine();
+    signal_caps_inode(in);
+  } else {
+    ldout(cct, 20) << __func__ << " inode " << m->ino << " not found; skipping quarantine disable" << dendl;
+  }
+}
+
 void Client::handle_caps(const MConstRef<MClientCaps>& m)
 {
   mds_rank_t mds = mds_rank_t(m->get_source().num());
@@ -6199,6 +6234,11 @@ void Client::handle_cap_grant(MetaSession *session, Inode *in, Cap *cap, const M
     check = true;
   }
 
+  if (new_caps != CEPH_CAP_PIN && in->is_under_quarantine()) {
+    if (m->oserrno == 0) {
+      in->del_quarantine();
+    }
+  }
 
   // update caps
   auto revoked = cap->issued & ~new_caps;
@@ -6206,6 +6246,10 @@ void Client::handle_cap_grant(MetaSession *session, Inode *in, Cap *cap, const M
     ldout(cct, 10) << "  revocation of " << ccap_string(revoked) << dendl;
     cap->issued = new_caps;
     cap->implemented |= new_caps;
+
+    if (m->oserrno == -EQUARANTINED) {
+      in->set_quarantine();
+    }
 
     // recall delegations if we're losing caps necessary for them
     if (revoked & ceph_deleg_caps_for_type(CEPH_DELEGATION_RD))
@@ -6258,7 +6302,8 @@ void Client::handle_cap_grant(MetaSession *session, Inode *in, Cap *cap, const M
     check_caps(in, flags);
 
   // wake up waiters
-  if (new_caps) {
+  if (new_caps || in->is_under_quarantine()) {
+    in->qtine_errno = m->get_errno();
     ldout(cct, 10) << __func__ << " calling signal_caps_inode" << dendl;
     signal_caps_inode(in);
   }
@@ -8042,11 +8087,6 @@ int Client::path_walk(InodeRef dirinode, const filepath& origpath,
       caps = CEPH_CAP_AUTH_SHARED;
     }
 
-    if (dname.size() > NAME_MAX) {
-      rc = -ENAMETOOLONG;
-      goto out;
-    }
-
     // N.B.: we don't validate alternate_name we generate during wrapping
     // matches the dentry. We probably should!
     if (!_wrap_name(*diri, dname, alternate_name)) {
@@ -8470,8 +8510,9 @@ bool Client::make_absolute_path_string(const InodeRef& in, std::string& path)
     return false;
   }
 
-  // Make sure this function returns path with single leading '/'
-  if (path.length() && path[0] == '/' && path[1] == '/')
+  // Joining mount_root "/" with a relative inode path produces "//...".
+  // Normalize that case without touching the plain root path "/".
+  if (path.size() > 1 && path[0] == '/' && path[1] == '/')
     path = path.substr(1);
 
   return true;
@@ -10001,8 +10042,12 @@ int Client::_readdir_cache_cb(dir_result_t *dirp, add_dirent_cb_t cb, void *p,
       mask |= CEPH_STAT_RSTAT;
     }
     int r = _getattr(dn->inode, mask, dirp->perms);
-    if (r < 0)
+    if (r == -EACCES && dn->inode->is_under_quarantine()) {
+      ldout(cct, 10) << __func__ << " quarantined entry '"
+		     << dn->name << "', using cached stat" << dendl;
+    } else if (r < 0) {
       return r;
+    }
 
     /* fix https://tracker.ceph.com/issues/56288 */
     if (dirp->inode->dir == NULL) {
@@ -10256,8 +10301,12 @@ int Client::_readdir_r_cb(int op,
           mask |= rstat_on_dir;
 	}
 	r = _getattr(entry.inode, mask, dirp->perms);
-	if (r < 0)
+	if (r == -EACCES && entry.inode->is_under_quarantine()) {
+	  ldout(cct, 10) << __func__ << " quarantined entry "
+			 << entry.name << ", using cached stat" << dendl;
+	} else if (r < 0) {
 	  return r;
+	}
       }
 
       fill_statx(entry.inode, caps, &stx);

@@ -706,9 +706,8 @@ TEST_F(BlockDirectoryFixture, ZScan)
       conn->async_exec(req, resp, yield[ec]);
       ASSERT_EQ((bool)ec, false);
 
-      std::vector<boost::redis::resp3::basic_node<std::string > > root_array;
       if (resp.has_value()) {
-        root_array = resp.value();
+        const auto root_array = resp.value();
         std::cout << "ZADD aggregate size is: " << root_array.size() << std::endl;
         auto size = root_array.size();
         if (size >= 2) {

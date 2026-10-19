@@ -2446,18 +2446,38 @@ void Objecter::op_submit(Op *op, ceph_tid_t *ptid, int *ctx_budget)
 // Register the op timeout noted by _op_submit_with_budget().  Must be called
 // with the op's session lock held and op->tid assigned: op_cancel() finds the
 // op by tid through the session, and the session lock keeps the reply handler
-// from retiring the op while we are still touching it.  An op that is
-// resubmitted (redirect, -EAGAIN) keeps the event armed on its first pass.
+// from retiring the op while we are still touching it.
+//
+// The pending event names its target op by tid, and the resubmission paths in
+// handle_osd_op_reply() (tiering redirect, -EAGAIN redrive) deliberately clear
+// op->tid so that the op is re-sent with a fresh one.  Left alone, the event
+// would fire on a tid that op_cancel() can no longer find, and the op would
+// silently lose its deadline.  So re-point it at the current tid.  The deadline
+// itself is absolute, so this is a re-target, not a restart: the timeout stays
+// per op rather than per attempt.  Ops that are resubmitted keeping their tid
+// (retry_writes_after_first_reply, the split-read redrive) fall out here
+// without touching the timer.
 void Objecter::_maybe_arm_op_timeout(Op *op)
 {
-  if (!op->timeout_deadline || op->ontimeout != 0)
+  if (!op->timeout_deadline || op->tid == op->timeout_tid)
     return;
+
+  if (op->ontimeout != 0)
+    timer.cancel_event(op->ontimeout);	// stale: armed for a previous tid
 
   const auto tid = op->tid;
   ceph_assert(tid != 0);
+  op->timeout_tid = tid;
   op->ontimeout = timer.add_event(*op->timeout_deadline,
 				  [this, tid]() {
 				    op_cancel(tid, -ETIMEDOUT); });
+}
+
+void Objecter::_take_inflight_slot(Op *op)
+{
+  inflight_ops++;
+  logger->inc(l_osdc_op_active);
+  op->inflight_accounted = true;
 }
 
 void Objecter::add_op_to_splitop_session(Op *op) {
@@ -2467,7 +2487,7 @@ void Objecter::add_op_to_splitop_session(Op *op) {
   }
   _session_op_assign(splitop_session, op);
   _maybe_arm_op_timeout(op);
-  inflight_ops++;
+  _take_inflight_slot(op);
   sl.unlock();
 }
 
@@ -2516,7 +2536,7 @@ void Objecter::_op_submit_with_budget(Op *op,
 
 void Objecter::_send_op_account(Op *op)
 {
-  inflight_ops++;
+  _take_inflight_slot(op);
 
   // add to gather set(s)
   if (op->has_completion()) {
@@ -2529,7 +2549,6 @@ void Objecter::_send_op_account(Op *op)
     logger->inc(l_osdc_replica_read_sent);
   }
 
-  logger->inc(l_osdc_op_active);
   logger->inc(l_osdc_op);
   logger->inc(l_osdc_oplen_avg, op->ops.size());
 
@@ -2635,6 +2654,7 @@ void Objecter::_op_submit(Op *op, shunique_lock<ceph::shared_mutex>& sul, ceph_t
         op->complete(make_error_code(osdc_errc::pool_eio), -EIO,
                      service.get_executor());
       }
+      _finish_unsent_op(op);
       return;
     }
   }
@@ -3582,6 +3602,30 @@ void Objecter::_finish_op(Op *op, int r)
 
   ceph_assert(inflight_ops > 0);
   inflight_ops--;
+
+  op->put();
+}
+
+void Objecter::_finish_unsent_op(Op *op)
+{
+  // rwlock is locked
+  ldout(cct, 15) << __func__ << " " << op << dendl;
+  ceph_assert(op->session == nullptr);
+
+  if (!op->ctx_budgeted && op->budget >= 0) {
+    put_op_budget_bytes(op->budget);
+    op->budget = -1;
+  }
+
+  if (op->ontimeout) {
+    timer.cancel_event(op->ontimeout);
+    op->ontimeout = 0;
+  }
+
+  if (op->inflight_accounted) {
+    logger->dec(l_osdc_op_active);
+    inflight_ops--;
+  }
 
   op->put();
 }

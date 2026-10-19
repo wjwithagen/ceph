@@ -509,7 +509,6 @@ int log_record(rgw::sal::Driver* driver,
   }
   input.http_ret = s->err.http_ret;
   input.err_code = s->err.err_code;
-  input.content_length = s->content_length;
   input.granted_by_acl = s->granted_by_acl;
   input.src_object = s->src_object.get();
   input.src_bucket_name = s->src_bucket_name;
@@ -579,7 +578,7 @@ int log_record(rgw::sal::Driver* driver,
   RGWObjVersionTracker objv_tracker;
   ret = target_bucket->get_logging_object_name(obj_name, conf.target_prefix, y, dpp, &objv_tracker);
   if (ret == 0) {
-    const ceph::coarse_real_time time_to_commit = time_from_name(obj_name, dpp) + std::chrono::seconds(conf.obj_roll_time);
+    const auto time_to_commit = time_from_name(obj_name, dpp) + ceph::timespan{std::chrono::seconds{conf.obj_roll_time}};
     if (ceph::coarse_real_time::clock::now() > time_to_commit) {
       ldpp_dout(dpp, 20) << "INFO: logging object '" << obj_name << "' exceeded its time, will be committed to logging bucket '" <<
         target_bucket_id << "'" << dendl;
@@ -649,7 +648,7 @@ int log_record(rgw::sal::Driver* driver,
         input.request_params,
         dash_if_zero(input.http_ret),
         dash_if_empty(input.err_code),
-        dash_if_zero(input.content_length),
+        "-", // not supported - bytes sent as response.
         dash_if_zero(size),
         "-", // no total time when logging record
         input.time_elapsed,

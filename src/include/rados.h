@@ -267,7 +267,10 @@ extern const char *ceph_osd_state_name(int s);
 									    \
 	f(LIST_SNAPS,	__CEPH_OSD_OP(RD, DATA, 10),	"list-snaps")	    \
 										\
+	/* deprecated: use GET_INTERNAL_VERSIONS_V2 instead */ \
 	f(GET_INTERNAL_VERSIONS, __CEPH_OSD_OP(RD, DATA, 33), "get-internal-versions") \
+                                                                            \
+	f(GET_INTERNAL_VERSIONS_V2, __CEPH_OSD_OP(RD, DATA, 34), "get-internal-versions-v2") \
 										\
 	/* sync */							    \
 	f(SYNC_READ,	__CEPH_OSD_OP(RD, DATA, 11),	"sync_read")	    \
@@ -512,6 +515,7 @@ enum {
 #define EOLDSNAPC    85  /* ORDERSNAP flag set; writer has old snapc*/
 #define EBLOCKLISTED 108 /* blocklisted */
 #define EBLACKLISTED 108 /* deprecated */
+#define EQUARANTINED 1000
 
 /* xattr comparison */
 enum {
