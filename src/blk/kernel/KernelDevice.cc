@@ -381,13 +381,6 @@ int KernelDevice::refresh_size()
     new_size = st.st_size;
   }
 
-  // Fallback to configuration if size detection returned 0 on any platform
-  if (new_size == 0) {
-    new_size = g_conf().get_val<uint64_t>("bluestore_block_size");
-    derr << __func__ << " size detection returned 0, falling back to "
-         << "bluestore_block_size " << new_size << dendl;
-  }
-
   // round size down to an even block
   size = p2align(new_size, int64_t(block_size));
   if (size <= 0) {
@@ -396,7 +389,6 @@ int KernelDevice::refresh_size()
     return -EINVAL;
   }
   return 0;
-
 }
 
 void KernelDevice::close()
