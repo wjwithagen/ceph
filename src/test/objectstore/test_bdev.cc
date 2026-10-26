@@ -133,10 +133,10 @@ TEST(KernelDevice, PosixAioSingleBufferCompletion) {
 }
 
 TEST(KernelDevice, PosixAioMultiIovecCompletion) {
-  // Multiple discrete bufferlist segments -> multiple iovecs -> the
-  // lio_listio()/n_aiocb > 1 completion path this PR's EV_ONESHOT fix
-  // targets. Segments are appended separately (not rebuilt into one
-  // contiguous buffer) specifically to force that path.
+  // A write made of several separate page-aligned segments must be
+  // submitted as a single aio_t whose iovec array has one entry per
+  // segment. The segments are page-aligned so aio_write() does not
+  // rebuild them into one contiguous buffer.
   uint64_t size = 1048576ull * 16;
   TempBdev bdev{ size };
   const bool buffered = false;
@@ -150,19 +150,17 @@ TEST(KernelDevice, PosixAioMultiIovecCompletion) {
   const size_t seglen = 4096;
   bufferlist wbl;
   for (int i = 0; i < nseg; i++) {
-    string s(seglen, 'a' + i);
-    wbl.append(s);
+    bufferptr p = buffer::create_small_page_aligned(seglen);
+    memset(p.c_str(), 'a' + i, seglen);
+    wbl.append(std::move(p));
   }
-  ASSERT_GT(wbl.get_num_buffers(), 1u)
-    << "test needs a genuinely multi-segment bufferlist to exercise "
-       "the lio_listio() path -- got a single contiguous segment instead";
 
   std::unique_ptr<IOContext> wioc(new IOContext(g_ceph_context, NULL));
   ASSERT_EQ(b->aio_write(0, wbl, wioc.get(), buffered), 0);
-  if (wioc->has_pending_aios()) {
-    b->aio_submit(wioc.get());
-    wioc->aio_wait();
-  }
+  ASSERT_EQ(wioc->pending_aios.size(), 1u);
+  ASSERT_EQ(wioc->pending_aios.front().iov.size(), (size_t)nseg);
+  b->aio_submit(wioc.get());
+  wioc->aio_wait();
 
   bufferlist rbl;
   std::unique_ptr<IOContext> rioc(new IOContext(g_ceph_context, NULL));
