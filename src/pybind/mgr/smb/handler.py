@@ -17,6 +17,7 @@ import contextlib
 import dataclasses
 import fnmatch
 import logging
+import threading
 import time
 
 import ceph.smb.constants
@@ -29,6 +30,7 @@ from ceph.fs.earmarking import EarmarkTopScope
 
 from . import config_store, external, resources, rgw
 from .enums import (
+    ACLSupportPolicy,
     AuthMode,
     CephFSStorageProvider,
     HostAccess,
@@ -66,6 +68,7 @@ from .resources import SMBResource
 from .results import ErrorResult, ResourceResult, Result, ResultGroup
 from .rgw_auth import RGWAuthorizer
 from .staging import (
+    CrossCheckToolbox,
     Staging,
     auth_refs,
     cross_check_resource,
@@ -73,6 +76,7 @@ from .staging import (
     rgw_credential_refs,
     tls_refs,
     ug_refs,
+    warn_availability,
 )
 from .utils import checked, ynbool
 
@@ -84,6 +88,7 @@ _CLUSTERED = 'clustered'
 _CEPHFS_PROXY = 'cephfs-proxy'
 _REMOTE_CONTROL = 'remote-control'
 _KEYBRIDGE = 'keybridge'
+_ACL_XATTR = 'acl_xattr'
 log = logging.getLogger(__name__)
 
 
@@ -123,6 +128,8 @@ class ClusterChangeGroup:
 class _FakePathResolver:
     """A stub PathResolver for unit testing."""
 
+    _result_resolve_case_sensitivity = (False, False)
+
     def resolve(
         self, volume: str, subvolumegroup: str, subvolume: str, path: str
     ) -> str:
@@ -143,6 +150,11 @@ class _FakePathResolver:
         return f'/{path}'
 
     resolve_exists = resolve
+
+    def resolve_case_sensitivity(
+        self, volume: str, subvolumegroup: str, subvolume: str, path: str
+    ) -> Tuple[bool, bool]:
+        return self._result_resolve_case_sensitivity
 
 
 class ExoResolver:
@@ -354,6 +366,7 @@ class ClusterConfigHandler:
             earmark_resolver = cast(EarmarkResolver, _FakeEarmarkResolver())
         self._earmark_resolver = earmark_resolver
         self._tool_execer = tool_execer
+        self._apply_lock = threading.Lock()
         log.info(
             'Initialized new ClusterConfigHandler with'
             f' internal store {self.internal_store!r},'
@@ -371,6 +384,13 @@ class ClusterConfigHandler:
         """Apply resource configuration changes.
         Set `create_only` to disable changing existing resource values.
         """
+        # mgr.remote() callers (e.g. dashboard) bypass the command finisher.
+        with self._apply_lock:
+            return self._apply(inputs, create_only=create_only)
+
+    def _apply(
+        self, inputs: Iterable[SMBResource], *, create_only: bool = False
+    ) -> ResultGroup:
         log.debug('applying changes to internal data store')
         results = ResultGroup()
         staging = Staging(self.internal_store, self._tool_execer)
@@ -385,8 +405,21 @@ class ClusterConfigHandler:
                             resource, staging, create_only=create_only
                         )
                     )
+                if results.success:
+                    for err in staging.check_availability_transitions(
+                        self.public_store
+                    ):
+                        results.replace(err)
+                if results.success:
+                    for resource_result in results.resources():
+                        warn_availability(
+                            resource_result.src, staging, resource_result
+                        )
+                    staging.warn_availability_transitions(
+                        self.public_store, results
+                    )
         except ErrorResult as err:
-            results.append(err)
+            results.replace(err)
         except Exception as err:
             log.exception("error updating resource")
             msg = str(err)
@@ -394,14 +427,16 @@ class ClusterConfigHandler:
                 # handle the case where the exception has no text
                 msg = f"error updating resource: {type(err)} (see logs for details)"
             result = ErrorResult(resource, msg=msg)
-            results.append(result)
+            results.replace(result)
         if results.success:
             log.debug(
                 'successfully updated %s resources. syncing changes to public stores',
                 len(list(results)),
             )
             with _store_transaction(staging.destination_store):
-                results = staging.save()
+                db_results = staging.save()
+                db_results.merge(results)
+                results = db_results
                 staging.prune_linked_entries()
             _reconcile_store(staging.destination_store)
             with _store_transaction(staging.destination_store):
@@ -496,18 +531,21 @@ class ClusterConfigHandler:
             earmark_resolver = self._choose_earmark_resolver(
                 resource, staging
             )
+            pending_result = ResourceResult.pending(resource)
             cross_check_resource(
                 resource,
                 staging,
-                path_resolver=path_resolver,
-                earmark_resolver=earmark_resolver,
+                toolbox=CrossCheckToolbox(
+                    path_resolver=path_resolver,
+                    earmark_resolver=earmark_resolver,
+                    recorder=pending_result,
+                ),
             )
         except ErrorResult as err:
             log.debug('rejected resource: %r', resource)
             return err
         log.debug('checked resource: %r', resource)
-        result = ResourceResult.checked(resource)
-        return result
+        return ResourceResult.checked_from_result(pending_result)
 
     def _choose_path_resolver(
         self, resource: SMBResource, staging: Staging
@@ -539,7 +577,6 @@ class ClusterConfigHandler:
         """Trigger synchronization for all the clusters listed in
         `modified_cluster_ids` or all clusters if None.
         """
-        share_ids = self.share_ids()
         present_cluster_ids = set()
         removed_cluster_ids = set()
         change_groups = []
@@ -559,11 +596,11 @@ class ClusterConfigHandler:
                 removed_cluster_ids.add(cluster_id)
                 continue
             present_cluster_ids.add(cluster_id)
-            cluster_shares = [
-                self._share_entry(cid, shid).get_share()
-                for cid, shid in share_ids
-                if cid == cluster_id
-            ]
+            cluster_shares = list(
+                ShareEntry.get_cluster_shares(
+                    self.internal_store, cluster_id
+                ).values()
+            )
             change_group = ClusterChangeGroup(
                 cluster,
                 cluster_shares,
@@ -611,6 +648,25 @@ class ClusterConfigHandler:
             self._remove_cluster(cluster_id)
 
     def _sync_modified(self, updated: ResultGroup) -> None:
+        # Only new clusters start as not yet orchestrated.
+        for result in updated.resources():
+            if (
+                isinstance(result.src, resources.Cluster)
+                and (result.status or {}).get('state') == State.CREATED
+            ):
+                cluster_id = result.src.cluster_id
+                entry = self.public_store[
+                    external.cluster_placeholder_key(cluster_id)
+                ]
+                if (
+                    not entry.exists()
+                    and not self.public_store[
+                        external.spec_backup_key(cluster_id)
+                    ].exists()
+                ):
+                    entry.set(
+                        {'cluster_id': cluster_id, 'orch_submitted': False}
+                    )
         cluster_ids = self._find_modifications(updated)
         self._sync_clusters(cluster_ids)
 
@@ -782,7 +838,10 @@ class ClusterConfigHandler:
         # keys directly in each export definition block while samba needs the
         # ceph keyring to load keys.
         # For RGW shares, we don't need CephFS volumes but still need orchestration.
-        previous_orch = previous_info.get('orch_needed', False)
+        # orch_submitted keeps clusters without shares orchestrated.
+        previous_orch = previous_info.get(
+            'orch_needed', False
+        ) or previous_info.get('orch_submitted', False)
         if self._orch and (vols or rgw_buckets or previous_orch):
             log.debug(
                 'Submitting SMB service spec for cluster %s: '
@@ -794,6 +853,13 @@ class ClusterConfigHandler:
                 len(rgw_buckets),
                 previous_orch,
             )
+            entry = self.public_store[
+                external.cluster_placeholder_key(cluster.cluster_id)
+            ]
+            info = dict(entry.get())
+            # Record the submission attempt even if it fails.
+            info['orch_submitted'] = True
+            entry.set(info)
             self._orch.submit_smb_spec(smb_spec)
         else:
             log.debug(
@@ -861,6 +927,15 @@ class _ShareConf:
     cephx_entity: str
     ceph_cluster: str
     rgw_entity: str = ''
+
+    @property
+    def acl_support(self) -> ACLSupportPolicy:
+        if self.resource.acl_support is not None:
+            return self.resource.acl_support
+        if sd := self.cluster.share_defaults:
+            if sd.acl_support is not None:
+                return sd.acl_support
+        return ACLSupportPolicy.DEFAULT
 
 
 @dataclasses.dataclass(frozen=True)
@@ -981,12 +1056,16 @@ def _generate_rgw_share(
     else:
         user_id = cred.user_id or ""
 
+    modules = []
+    if conf.acl_support is ACLSupportPolicy.DEFAULT:
+        modules.append(_ACL_XATTR)
+    modules.append('ceph_rgw')
+
     cfg = {
         # smb.conf options
         'options': {
             'path': '/',
-            'vfs objects': 'acl_xattr ceph_rgw',
-            'acl_xattr:security_acl_name': 'user.NTACL',
+            'vfs objects': ' '.join(modules),
             'ceph_rgw:bucket': rgw.bucket,
             'ceph_rgw:user_id': user_id,
             # Credential values are left empty here; they are injected at
@@ -1002,6 +1081,8 @@ def _generate_rgw_share(
         }
     }
 
+    if _ACL_XATTR in modules:
+        cfg['options']['acl_xattr:security_acl_name'] = 'user.NTACL'
     if share.comment is not None:
         cfg['options']['comment'] = share.comment
     if share.max_connections is not None:
@@ -1060,9 +1141,9 @@ def _generate_share(conf: _ShareConf) -> Dict[str, Dict[str, str]]:
     # Add macOS support modules if enabled
     if conf.cluster.is_macos_compatibility_enabled:
         modules.extend(["fruit", "streams_xattr"])
-
-    # Add standard modules
-    modules.extend(["acl_xattr", "ceph_snapshots"])
+    if conf.acl_support is ACLSupportPolicy.DEFAULT:
+        modules.append(_ACL_XATTR)
+    modules.append("ceph_snapshots")
 
     if qos := cephfs.qos:
         vfs_rl = "aio_ratelimit"
@@ -1075,7 +1156,6 @@ def _generate_share(conf: _ShareConf) -> Dict[str, Dict[str, str]]:
         'options': {
             'path': path,
             "vfs objects": " ".join(modules),
-            'acl_xattr:security_acl_name': 'user.NTACL',
             f'{ceph_vfs}:config_file': ceph_config_file,
             f'{ceph_vfs}:filesystem': cephfs.volume,
             f'{ceph_vfs}:user_id': cephx_entity,
@@ -1088,6 +1168,8 @@ def _generate_share(conf: _ShareConf) -> Dict[str, Dict[str, str]]:
         }
     }
 
+    if _ACL_XATTR in modules:
+        cfg['options']['acl_xattr:security_acl_name'] = 'user.NTACL'
     if qos:
         opts = cfg["options"]
         for field in (
@@ -1116,6 +1198,8 @@ def _generate_share(conf: _ShareConf) -> Dict[str, Dict[str, str]]:
         opts[f'{ceph_vfs}:keybridge name'] = str(cephfs.fscrypt_key.name)
         opts[f'{ceph_vfs}:keybridge kind'] = 'B64'
         opts[f'{ceph_vfs}:fscrypt'] = 'keybridge'
+    if share.persistent_handles_enabled(conf.cluster):
+        cfg['options']['continuous availability'] = 'yes'
     # extend share with user+group login access lists
     _generate_share_login_control(share, cfg)
     _generate_share_hosts_access(share, cfg)
@@ -1190,6 +1274,15 @@ def _generate_share_hosts_access(
 def _generate_config(conf: _ClusterConf) -> Dict[str, Any]:
     cluster_global_opts = {}
     cluster = conf.resource
+    persistent_handles = resources.requires_persistent_handles(
+        cluster, (share.resource for share in conf.shares)
+    )
+    if persistent_handles:
+        cluster_global_opts['persistent handles'] = 'yes'
+        if cluster.persistent_handles_durability is not None:
+            cluster_global_opts['persistent handles durability'] = str(
+                cluster.persistent_handles_durability
+            )
     if cluster.auth_mode == AuthMode.ACTIVE_DIRECTORY:
         assert cluster.domain_settings is not None
         cluster_global_opts['security'] = 'ads'
@@ -1477,13 +1570,13 @@ def _swap_pending_cluster_info(
         existing = pentry.get()
     except KeyError:
         existing = {}
-    pentry.set(
-        {
-            'cluster_id': change_group.cluster.cluster_id,
-            'timestamp': int(time.time()),
-            'orch_needed': orch_needed,
-        }
-    )
+    info = {
+        'cluster_id': change_group.cluster.cluster_id,
+        'timestamp': int(time.time()),
+        'orch_needed': orch_needed,
+        'orch_submitted': existing.get('orch_submitted'),
+    }
+    pentry.set(info)
     change_group.cache_updated_entry(pentry)
     return existing
 

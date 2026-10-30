@@ -305,6 +305,30 @@ seastar::future<OSDMeta> OSD::open_or_create_meta_coll(FuturizedStore &store)
   });
 }
 
+namespace {
+
+/// Fail a --mkfs step with a plain error exit rather than an abort.
+///
+/// mkfs is a one-shot tool invocation, and its failures are overwhelmingly
+/// environmental: no space for the backing device files, wrong permissions
+/// on osd_data, a path that is not there. Aborting turns every one of those
+/// into a SIGABRT plus a core dump, which buries the single line that says
+/// what actually went wrong. Throwing instead lets main() report the error
+/// and exit non-zero.
+auto mkfs_step_failed(std::string what)
+{
+  return crimson::stateful_ec::handle(
+    [what = std::move(what)](const std::error_code &ec) {
+      LOG_PREFIX(OSD::mkfs);
+      auto osd_data = local_conf().get_val<std::string>("osd_data");
+      ERROR("{} in {}: {}", what, osd_data, ec.message());
+      return seastar::make_exception_future<>(
+        std::system_error(ec, fmt::format("{} in {}", what, osd_data)));
+    });
+}
+
+}
+
 seastar::future<> OSD::mkfs(
   FuturizedStore &store,
   unsigned whoami,
@@ -316,50 +340,77 @@ seastar::future<> OSD::mkfs(
   DEBUG("starting store mkfs");
   co_await store.start();
 
-  DEBUG("calling store mkfs");
-  co_await store.mkfs(osd_uuid).handle_error(
-    crimson::stateful_ec::assert_failure(fmt::format(
-      "{} error creating empty object store in {}",
-       FNAME, local_conf().get_val<std::string>("osd_data")).c_str())
-  );
+  // Every exit past start() must go through stop(): destroying a started
+  // seastar::sharded<> asserts, which would turn the error exit back into
+  // an abort.
+  bool mounted = false;
+  std::exception_ptr failure;
+  try {
+    DEBUG("calling store mkfs");
+    co_await store.mkfs(osd_uuid).handle_error(
+      mkfs_step_failed("error creating empty object store")
+    );
 
-  DEBUG("mounting store mkfs");
-  co_await store.mount().handle_error(
-    crimson::stateful_ec::assert_failure(fmt::format(
-      "{} error mounting object store in {}",
-      FNAME, local_conf().get_val<std::string>("osd_data")).c_str())
-  );
+    DEBUG("mounting store mkfs");
+    co_await store.mount().handle_error(
+      mkfs_step_failed("error mounting object store")
+    );
+    // set only once the whole mount succeeded, and cleared before umount():
+    // SeaStore::umount() closes every device unconditionally, and closing a
+    // seastar::file that was never opened (or was already closed) dereferences
+    // a null impl. stop() alone is safe after a partial mount or umount; the
+    // destructors close whatever is still open.
+    mounted = true;
 
-  {
-    auto meta_coll = co_await open_or_create_meta_coll(store);
+    {
+      auto meta_coll = co_await open_or_create_meta_coll(store);
 
-    OSDSuperblock superblock;
-    superblock.cluster_fsid = cluster_fsid;
-    superblock.osd_fsid = store.get_fsid();
-    superblock.whoami = whoami;
-    superblock.compat_features = get_osd_initial_compat_set();
-    co_await _write_superblock(
-      store, std::move(meta_coll), std::move(superblock));
+      OSDSuperblock superblock;
+      superblock.cluster_fsid = cluster_fsid;
+      superblock.osd_fsid = store.get_fsid();
+      superblock.whoami = whoami;
+      superblock.compat_features = get_osd_initial_compat_set();
+      co_await _write_superblock(
+        store, std::move(meta_coll), std::move(superblock));
+    }
+
+    co_await store.write_meta("ceph_fsid", cluster_fsid.to_string());
+
+    co_await store.write_meta("magic", CEPH_OSD_ONDISK_MAGIC);
+
+    co_await store.write_meta("whoami", std::to_string(whoami));
+
+    co_await _write_key_meta(store);
+
+    co_await store.write_meta("osdspec_affinity", osdspec_affinity);
+
+    co_await store.write_meta("ready", "ready");
+
+    INFO("created object store {} for osd.{} fsid {}\n",
+         local_conf().get_val<std::string>("osd_data"),
+         whoami, cluster_fsid);
+    mounted = false;
+    co_await store.umount();
+  } catch (...) {
+    failure = std::current_exception();
   }
 
-  co_await store.write_meta("ceph_fsid", cluster_fsid.to_string());
-
-  co_await store.write_meta("magic", CEPH_OSD_ONDISK_MAGIC);
-
-  co_await store.write_meta("whoami", std::to_string(whoami));
-
-  co_await _write_key_meta(store);
-
-  co_await store.write_meta("osdspec_affinity", osdspec_affinity);
-
-  co_await store.write_meta("ready", "ready");
-
-  INFO("created object store {} for osd.{} fsid {}\n",
-       local_conf().get_val<std::string>("osd_data"),
-       whoami, cluster_fsid);
-  co_await store.umount();
-
-  co_await store.stop();
+  if (failure && mounted) {
+    co_await store.umount().handle_exception([FNAME](auto ep) {
+      ERROR("umount after a failed mkfs also failed: {}", ep);
+    });
+  }
+  co_await store.stop().handle_exception([FNAME, failure](auto ep) {
+    if (!failure) {
+      return seastar::make_exception_future<>(ep);
+    }
+    // keep the original error: it is the one the operator needs to see
+    ERROR("stop after a failed mkfs also failed: {}", ep);
+    return seastar::make_ready_future<>();
+  });
+  if (failure) {
+    std::rethrow_exception(failure);
+  }
 }
 
 seastar::future<> OSD::_write_superblock(
@@ -630,6 +681,7 @@ seastar::future<> OSD::start()
     DEBUG("replacing unkwnown addrs of cluster messenger");
     cluster_msgr->set_myaddrs(addrs);
   }
+  co_await start_cluster_lanes(osd_required);
   co_await heartbeat->start(pick_addresses(CEPH_PICK_ADDRESS_PUBLIC),
                             pick_addresses(CEPH_PICK_ADDRESS_CLUSTER));
   // create the admin-socket server, and the objects that register
@@ -638,6 +690,18 @@ seastar::future<> OSD::start()
   co_await log_client.set_fsid(monc->get_fsid());
   DEBUG("starting boot");
   co_await start_boot();
+}
+
+seastar::future<> OSD::start_cluster_lanes(uint64_t osd_required)
+{
+  LOG_PREFIX(OSD::start_cluster_lanes);
+  INFO("starting a cluster messenger on each reactor");
+  co_await shard_services.invoke_on_all(
+    [this, osd_required, addrs=cluster_msgr->get_myaddrs()]
+    (auto &local_service) {
+    return local_service.start_cluster_lane(
+      nonce, addrs, osd_required, *this, monc.get(), monc.get());
+  });
 }
 
 seastar::future<> OSD::start_boot()
@@ -876,6 +940,9 @@ seastar::future<> OSD::stop()
     DEBUG("prepared to stop");
     public_msgr->stop();
     cluster_msgr->stop();
+    co_await shard_services.invoke_on_all([](auto &local_service) {
+      local_service.stop_cluster_lane();
+    });
     auto gate_close_fut = gate.close_all();
     co_await asok->stop();
     co_await heartbeat->stop();
@@ -885,6 +952,9 @@ seastar::future<> OSD::stop()
     co_await pg_shard_manager.stop_pgs();
     co_await monc->stop();
     co_await mgrc->stop();
+    co_await shard_services.invoke_on_all([](auto &local_service) {
+      return local_service.shutdown_cluster_lane();
+    });
     co_await shard_services.stop();
     co_await osd_states.stop();
     co_await osd_singleton_state.stop();
@@ -1315,8 +1385,12 @@ seastar::future<> OSD::committed_osd_maps(
       // osd_id came from old_map->get_all_osds(); if it was purged in the new
       // osdmap, osdmap->get_cluster_addrs(osd_id) would ceph_assert(exists()).
       // old_map is guaranteed to contain osd_id and holds its last-known addr.
-      co_await cluster_msgr->mark_down(
-        old_map->get_cluster_addrs(osd_id).front());
+      const auto addr = old_map->get_cluster_addrs(osd_id).front();
+      // its lanes connected to us from their own ports
+      co_await cluster_msgr->mark_down_all_ports(addr);
+      co_await shard_services.invoke_on_all([addr](auto &local_service) {
+        return local_service.mark_down_cluster_lane(addr);
+      });
     });
 
     co_await pg_shard_manager.update_map(std::move(o));

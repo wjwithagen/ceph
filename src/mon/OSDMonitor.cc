@@ -694,16 +694,16 @@ void OSDMonitor::create_initial()
   if (newmap.nearfull_ratio > 1.0) newmap.nearfull_ratio /= 100;
 
   // new cluster should require latest by default
-  if (g_conf().get_val<bool>("mon_debug_no_require_umbrella")) {
-    if (g_conf().get_val<bool>("mon_debug_no_require_tentacle")) {
-      derr << __func__ << " mon_debug_no_require_umbrella and tentacle=true" << dendl;
-      newmap.require_osd_release = ceph_release_t::squid;
-    } else {
-      derr << __func__ << " mon_debug_no_require_umbrella=true" << dendl;
+  if (g_conf().get_val<bool>("mon_debug_no_require_vampire")) {
+    if (g_conf().get_val<bool>("mon_debug_no_require_umbrella")) {
+      derr << __func__ << " mon_debug_no_require_vampire and umbrella=true" << dendl;
       newmap.require_osd_release = ceph_release_t::tentacle;
+    } else {
+      derr << __func__ << " mon_debug_no_require_vampire=true" << dendl;
+      newmap.require_osd_release = ceph_release_t::umbrella;
     }
   } else {
-    newmap.require_osd_release = ceph_release_t::umbrella;
+    newmap.require_osd_release = ceph_release_t::vampire;
   }
 
   ceph_release_t r = ceph_release_from_name(g_conf()->mon_osd_initial_require_min_compat_client);
@@ -3559,26 +3559,26 @@ bool OSDMonitor::preprocess_boot(MonOpRequestRef op)
   ceph_assert(m->get_orig_source_inst().name.is_osd());
 
   // lower bound of N-2
-  if (!HAVE_FEATURE(m->osd_features, SERVER_SQUID)) {
+  if (!HAVE_FEATURE(m->osd_features, SERVER_TENTACLE)) {
     mon.clog->info() << "disallowing boot of OSD "
 		     << m->get_orig_source_inst()
-		     << " because the osd lacks CEPH_FEATURE_SERVER_SQUID";
+		     << " because the osd lacks CEPH_FEATURE_SERVER_TENTACLE";
     goto ignore;
   }
 
   // make sure osd versions do not span more than 3 releases
-  if (HAVE_FEATURE(m->osd_features, SERVER_TENTACLE) &&
-      osdmap.require_osd_release < ceph_release_t::reef) {
-    mon.clog->info() << "disallowing boot of tentacle+ OSD "
-		      << m->get_orig_source_inst()
-		      << " because require_osd_release < reef";
-    goto ignore;
-  }
   if (HAVE_FEATURE(m->osd_features, SERVER_UMBRELLA) &&
     osdmap.require_osd_release < ceph_release_t::squid) {
     mon.clog->info() << "disallowing boot of umbrella+ OSD "
                       << m->get_orig_source_inst()
                       << " because require_osd_release < squid";
+    goto ignore;
+  }
+  if (HAVE_FEATURE(m->osd_features, SERVER_VAMPIRE) &&
+    osdmap.require_osd_release < ceph_release_t::tentacle) {
+    mon.clog->info() << "disallowing boot of vampire+ OSD "
+                      << m->get_orig_source_inst()
+                      << " because require_osd_release < tentacle";
     goto ignore;
   }
 
@@ -9612,9 +9612,25 @@ int OSDMonitor::prepare_command_pool_application(const string &prefix,
   return _command_pool_application(prefix, cmdmap, ss, nullptr, true);
 }
 
+static bool refuse_in_stretch_mode(const OSDMap& osdmap,
+                                   const string& command,
+                                   stringstream& ss)
+{
+  if (osdmap.stretch_mode_enabled) {
+    ss << command << " is for individual stretch pools and cannot be used "
+       << "while stretch mode is enabled";
+    return true;
+  }
+  return false;
+}
+
 int OSDMonitor::prepare_command_pool_stretch_set(const cmdmap_t& cmdmap,
                                                     stringstream& ss)
 {
+  if (refuse_in_stretch_mode(osdmap, "osd pool stretch set", ss)) {
+    return -EINVAL;
+  }
+
   string pool_name;
   cmd_getval(cmdmap, "pool", pool_name);
   int64_t pool = osdmap.lookup_pg_pool_name(pool_name);
@@ -9626,6 +9642,11 @@ int OSDMonitor::prepare_command_pool_stretch_set(const cmdmap_t& cmdmap,
   pg_pool_t p = *osdmap.get_pg_pool(pool);
   if (pending_inc.new_pools.count(pool))
     p = pending_inc.new_pools[pool];
+
+  if (p.is_erasure()) {
+    ss << "stretched pools must be replicated; '" << pool_name << "' is erasure-coded";
+    return -EINVAL;
+  }
 
   int64_t bucket_count = cmd_getval_or<int64_t>(cmdmap, "peering_crush_bucket_count", 0);
   if (bucket_count <= 0) {
@@ -9724,6 +9745,10 @@ int OSDMonitor::prepare_command_pool_stretch_unset(const cmdmap_t& cmdmap,
   * Command syntax:
   *   ceph osd pool stretch unset <pool>
   */
+  if (refuse_in_stretch_mode(osdmap, "osd pool stretch unset", ss)) {
+    return -EINVAL;
+  }
+
   string pool_name;
   cmd_getval(cmdmap, "pool", pool_name);
   int64_t pool = osdmap.lookup_pg_pool_name(pool_name);
@@ -9772,6 +9797,22 @@ int OSDMonitor::prepare_command_pool_stretch_unset(const cmdmap_t& cmdmap,
   if (pool_min_size < 0) {
     ss << "pool min_size must be non-negative";
     return -EINVAL;
+  }
+
+  // only an older mon could have stretched an EC pool; let unset repair it
+  if (p.is_erasure()) {
+    ErasureCodeInterfaceRef erasure_code;
+    int err = get_erasure_code(p.erasure_code_profile, &erasure_code, &ss);
+    if (err < 0) {
+      return err;
+    }
+    int64_t k = erasure_code->get_data_chunk_count();
+    int64_t k_plus_m = erasure_code->get_chunk_count();
+    if (pool_size != k_plus_m || pool_min_size < k || pool_min_size > k_plus_m) {
+      ss << "'" << pool_name << "' is erasure-coded: size must be " << k_plus_m
+         << " (k+m) and min_size between " << k << " (k) and " << k_plus_m;
+      return -EINVAL;
+    }
   }
 
   // unset stretch values
@@ -12496,7 +12537,7 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
       err = 0;
       goto reply_no_propose;
     }
-    if (osdmap.require_osd_release < ceph_release_t::squid && !sure) {
+    if (osdmap.require_osd_release < ceph_release_t::tentacle && !sure) {
       ss << "Not advisable to continue since current 'require_osd_release' "
          << "refers to a very old Ceph release. Pass "
 	 << "--yes-i-really-mean-it if you really wish to continue.";
@@ -12545,6 +12586,19 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
       if ((!HAVE_FEATURE(osdmap.get_up_osd_features(), SERVER_UMBRELLA))
            && !sure) {
         ss << "not all up OSDs have CEPH_FEATURE_SERVER_UMBRELLA feature";
+        err = -EPERM;
+        goto reply_no_propose;
+      }
+    } else if (rel == ceph_release_t::vampire) {
+      if (!mon.monmap->get_required_features().contains_all(
+            ceph::features::mon::FEATURE_VAMPIRE)) {
+        ss << "not all mons are vampire";
+        err = -EPERM;
+        goto reply_no_propose;
+      }
+      if ((!HAVE_FEATURE(osdmap.get_up_osd_features(), SERVER_VAMPIRE))
+           && !sure) {
+        ss << "not all up OSDs have CEPH_FEATURE_SERVER_VAMPIRE feature";
         err = -EPERM;
         goto reply_no_propose;
       }
@@ -14972,6 +15026,12 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
       goto reply_no_propose;
     }
   } else if (prefix == "osd force_healthy_stretch_mode") {
+    if (!mon.is_degraded_stretch_mode() || !mon.is_recovering_stretch_mode()) {
+      ss << "the cluster is not in recovery stretch mode; "
+         << "force_healthy_stretch_mode only ends recovery stretch mode";
+      err = -EINVAL;
+      goto reply_no_propose;
+    }
     bool sure = false;
     cmd_getval(cmdmap, "yes_i_really_mean_it", sure);
     if (!sure) {

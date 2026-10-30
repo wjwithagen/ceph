@@ -47,7 +47,8 @@ class Module(orchestrator.OrchestratorClientMixin, MgrModule):
             xprtsec: Optional[str] = None,
             cmount_path: Optional[str] = "/",
             transports: Optional[List[str]] = None,
-            skip_notify_nfs_server: bool = False
+            skip_notify_nfs_server: bool = False,
+            kmip_key_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """Create a CephFS export"""
         self.export_mgr.skip_notify_nfs_server = skip_notify_nfs_server
@@ -66,7 +67,8 @@ class Module(orchestrator.OrchestratorClientMixin, MgrModule):
             xprtsec=xprtsec,
             cmount_path=cmount_path,
             transports=transports,
-            earmark_resolver=earmark_resolver
+            earmark_resolver=earmark_resolver,
+            kmip_key_id=kmip_key_id
         )
 
     @NFSCLICommand('nfs export create rgw', perm='rw')
@@ -83,7 +85,7 @@ class Module(orchestrator.OrchestratorClientMixin, MgrModule):
             sectype: Optional[List[str]] = None,
             xprtsec: Optional[str] = None,
             transports: Optional[List[str]] = None,
-            skip_notify_nfs_server: bool = False
+            skip_notify_nfs_server: bool = False,
     ) -> Dict[str, Any]:
         """Create an RGW export"""
         self.export_mgr.skip_notify_nfs_server = skip_notify_nfs_server
@@ -98,7 +100,7 @@ class Module(orchestrator.OrchestratorClientMixin, MgrModule):
             addr=client_addr,
             sectype=sectype,
             xprtsec=xprtsec,
-            transports=transports,
+            transports=transports
         )
 
     @NFSCLICommand('nfs export rm', perm='rw')
@@ -187,14 +189,21 @@ class Module(orchestrator.OrchestratorClientMixin, MgrModule):
                                 enable_nfsv3: bool = False,
                                 enable_nfs_metrics: bool = False,
                                 ingress_placement: Optional[str] = None,
-                                inbuf: Optional[str] = None) -> None:
+                                clients_per_pool: Optional[int] = None,
+                                inbuf: Optional[str] = None
+                                ) -> None:
         """Create an NFS Cluster"""
         cluster_qos_config = None
+        kmip_cert = kmip_key = kmip_ca_cert = kmip_host_list = None
         ssl_cert = ssl_key = ssl_ca_cert = tls_min_version = tls_ciphers = None
         ssl = tls_ktls = tls_debug = False
         if inbuf:
             config = yaml.safe_load(inbuf)
             cluster_qos_config = config.get('cluster_qos_config')
+            kmip_cert = config.get('kmip_cert')
+            kmip_key = config.get('kmip_key')
+            kmip_ca_cert = config.get('kmip_ca_cert')
+            kmip_host_list = config.get('kmip_host_list')
             ssl = config.get('ssl')
             ssl_cert = config.get('ssl_cert')
             ssl_key = config.get('ssl_key')
@@ -230,6 +239,10 @@ class Module(orchestrator.OrchestratorClientMixin, MgrModule):
                                            ip_addrs=ip_addrs,
                                            monitoring_ip_addrs=monitoring_ip_addrs,
                                            monitoring_port=monitoring_port,
+                                           kmip_cert=kmip_cert,
+                                           kmip_key=kmip_key,
+                                           kmip_ca_cert=kmip_ca_cert,
+                                           kmip_host_list=kmip_host_list,
                                            ssl=ssl,
                                            ssl_cert=ssl_cert,
                                            ssl_key=ssl_key,
@@ -240,7 +253,8 @@ class Module(orchestrator.OrchestratorClientMixin, MgrModule):
                                            tls_ciphers=tls_ciphers,
                                            enable_rdma=enable_rdma,
                                            rdma_port=rdma_port,
-                                           ingress_placement=ingress_placement)
+                                           ingress_placement=ingress_placement,
+                                           clients_per_pool=clients_per_pool)
 
     @NFSCLICommand('nfs cluster rm', perm='rw')
     @object_format.EmptyResponder()
@@ -311,6 +325,18 @@ class Module(orchestrator.OrchestratorClientMixin, MgrModule):
 
     def cluster_info(self, cluster_id: Optional[str] = None) -> Dict[str, Any]:
         return self.nfs.show_nfs_cluster_info(cluster_id=cluster_id)
+
+    # This method is called by the cephadm module (../cephadm/services/nfs.py)
+    # when an NFS service spec enables or raises clients_per_pool, just before
+    # the daemons are reconfigured for it. Do not change the interface without
+    # updating the cephadm code.
+    def reconcile_client_pool(self, cluster_id: str, clients_per_pool: int) -> List[str]:
+        """Top up the CephFS client pool of a cluster to clients_per_pool users.
+
+        Lets ``clients_per_pool`` be enabled or raised on an NFS cluster that
+        already has exports, without recreating them.
+        """
+        return self.export_mgr.reconcile_client_pool(cluster_id, clients_per_pool)
 
     def fetch_nfs_cluster_obj(self) -> NFSCluster:
         return self.nfs

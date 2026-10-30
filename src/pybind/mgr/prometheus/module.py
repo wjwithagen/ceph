@@ -172,7 +172,7 @@ OSD_STATS = ['apply_latency_ms', 'commit_latency_ms']
 
 POOL_METADATA = ('pool_id', 'name', 'type', 'description', 'compression_mode', 'application')
 
-RGW_METADATA = ('ceph_daemon', 'hostname', 'ceph_version', 'instance_id')
+RGW_METADATA = ('ceph_daemon', 'hostname', 'ceph_version', 'instance_id', 'zone_id')
 
 RBD_MIRROR_METADATA = ('ceph_daemon', 'id', 'instance_id', 'hostname',
                        'ceph_version')
@@ -194,7 +194,7 @@ HW_CPU_LABELS = ('hostname', 'cpu', 'manufacturer', 'model', 'total_threads')
 HW_MEMORY_LABELS = ('hostname', 'dimm', 'type')
 MIB_TO_BYTES = 1048576
 
-HW_HEALTH_LABELS = ('hostname', 'component', 'category')
+HW_STATUS_LABELS = ('hostname', 'component', 'category', 'state')
 
 HW_TEMP_LABELS = ('hostname', 'sensor_name')
 
@@ -208,6 +208,8 @@ HEALTH_STATUS_MAP = {
     'Degraded': 1,
     'Error': 2,
     'Critical': 2,
+    # Health not reported by the BMC
+    'unknown': -1,
 }
 
 sensor_metric = namedtuple('sensor_metric', 'metric description labels')
@@ -233,6 +235,12 @@ HEALTH_CHECKS = [
 ]
 
 HEALTHCHECK_DETAIL = ('name', 'severity', 'message')
+BLUESTORE_FREE_FRAGMENTATION = 'BLUESTORE_FREE_FRAGMENTATION'
+HEALTH_CHECKS_WITH_MESSAGE = (
+    'CEPHADM_CERT_ERROR',
+    'CEPHADM_CERT_WARNING',
+    BLUESTORE_FREE_FRAGMENTATION,
+)
 
 
 class Severity(enum.Enum):
@@ -1124,11 +1132,12 @@ class Module(MgrModule, OrchestratorClientMixin):
             HW_MEMORY_LABELS
         )
 
-        metrics['hardware_health'] = Metric(
+        metrics['hardware_status'] = Metric(
             'gauge',
-            'hardware_health',
-            'Hardware component health status (0=OK, 1=Warning, 2=Error)',
-            HW_HEALTH_LABELS
+            'hardware_status',
+            'Hardware component health (-1=Unknown, 0=OK, 1=Warning, 2=Error), '
+            'labelled with the Redfish state of the component',
+            HW_STATUS_LABELS
         )
 
         for sensor in SENSOR_METRICS.values():
@@ -1173,10 +1182,31 @@ class Module(MgrModule, OrchestratorClientMixin):
         self.log.info('Config changed, signaling serve loop to restart engine')
         self.config_change_event.set()
 
-    def _process_cert_health_detail(self, alert_id: str, health_data: dict) -> None:
-        """Process certificate health check details and set metrics."""
+    def _process_health_checks_with_message(self, health_check: str, health_data: dict) -> None:
+        """Process health checks that expose message details."""
         severity = health_data.get('severity', 'unknown')
-        detail_messages = health_data.get('detail', [])
+        if health_check in ('CEPHADM_CERT_ERROR', 'CEPHADM_CERT_WARNING'):
+            detail_messages = health_data.get('detail', [])
+        else:
+            summary = health_data.get('summary', {})
+            if isinstance(summary, dict):
+                msg = summary.get('message', '')
+            elif isinstance(summary, str):
+                msg = summary
+            else:
+                msg = ''
+
+            if health_check == BLUESTORE_FREE_FRAGMENTATION and msg:
+                osd_details = [
+                    entry['message'].strip()
+                    for entry in health_data.get('detail', [])
+                    if entry.get('message', '').strip()
+                ]
+                if osd_details:
+                    msg = f"{msg}. Affected OSDs: {', '.join(osd_details)}"
+
+            detail_messages = [{'message': msg}] if msg else []
+
         if not detail_messages:
             return
 
@@ -1189,13 +1219,13 @@ class Module(MgrModule, OrchestratorClientMixin):
                 self.metrics['health_detail'].set(
                     1,
                     (
-                        alert_id,
+                        health_check,
                         str(severity),
                         str(message)
                     )
                 )
             except Exception as e:
-                self.log.error(f"Failed to process {alert_id} message '{message}': {e}")
+                self.log.error(f"Failed to process {health_check} message '{message}': {e}")
 
     @profile_method()
     def get_health(self) -> None:
@@ -1246,15 +1276,15 @@ class Module(MgrModule, OrchestratorClientMixin):
                     # health check is not active, so give it a default of 0
                     self.metrics[path].set(0)
 
-        for alert_id in ('CEPHADM_CERT_ERROR', 'CEPHADM_CERT_WARNING'):
-            if alert_id in active_names:
-                self._process_cert_health_detail(alert_id, active_healthchecks[alert_id])
+        for health_check in HEALTH_CHECKS_WITH_MESSAGE:
+            if health_check in active_names:
+                self._process_health_checks_with_message(health_check, active_healthchecks[health_check])
 
         self.health_history.check(health)
 
         for name, info in self.health_history.healthcheck.items():
-            # Skip CEPHADM_CERT_ERROR and CEPHADM_CERT_WARNING as they're handled specially above with message details
-            if name in ('CEPHADM_CERT_ERROR', 'CEPHADM_CERT_WARNING'):
+            # These health checks are handled separately to expose message details.
+            if name in HEALTH_CHECKS_WITH_MESSAGE:
                 continue
             v = 1 if info.active else 0
             self.metrics['health_detail'].set(
@@ -1466,6 +1496,25 @@ class Module(MgrModule, OrchestratorClientMixin):
                     'osd.{}'.format(id_),
                 ))
 
+    def get_rgw_zone_ids(self) -> Dict[str, str]:
+        """
+        Map RGW daemons to the zone id they registered in the service map.
+        Keyed both by service map id (gid) and by daemon name (metadata 'id'),
+        since the instance_id label is derived from either of them.
+        """
+        zone_ids: Dict[str, str] = {}
+        service_map = self.get('service_map')
+        daemons = service_map.get('services', {}).get('rgw', {}).get('daemons', {})
+        for gid, daemon in daemons.items():
+            if not isinstance(daemon, dict):
+                continue
+            metadata = daemon.get('metadata', {})
+            zone_id = metadata.get('zone_id', '')
+            zone_ids[str(gid)] = zone_id
+            if metadata.get('id'):
+                zone_ids[metadata['id']] = zone_id
+        return zone_ids
+
     def get_service_list(self) -> Dict[Tuple[str, str], Tuple[str, str, str]]:
         ret = {}
         for server in self.list_servers():
@@ -1661,6 +1710,7 @@ class Module(MgrModule, OrchestratorClientMixin):
         # If orchestrator is available and ceph-exporter is running modify rgw instance id
         # to match the one from exporter
         modify_instance_id = self.orch_is_available() and self.get_module_option('exclude_perf_counters')
+        rgw_zone_ids = self.get_rgw_zone_ids()
         if modify_instance_id:
             daemons = raise_if_exception(self.list_daemons(daemon_type='rgw'))
             for daemon in daemons:
@@ -1672,7 +1722,8 @@ class Module(MgrModule, OrchestratorClientMixin):
                                                  (f"{daemon.daemon_type}.{daemon.daemon_id}",
                                                   str(daemon.hostname),
                                                   str(daemon.version),
-                                                  instance_id))
+                                                  instance_id,
+                                                  rgw_zone_ids.get(daemon.daemon_id or '', '')))
         for key, value in servers.items():
             service_id, service_type = key
             if service_type == 'rgw' and not modify_instance_id:
@@ -1680,7 +1731,8 @@ class Module(MgrModule, OrchestratorClientMixin):
                 self.metrics['rgw_metadata'].set(
                     1,
                     ('{}.{}'.format(service_type, name),
-                     hostname, version, service_id)
+                     hostname, version, service_id,
+                     rgw_zone_ids.get(service_id, ''))
                 )
             elif service_type == 'rbd-mirror':
                 mirror_metadata = self.get_metadata('rbd-mirror', service_id)
@@ -1774,7 +1826,7 @@ class Module(MgrModule, OrchestratorClientMixin):
             pools[pool_name].add(namespace_name)
 
         rbd_stats_pools = {}
-        for pool_id in self.rbd_stats['pools'].keys():
+        for pool_id in list(self.rbd_stats['pools']):
             name = self.rbd_stats['pools'][pool_id]['name']
             if name not in pools:
                 del self.rbd_stats['pools'][pool_id]
@@ -2159,17 +2211,21 @@ class Module(MgrModule, OrchestratorClientMixin):
         except Exception as e:
             self.log.error(f"Failed to get SMB metadata: {str(e)}")
 
+    @staticmethod
+    def _hw_status_value(status_val: Any, field: str) -> str:
+        """Return the value of a Redfish Status field (e.g. state, health), 'unknown' if missing."""
+        status = status_val if isinstance(status_val, dict) else {}
+        return status.get(field, 'unknown')
+
     def _hw_get_health_value(
             self, status_val: Any, hostname: str = '',
             comp_id: str = '', category: str = ''
     ) -> Optional[int]:
-        """Map a Redfish health status to a numeric value (0=OK, 1=Warning, 2=Error)."""
-        if isinstance(status_val, dict):
-            health_str = status_val.get('health', 'Unknown')
-        elif isinstance(status_val, str):
+        """Map a Redfish health status to a numeric value (-1=Unknown, 0=OK, 1=Warning, 2=Error)."""
+        if isinstance(status_val, str):
             health_str = status_val
         else:
-            health_str = 'Unknown'
+            health_str = self._hw_status_value(status_val, 'health')
 
         value = HEALTH_STATUS_MAP.get(health_str)
         if value is None:
@@ -2184,14 +2240,19 @@ class Module(MgrModule, OrchestratorClientMixin):
             self, status_val: Any, hostname: str,
             comp_id: str, category: str
     ) -> None:
-        """Set hardware_health gauge for a single component."""
+        """Set hardware_status gauge for a single component.
+
+        The value is the Redfish health, the Redfish state is exported as a label.
+        """
+        state = self._hw_status_value(status_val, 'state')
         health_value = self._hw_get_health_value(
             status_val, hostname, comp_id, category
         )
-        if health_value is not None:
-            self.metrics['hardware_health'].set(
-                health_value, (hostname, comp_id, category)
-            )
+        if health_value is None:
+            return
+        self.metrics['hardware_status'].set(
+            health_value, (hostname, comp_id, category, state)
+        )
 
     def _hw_iter_components(
             self, status: Dict[str, Any], category: str

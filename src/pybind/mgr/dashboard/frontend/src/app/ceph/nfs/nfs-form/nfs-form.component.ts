@@ -34,7 +34,7 @@ import { CephfsSubvolumeGroupService } from '~/app/shared/api/cephfs-subvolume-g
 import { RgwUserService } from '~/app/shared/api/rgw-user.service';
 import { RgwExportType } from '../nfs-list/nfs-list.component';
 import { DEFAULT_SUBVOLUME_GROUP } from '~/app/shared/constants/cephfs.constant';
-import { NFSCluster, NFSClusterOption } from '../models/nfs-cluster-config';
+import { NFSCluster, NFSClusterOption } from '../models/nfs.model';
 
 @Component({
   selector: 'cd-nfs-form',
@@ -45,6 +45,10 @@ import { NFSCluster, NFSClusterOption } from '../models/nfs-cluster-config';
 export class NfsFormComponent extends CdForm implements OnInit {
   @ViewChild('nfsClients', { static: true })
   nfsClients: NfsFormClientComponent;
+
+  readonly routes = {
+    RGW_BUCKET_CREATE: '/rgw/bucket/create'
+  };
 
   clients: any[] = [];
 

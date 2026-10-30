@@ -1767,10 +1767,6 @@ void OSDService::queue_for_snap_trim(PG *pg, uint64_t cost_per_object)
        */
       return cost_per_object * cct->_conf->osd_pg_max_concurrent_snap_trims;
     } else {
-      /* We retain this legacy behavior for WeightedPriorityQueue.
-       * This branch should be removed after Umbrella (after consulting
-       * dev team)
-       */
       return cct->_conf->osd_snap_trim_cost;
     }
   }();
@@ -6575,9 +6571,9 @@ void TestOpsSocketHook::test_ops(OSDService *service, ObjectStore *store,
         }
     } else {
         if ((command == "injectecreaderr") ||
-	    (command == "injecteclearreaderr") ||
+	    (command == "injectecclearreaderr") ||
 	    (command == "injectecwriteerr") ||
-	    (command == "injecteclearwriteerr") ||
+	    (command == "injectecclearwriteerr") ||
             (command == "injectparityread") ||
             (command == "injectclearparityread")) {
             ss << "Only supported on ec pool";

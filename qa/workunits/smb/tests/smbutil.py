@@ -1,5 +1,6 @@
 import base64
 import contextlib
+import functools
 import os
 import pathlib
 import time
@@ -8,6 +9,7 @@ import cephutil
 
 import smbclient
 from smbprotocol.header import NtStatus
+from smbprotocol.exceptions import SMBResponseException
 
 
 class SMBTestHost:
@@ -175,6 +177,31 @@ class PathWrapper:
         """Unlink (remove) a file."""
         smbclient.remove(str(self.share_path))
 
+    def stat(self):
+        return smbclient.stat(str(self.share_path))
+
+    def get_security_descriptor(self):
+        import smbclient.security
+
+        return smbclient.security.get_security_descriptor(
+            str(self.share_path)
+        )
+
+    def set_security_descriptor(self, sec_desc):
+        import smbclient.security
+
+        return smbclient.security.set_security_descriptor(
+            str(self.share_path),
+            sec_desc,
+        )
+
+    def rmtree(self, *, ignore_errors=False):
+        import smbclient.shutil
+
+        return smbclient.shutil.rmtree(
+            str(self.share_path), ignore_errors=ignore_errors
+        )
+
 
 def _get_resources(smb_cfg, rtype):
     jres = cephutil.cephadm_shell_cmd(
@@ -213,15 +240,13 @@ def get_share_by_id(smb_cfg, cluster_id, share_id):
     return share
 
 
-def _apply(smb_cfg, resources, immediate=False, check=None):
+def _apply(smb_cfg, resources, immediate=False, check=None, load_json=True):
     jres = cephutil.cephadm_shell_cmd(
         smb_cfg,
         ['ceph', 'smb', 'apply', '-i-'],
         input_json={'resources': resources},
-        load_json=True,
+        load_json=load_json,
     )
-    assert jres.returncode == 0
-    assert jres.obj and jres.obj.get('success')
     if check:
         ret = check(jres)
     else:
@@ -234,6 +259,8 @@ def _apply(smb_cfg, resources, immediate=False, check=None):
 
 
 def _res_check(jres):
+    assert jres.returncode == 0
+    assert jres.obj and jres.obj.get('success')
     assert 'results' in jres.obj
     _results = jres.obj['results']
     assert len(_results) == 1, "more than one result found"
@@ -264,3 +291,73 @@ def apply_resource(
 
     rr = _apply(smb_cfg, [resource], immediate=immediate, check=_res_check)
     return rr
+
+
+def _res_check_many(jres, count):
+    assert jres.returncode == 0
+    assert jres.obj and jres.obj.get('success')
+    assert 'results' in jres.obj
+    _results = jres.obj['results']
+    assert len(_results) == count
+    return jres.obj
+
+
+def apply_resources(
+    smb_cfg,
+    resources,
+    immediate=False,
+):
+    """Apply resources via the apply command."""
+
+    _check = functools.partial(_res_check_many, count=len(resources))
+    rr = _apply(smb_cfg, resources, immediate=immediate, check=_check)
+    return rr
+
+
+def apply_resources_unchecked(
+    smb_cfg,
+    resources,
+    immediate=False,
+):
+    """Apply resources via the apply command. Do not assert result is OK."""
+
+    return _apply(
+        smb_cfg,
+        resources,
+        immediate=immediate,
+        load_json=cephutil.LoadJSON.BOTH,
+    )
+
+
+@contextlib.contextmanager
+def raises_nt_error(nt_status, base_exc=None):
+    """Checks that an exception was raised and that the nt status error matches
+    a given nt_status error code (or codes).  nt_status may be an int or a
+    tuple of ints.  base_exc is the base class of the exception to catch -
+    defaults to the common base classes used by smbprotocol and smbclient
+    (part of smbprotocol).
+    """
+    info = {}
+    base_exc = (
+        (OSError, SMBResponseException) if base_exc is None else base_exc
+    )
+    try:
+        yield info
+    except base_exc as err:
+        info['exception'] = err
+        # smbprotocol is not particularly consistent where the nt status
+        # error is stored on the exception objects across the different
+        # layers. Check the clearly named one first and then the other.
+        info['ntstatus'] = getattr(err, 'ntstatus', None) or getattr(
+            err, 'status', None
+        )
+    if not info:
+        raise AssertionError('DID NOT RAISE')
+    if not isinstance(nt_status, tuple):
+        _statuses = (nt_status,)
+    else:
+        _statuses = nt_status
+    if info['ntstatus'] not in _statuses:
+        raise AssertionError(
+            f'NTSTATUS mismatch: {info["ntstatus"]} not in {_statuses}'
+        )

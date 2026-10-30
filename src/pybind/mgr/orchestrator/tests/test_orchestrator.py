@@ -4,10 +4,11 @@ import textwrap
 
 import pytest
 import yaml
+from datetime import datetime, timezone
 
 from ceph.deployment.hostspec import HostSpec
 from ceph.deployment.inventory import Devices, Device
-from ceph.deployment.service_spec import ServiceSpec
+from ceph.deployment.service_spec import ServiceSpec, NvmeofServiceSpec, PlacementSpec
 from ceph.deployment import inventory
 from ceph.utils import datetime_now
 from mgr_module import HandleCommandResult
@@ -145,6 +146,44 @@ def test_handle_command():
     r = m._handle_command(None, cmd)
     assert r == HandleCommandResult(
         retval=-2, stdout='', stderr='No orchestrator configured (try `ceph orch set backend`)')
+
+
+@pytest.mark.parametrize('svc_arg,paths', [
+    ('host0:/dev/sda,/dev/sdb', ['/dev/sda', '/dev/sdb']),
+    (
+        'host0:/dev/disk/by-path/pci-0000:cd:00.0-nvme-1',
+        ['/dev/disk/by-path/pci-0000:cd:00.0-nvme-1'],
+    ),
+    (
+        'host0:/dev/disk/by-path/pci-0000:c9:00.0-nvme-1,'
+        '/dev/disk/by-path/pci-0000:cd:00.0-nvme-1',
+        [
+            '/dev/disk/by-path/pci-0000:c9:00.0-nvme-1',
+            '/dev/disk/by-path/pci-0000:cd:00.0-nvme-1',
+        ],
+    ),
+    (
+        'host0:data_devices=/dev/disk/by-path/pci-0000:cd:00.0-nvme-1',
+        ['/dev/disk/by-path/pci-0000:cd:00.0-nvme-1'],
+    ),
+])
+def test_daemon_add_osd_device_paths(svc_arg, paths):
+    m = OrchestratorCli('orchestrator', 0, 0)
+    with mock.patch.object(m, 'create_osds', return_value=OrchResult('Scheduled')) as create_osds:
+        r = m._daemon_add_osd(svc_arg, method='raw')
+    assert r.retval == 0
+    assert r.stdout == 'Scheduled'
+    drive_group = create_osds.call_args[0][0]
+    assert drive_group.placement.host_pattern.pattern == 'host0'
+    assert [dev.path for dev in drive_group.data_devices.paths] == paths
+    assert drive_group.method == 'raw'
+
+
+def test_daemon_add_osd_rejects_spec_without_separator():
+    m = OrchestratorCli('orchestrator', 0, 0)
+    r = m._daemon_add_osd('host0')
+    assert r.retval != 0
+    assert "Invalid 'host:device' spec" in r.stderr
 
 
 r = OrchResult([ServiceDescription(spec=ServiceSpec(service_type='osd'), running=123)])
@@ -318,6 +357,7 @@ def test_preview_table_osd_smoke():
 
 @mock.patch("orchestrator.module.OrchestratorCli.release_name", new_callable=mock.PropertyMock)
 @mock.patch("orchestrator.module.OrchestratorCli._apply_misc")
+@mock.patch("orchestrator.module.OrchestratorCli.describe_service")
 @mock.patch("orchestrator.module.OrchestratorCli.remote")
 @mock.patch("orchestrator.module.OrchestratorCli.get")
 class TestApplyNvmeof:
@@ -325,21 +365,22 @@ class TestApplyNvmeof:
     def setup_method(self):
         self.m = OrchestratorCli('orchestrator', 0, 0)
 
-    def test_missing_group_raises_validation_error(self, mock_get, mock_remote, mock_apply_misc, mock_release_name):
+    def test_missing_group_raises_validation_error(self, mock_get, mock_remote, mock_describe_service, mock_apply_misc, mock_release_name):
         res = self.m._apply_nvmeof(pool="mypool", group="")
 
         assert res.retval != 0
         assert "The --group argument is required" in res.stderr
         mock_apply_misc.assert_not_called()
 
-    def test_inbuf_raises_validation_error(self, mock_get, mock_remote, mock_apply_misc, mock_release_name):
+    def test_inbuf_raises_validation_error(self, mock_get, mock_remote, mock_describe_service, mock_apply_misc, mock_release_name):
         res = self.m._apply_nvmeof(pool="mypool", group="mygroup", inbuf="some_yaml_content")
 
         assert res.retval != 0
         assert "unrecognized command -i; -h or --help for usage" in res.stderr
         mock_apply_misc.assert_not_called()
 
-    def test_custom_pool_skips_metadata_pool_creation(self, mock_get, mock_remote, mock_apply_misc, mock_release_name):
+    def test_custom_pool_skips_metadata_pool_creation(self, mock_get, mock_remote, mock_describe_service, mock_apply_misc, mock_release_name):
+        mock_describe_service.return_value = OrchResult(result=[])
         mock_apply_misc.return_value = HandleCommandResult(retval=0, stdout="Success")
 
         res = self.m._apply_nvmeof(pool="custompool", group="mygroup")
@@ -348,7 +389,7 @@ class TestApplyNvmeof:
         mock_apply_misc.assert_called_once()
         assert res.retval == 0
 
-    def test_default_pool_fails_if_module_disabled(self, mock_get, mock_remote, mock_apply_misc, mock_release_name):
+    def test_default_pool_fails_if_module_disabled(self, mock_get, mock_remote, mock_describe_service, mock_apply_misc, mock_release_name):
         mock_release_name.return_value = "squid"
         mock_get.return_value = {'modules': [], 'always_on_modules': {}}
 
@@ -362,16 +403,197 @@ class TestApplyNvmeof:
         mock_remote.assert_not_called()
         mock_apply_misc.assert_not_called()
 
-    def test_default_pool_creates_metadata_pool_if_module_enabled(self, mock_get, mock_remote, mock_apply_misc, mock_release_name):
+    def test_default_pool_creates_metadata_pool_if_module_enabled(self, mock_get, mock_remote, mock_describe_service, mock_apply_misc, mock_release_name):
         mock_release_name.return_value = "squid"
         mock_get.return_value = {'modules': ['nvmeof'], 'always_on_modules': {}}
+        mock_describe_service.return_value = OrchResult(result=[])
         mock_apply_misc.return_value = HandleCommandResult(retval=0, stdout="Success")
 
         res = self.m._apply_nvmeof(pool=".nvmeof", group="mygroup")
 
         mock_remote.assert_called_once_with('nvmeof', 'create_pool_if_not_exists')
+        mock_describe_service.assert_called_once_with(
+            service_type='nvmeof',
+            service_name='nvmeof.nvmeof.mygroup',
+            refresh=False,
+        )
         mock_apply_misc.assert_called_once()
         assert res.retval == 0
+
+    def test_existing_service_preserves_spec_when_scaling(
+            self,
+            mock_get,
+            mock_remote,
+            mock_describe_service,
+            mock_apply_misc,
+            mock_release_name):
+        existing_spec = NvmeofServiceSpec(
+            service_id='custompool.mygroup',
+            pool='custompool',
+            group='mygroup',
+            placement=PlacementSpec.from_string('host1'),
+            encryption_key='secret-key',
+        )
+
+        mock_describe_service.return_value = OrchResult(result=[
+            ServiceDescription(
+                spec=existing_spec,
+                created=datetime.now(timezone.utc),
+            )
+        ])
+        mock_apply_misc.return_value = HandleCommandResult(
+            retval=0,
+            stdout='Success',
+        )
+
+        res = self.m._apply_nvmeof(
+            pool='custompool',
+            group='mygroup',
+            placement='host1 host2',
+        )
+
+        assert res.retval == 0
+
+        applied_spec = mock_apply_misc.call_args.args[0][0]
+
+        assert isinstance(applied_spec, NvmeofServiceSpec)
+        assert applied_spec.encryption_key == 'secret-key'
+        assert applied_spec.placement.to_json() == (
+            PlacementSpec.from_string('host1 host2').to_json()
+        )
+
+    def test_existing_service_preserves_placement_when_not_provided(
+            self,
+            mock_get,
+            mock_remote,
+            mock_describe_service,
+            mock_apply_misc,
+            mock_release_name):
+        existing_spec = NvmeofServiceSpec(
+            service_id='custompool.mygroup',
+            pool='custompool',
+            group='mygroup',
+            placement=PlacementSpec.from_string('host1 host2'),
+        )
+
+        mock_describe_service.return_value = OrchResult(result=[
+            ServiceDescription(
+                spec=existing_spec,
+                created=datetime.now(timezone.utc),
+            )
+        ])
+        mock_apply_misc.return_value = HandleCommandResult(
+            retval=0,
+            stdout='Success',
+        )
+
+        res = self.m._apply_nvmeof(
+            pool='custompool',
+            group='mygroup',
+        )
+
+        assert res.retval == 0
+
+        applied_spec = mock_apply_misc.call_args.args[0][0]
+
+        assert applied_spec.placement.to_json() == (
+            PlacementSpec.from_string('host1 host2').to_json()
+        )
+
+    def test_existing_unmanaged_service_stays_unmanaged(
+            self,
+            mock_get,
+            mock_remote,
+            mock_describe_service,
+            mock_apply_misc,
+            mock_release_name):
+
+        existing_spec = NvmeofServiceSpec(
+            service_id='custompool.mygroup',
+            pool='custompool',
+            group='mygroup',
+            placement=PlacementSpec.from_string('host1'),
+            unmanaged=True,
+        )
+
+        mock_describe_service.return_value = OrchResult(result=[
+            ServiceDescription(
+                spec=existing_spec,
+                created=datetime.now(timezone.utc),
+            )
+        ])
+        mock_apply_misc.return_value = HandleCommandResult(
+            retval=0,
+            stdout='Success',
+        )
+
+        res = self.m._apply_nvmeof(
+            pool='custompool',
+            group='mygroup',
+            placement='host1 host2',
+        )
+
+        assert res.retval == 0
+
+        applied_spec = mock_apply_misc.call_args.args[0][0]
+
+        assert applied_spec.unmanaged is True
+
+    @pytest.mark.parametrize(
+        'created,deleted',
+        [
+            (None, None),
+            (
+                datetime.now(timezone.utc),
+                datetime.now(timezone.utc),
+            ),
+        ],
+    )
+    def test_non_active_spec_uses_fresh_spec(
+            self,
+            mock_get,
+            mock_remote,
+            mock_describe_service,
+            mock_apply_misc,
+            mock_release_name,
+            created,
+            deleted):
+        stale_spec = NvmeofServiceSpec(
+            service_id='custompool.mygroup',
+            pool='oldpool',
+            group='oldgroup',
+            unmanaged=True,
+        )
+
+        mock_describe_service.return_value = OrchResult(result=[
+            ServiceDescription(
+                spec=stale_spec,
+                created=created,
+                deleted=deleted,
+            )
+        ])
+        mock_apply_misc.return_value = HandleCommandResult(
+            retval=0,
+            stdout='Success',
+        )
+
+        res = self.m._apply_nvmeof(
+            pool='custompool',
+            group='mygroup',
+            placement='host1',
+        )
+
+        assert res.retval == 0
+
+        applied_spec = mock_apply_misc.call_args.args[0][0]
+
+        # The placeholder/deleting spec must not be reused.
+        assert applied_spec.pool == 'custompool'
+        assert applied_spec.group == 'mygroup'
+        assert applied_spec.unmanaged is False
+        assert applied_spec.placement.to_json() == (
+            PlacementSpec.from_string('host1').to_json()
+        )
 
 
 @mock.patch("orchestrator.module.OrchestratorCli._apply_misc")

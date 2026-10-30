@@ -160,7 +160,8 @@ public:
     osd_op_params_t& osd_op_params,
     object_stat_sum_t& delta_stats,
     bool whiteout,
-    int num_bytes);
+    int num_bytes,
+    ObjectContext::attr_cache_t& attr_cache);
   interruptible_future<> remove(
     ObjectState& os,
     ceph::os::Transaction& txn);
@@ -214,7 +215,8 @@ public:
     object_stat_sum_t& delta_stats,
     crimson::osd::ObjectContextRef head,
     crimson::osd::ObjectContextLoader& obc_loader,
-    const SnapContext &snapc);
+    const SnapContext &snapc,
+    ObjectContext::attr_cache_t& attr_cache);
   write_iertr::future<> truncate(
     ObjectState& os,
     const OSDOp& osd_op,
@@ -281,6 +283,11 @@ public:
     ::crimson::interruptible::interruptible_errorator<
       ::crimson::osd::IOInterruptCondition,
       get_attr_errorator>;
+  /// EC pools read xattrs from attr_cache, replicated pools from the store
+  get_attr_ierrorator::future<ceph::bufferlist> get_xattr_maybe_from_cache(
+    const ObjectState& os,
+    const ObjectContext::attr_cache_t& attr_cache,
+    std::string&& name) const;
   get_attr_ierrorator::future<> getxattr(
     const ObjectState& os,
     const ObjectContext::attr_cache_t& attr_cache,
@@ -303,6 +310,7 @@ public:
       cmp_xattr_errorator>;
   cmp_xattr_ierrorator::future<> cmp_xattr(
     const ObjectState& os,
+    const ObjectContext::attr_cache_t& attr_cache,
     OSDOp& osd_op,
     object_stat_sum_t& delta_stats) const;
   using rm_xattr_ertr = crimson::errorator<crimson::ct_error::enoent>;

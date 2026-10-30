@@ -137,7 +137,7 @@ BlockRBManager::write_ertr::future<> BlockRBManager::write(
   }
   co_return co_await device->write(
     addr,
-    bptr);
+    std::move(bptr));
 }
 
 BlockRBManager::read_ertr::future<> BlockRBManager::read(
@@ -171,7 +171,7 @@ BlockRBManager::write_ertr::future<> BlockRBManager::write(
   ceph_assert(device);
   bufferptr bptr;
   try {
-    bptr = bufferptr(ceph::buffer::create_page_aligned(bl.length()));
+    bptr = bufferptr(device->alloc_io_buffer(bl.length()));
     auto iter = bl.cbegin();
     iter.copy(bl.length(), bptr.c_str());
   } catch (const std::exception &e) {

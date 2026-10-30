@@ -1,9 +1,8 @@
 import { HttpClient, HttpParams } from '@angular/common/http';
 import { Injectable } from '@angular/core';
 
-import _ from 'lodash';
 import { BehaviorSubject, Observable, of as observableOf, throwError } from 'rxjs';
-import { catchError, distinctUntilChanged, map, mapTo, shareReplay, tap } from 'rxjs/operators';
+import { catchError, distinctUntilChanged, map, shareReplay, tap } from 'rxjs/operators';
 import { Bucket } from '~/app/ceph/rgw/models/rgw-bucket';
 import { RgwRateLimitConfig } from '~/app/ceph/rgw/models/rgw-rate-limit';
 
@@ -103,15 +102,17 @@ export class RgwBucketService extends ApiClient {
 
   /**
    * Get the list of buckets.
-   * @return Observable<Object[]>
+   * Without stats: bucket names. With stats: full bucket objects.
    */
-  list(stats: boolean = false, uid: string = '') {
+  list(stats?: false, uid?: string): Observable<string[]>;
+  list(stats: true, uid?: string): Observable<Bucket[]>;
+  list(stats: boolean = false, uid: string = ''): Observable<string[] | Bucket[]> {
     return this.rgwDaemonService.request((params: HttpParams) => {
       params = params.append('stats', stats.toString());
       if (uid) {
         params = params.append('uid', uid);
       }
-      return this.http.get(this.url, {
+      return this.http.get<string[] | Bucket[]>(this.url, {
         headers: { Accept: this.getVersionHeaderValue(1, 1) },
         params: params
       });
@@ -253,19 +254,26 @@ export class RgwBucketService extends ApiClient {
 
   /**
    * Check if the specified bucket exists.
+   * Uses a direct GET (not the details cache) so a 404 used only for
+   * existence checks can reliably call preventDefault and avoid toasts.
    * @param {string} bucket The bucket name to check.
    * @return Observable<boolean>
    */
   exists(bucket: string) {
-    return this.get(bucket).pipe(
-      mapTo(true),
-      catchError((error: Event) => {
-        if (_.isFunction(error.preventDefault)) {
-          error.preventDefault();
-        }
-        return observableOf(false);
+    return this.rgwDaemonService
+      .request((params: HttpParams) => {
+        return this.http.get(`${this.url}/${bucket}`, { params: params });
       })
-    );
+      .pipe(
+        map(() => true),
+        catchError((error: any) => {
+          if (error?.status === 404) {
+            error?.preventDefault?.();
+            return observableOf(false);
+          }
+          throw error;
+        })
+      );
   }
 
   getLockDays(bucketData: object): number {
@@ -329,9 +337,11 @@ export class RgwBucketService extends ApiClient {
     });
   }
   updateBucketRateLimit(bid: string, bucketRateLimitArgs: RgwRateLimitConfig) {
-    return this.http
-      .put(`${this.url}/${bid}/ratelimit`, bucketRateLimitArgs)
-      .pipe(tap(() => this.bucketRateLimitCache.delete(bid)));
+    return this.rgwDaemonService.request((params: HttpParams) => {
+      return this.http
+        .put(`${this.url}/${bid}/ratelimit`, bucketRateLimitArgs, { params })
+        .pipe(tap(() => this.bucketRateLimitCache.delete(bid)));
+    });
   }
 
   getBucketRateLimit(uid: string, forceRefresh = false) {
@@ -344,19 +354,26 @@ export class RgwBucketService extends ApiClient {
       return cached;
     }
 
-    const request$ = this.http.get(`${this.url}/${uid}/ratelimit`).pipe(
-      shareReplay(1),
-      catchError((error) => {
-        this.bucketRateLimitCache.delete(uid);
-        return throwError(() => error);
+    const request$ = this.rgwDaemonService
+      .request((params: HttpParams) => {
+        return this.http.get(`${this.url}/${uid}/ratelimit`, { params });
       })
-    );
+      .pipe(
+        shareReplay(1),
+        catchError((error) => {
+          this.bucketRateLimitCache.delete(uid);
+          return throwError(() => error);
+        })
+      );
 
     this.bucketRateLimitCache.set(uid, request$);
     return request$;
   }
+
   getGlobalBucketRateLimit() {
-    return this.http.get(`${this.url}/ratelimit`);
+    return this.rgwDaemonService.request((params: HttpParams) => {
+      return this.http.get(`${this.url}/ratelimit`, { params });
+    });
   }
 
   listNotification(bucket_name: string) {

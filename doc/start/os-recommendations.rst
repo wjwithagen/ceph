@@ -35,7 +35,7 @@ Ceph runs on any Linux distribution with a supported kernel and
 +----------------+-------------------------+----------------+-------------------+-----------------+----------------+----------------+----------------+
 | Ubuntu 22.04   | `Jun 2027 <Ubuntu_>`_   | A              | A                 | A               |                |                |                |
 +----------------+-------------------------+----------------+-------------------+-----------------+----------------+----------------+----------------+
-| Ubuntu 24.04   | `Jun 2029 <Ubuntu_>`_   |                | Upcoming          | A               | A              | A              |                |
+| Ubuntu 24.04   | `Jun 2029 <Ubuntu_>`_   |                | A in v20.2.5      | A               | A              | A              |                |
 +----------------+-------------------------+----------------+-------------------+-----------------+----------------+----------------+----------------+
 | Ubuntu 26.04   | `May 2031 <Ubuntu_>`_   |                |                   |                 | A              | A              | A              |
 +----------------+-------------------------+----------------+-------------------+-----------------+----------------+----------------+----------------+
@@ -70,7 +70,7 @@ Container Hosts
 +----------------+-------------------------+----------------+-------------------+-----------------+----------------+----------------+----------------+
 | Ubuntu 22.04   | `Jun 2027 <Ubuntu_>`_   | H              | H                 | H               |                |                |                |
 +----------------+-------------------------+----------------+-------------------+-----------------+----------------+----------------+----------------+
-| Ubuntu 24.04   | `Jun 2029 <Ubuntu_>`_   |                | Upcoming          | H               | H              | H              |                |
+| Ubuntu 24.04   | `Jun 2029 <Ubuntu_>`_   |                | H in v20.2.5      | H               | H              | H              |                |
 +----------------+-------------------------+----------------+-------------------+-----------------+----------------+----------------+----------------+
 | Ubuntu 26.04   | `May 2031 <Ubuntu_>`_   |                |                   |                 | H              | H              | H              |
 +----------------+-------------------------+----------------+-------------------+-----------------+----------------+----------------+----------------+
@@ -89,6 +89,11 @@ Container Base Image
 Since Umbrella the container image is built on Rocky Linux 10 (CentOS 9
 Stream before that). The host does not need to run Rocky 10; any
 distribution marked H above works.
+
+Rocky Linux 10 requires the x86-64-v3 microarchitecture level, so on the x86
+architecture the container image runs only on CPUs that support x86-64-v3,
+whatever distribution the host runs. For the first CPU generations that
+support it, see :ref:`CPU and Memory Sizing <hardware-cpu>`.
 
 .. note:: ARM architecture containers provide a limited set of daemons.
    Check that the daemons you need are available before you plan an ARM

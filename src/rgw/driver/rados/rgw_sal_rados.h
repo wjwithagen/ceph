@@ -352,7 +352,7 @@ class RadosStore : public StoreDriver {
     virtual int register_to_service_map(const DoutPrefixProvider *dpp, const std::string& daemon_type,
 				const std::map<std::string, std::string>& meta) override;
     virtual void get_quota(RGWQuota& quota) override;
-    virtual void get_ratelimit(RGWRateLimitInfo& bucket_ratelimit, RGWRateLimitInfo& user_ratelimit, RGWRateLimitInfo& anon_ratelimit) override;
+    virtual void get_ratelimit(RGWRateLimitInfo& bucket_ratelimit, RGWRateLimitInfo& user_ratelimit, RGWRateLimitInfo& account_ratelimit, RGWRateLimitInfo& anon_ratelimit) override;
     virtual int set_buckets_enabled(const DoutPrefixProvider* dpp, std::vector<rgw_bucket>& buckets, bool enabled, optional_yield y) override;
     virtual int get_sync_policy_handler(const DoutPrefixProvider* dpp,
 					std::optional<rgw_zone_id> zone,
@@ -712,8 +712,9 @@ class RadosObject : public StoreObject {
 };
 
 class RadosBucket : public StoreBucket {
-  private:
+  protected:
     RadosStore* store;
+  private:
     RGWAccessControlPolicy acls;
     std::string topics_oid() const;
 
@@ -831,33 +832,24 @@ class RadosBucket : public StoreBucket {
     friend class RadosUser;
 };
 
-class RadosVectorBucket : public StoreVectorBucket {
-  private:
-    RadosStore* store;
-
+// Reuse object operations with a separate entrypoint and owner bucket list.
+class RadosVectorBucket : public RadosBucket {
   public:
-    RadosVectorBucket(RadosStore *_st)
-      : store(_st) {}
+    using RadosBucket::RadosBucket; // inherit RadosBucket's constructors
+    ~RadosVectorBucket() override;
 
-    RadosVectorBucket(RadosStore *_st, const rgw_bucket& _b)
-      : StoreVectorBucket(_b),
-	store(_st) {}
-
-    RadosVectorBucket(RadosStore *_st, const RGWBucketInfo& _i)
-      : StoreVectorBucket(_i),
-	store(_st) {}
-
-    ~RadosVectorBucket() override = default;
     int remove(const DoutPrefixProvider* dpp, bool delete_children, optional_yield y) override;
     int create(const DoutPrefixProvider* dpp, const CreateParams& params,
                optional_yield y) override;
     int load_bucket(const DoutPrefixProvider* dpp, optional_yield y) override;
-    int check_empty(const DoutPrefixProvider* dpp, optional_yield y) override { return 0; }
-    std::unique_ptr<VectorBucket> clone() override {
+    std::unique_ptr<Bucket> clone() override {
       return std::make_unique<RadosVectorBucket>(*this);
     }
     int put_info(const DoutPrefixProvider* dpp, bool exclusive, ceph::real_time mtime, optional_yield y) override;
     int try_refresh_info(const DoutPrefixProvider* dpp, ceph::real_time* pmtime, optional_yield y) override;
+    // Ownership changes must also update the vector entrypoint and owner list.
+    int chown(const DoutPrefixProvider* dpp, const rgw_owner& new_owner,
+              const std::string& new_owner_name, optional_yield y) override { return -ENOTSUP; }
 
   private:
     int link(const DoutPrefixProvider* dpp, const rgw_owner& new_owner, optional_yield y, bool update_entrypoint = true, RGWObjVersionTracker* objv = nullptr);

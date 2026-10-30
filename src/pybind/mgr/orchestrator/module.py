@@ -3,7 +3,7 @@ import errno
 import json
 import os
 import shutil
-from typing import List, Set, Optional, Iterator, cast, Dict, Any, Union, Sequence, Mapping, Tuple
+from typing import List, Set, Optional, Iterator, cast, Dict, Any, Union, Sequence, Mapping, Tuple, Type, Callable
 import re
 import datetime
 import math
@@ -345,6 +345,7 @@ def preview_table_services(data: List) -> str:
     table.align = 'l'
     table.left_padding_width = 0
     table.right_padding_width = 2
+    table.max_width = 30
     for item in data:
         if item.get('warning'):
             continue
@@ -1601,7 +1602,8 @@ Usage:
         if not svc_arg:
             return HandleCommandResult(-errno.EINVAL, stderr=usage)
         try:
-            host_name, raw = svc_arg.split(":")
+            # PCI by-path names contain extra ':' (pci-0000:cd:00.0-nvme-1).
+            host_name, raw = svc_arg.split(":", 1)
             list_drive_group_spec_bool_arg: List[str] = []
             drive_group_spec = {
                 'data_devices': []
@@ -1764,6 +1766,7 @@ Usage:
                  placement: Optional[str] = None,
                  _end_positional_: int = 0,
                  port: Optional[int] = None,
+                 http_port: Optional[int] = None,
                  ssl: bool = False,
                  inbuf: Optional[str] = None) -> HandleCommandResult:
         """Start RGW daemon(s)"""
@@ -1773,6 +1776,7 @@ Usage:
         spec = RGWSpec(
             service_id=svc_id,
             rgw_frontend_port=port,
+            rgw_frontend_http_port=http_port,
             ssl=ssl,
             placement=PlacementSpec.from_string(placement),
         )
@@ -2057,6 +2061,89 @@ Usage:
                 out = to_format(data, format, many=True, cls=None)
         return HandleCommandResult(stdout=out)
 
+    def _get_stored_spec(
+            self,
+            service_name: str,
+            spec_cls: Type[ServiceSpec],
+    ) -> Optional[ServiceSpec]:
+        """
+        Return the active stored spec for service_name, if one exists.
+
+        Ignore placeholder specs for daemons without a stored spec and specs
+        that are pending removal.
+        """
+        service_type = service_name.split('.', 1)[0]
+
+        completion = self.describe_service(
+            service_type=service_type,
+            service_name=service_name,
+            refresh=False,
+        )
+
+        for sd in raise_if_exception(completion):
+            if (
+                sd.spec.service_name() == service_name
+                and isinstance(sd.spec, spec_cls)
+                and sd.created is not None
+                and sd.deleted is None
+            ):
+                return sd.spec
+
+        return None
+
+    def _apply_or_patch(
+            self,
+            service_name: str,
+            spec_cls: Type[ServiceSpec],
+            create: Callable[[], ServiceSpec],
+            placement: Optional[str] = None,
+            unmanaged: Optional[bool] = None,
+            dry_run: bool = False,
+            format: Format = Format.plain,
+            no_overwrite: bool = False,
+    ) -> HandleCommandResult:
+        """
+        Create a service from CLI arguments, or patch an existing stored spec.
+
+        For an existing service, only values explicitly supplied by this CLI
+        path are changed. All other values are preserved.
+        """
+        existing = self._get_stored_spec(service_name, spec_cls)
+
+        if existing is None:
+            self.log.debug(
+                'No stored spec found for %s; creating a new service spec',
+                service_name,
+            )
+            spec = create()
+        else:
+            self.log.debug(
+                'Reusing stored spec for %s and applying CLI updates',
+                service_name,
+            )
+
+            data = existing.to_json()
+
+            if placement is not None:
+                data['placement'] = PlacementSpec.from_string(
+                    placement
+                ).to_json()
+
+            if unmanaged is not None:
+                data['unmanaged'] = unmanaged
+
+            spec = ServiceSpec.from_json(data)
+
+        spec.preview_only = dry_run
+        spec.validate()
+
+        return self._apply_misc(
+            [spec],
+            dry_run,
+            format,
+            no_overwrite,
+        )
+
     @OrchestratorCLICommand.Write('orch apply mds')
     def _apply_mds(self,
                    fs_name: str,
@@ -2091,6 +2178,7 @@ Usage:
                    zone: Optional[str] = None,
                    networks: Optional[List[str]] = None,
                    port: Optional[int] = None,
+                   http_port: Optional[int] = None,
                    ssl: bool = False,
                    dry_run: bool = False,
                    format: Format = Format.plain,
@@ -2115,6 +2203,7 @@ Usage:
             rgw_zone=zone,
             networks=networks,
             rgw_frontend_port=port,
+            rgw_frontend_http_port=http_port,
             ssl=ssl,
             placement=PlacementSpec.from_string(placement),
             unmanaged=unmanaged,
@@ -2267,18 +2356,28 @@ Usage:
             nvmeof_pool_helper.create_pool_if_needed()
 
         cleanpool = pool.lstrip('.')
-        spec = NvmeofServiceSpec(
-            service_id=f'{cleanpool}.{group}' if group else cleanpool,
-            pool=pool,
-            group=group,
-            placement=PlacementSpec.from_string(placement),
-            unmanaged=unmanaged,
-            preview_only=dry_run
+        service_id = f'{cleanpool}.{group}' if group else cleanpool
+        service_name = f'nvmeof.{service_id}'
+
+        def create() -> ServiceSpec:
+            return NvmeofServiceSpec(
+                service_id=service_id,
+                pool=pool,
+                group=group,
+                placement=PlacementSpec.from_string(placement),
+                unmanaged=unmanaged,
+            )
+
+        return self._apply_or_patch(
+            service_name=service_name,
+            spec_cls=NvmeofServiceSpec,
+            create=create,
+            placement=placement,
+            unmanaged=True if unmanaged else None,
+            dry_run=dry_run,
+            format=format,
+            no_overwrite=no_overwrite,
         )
-
-        spec.validate()  # force any validation exceptions to be caught correctly
-
-        return self._apply_misc([spec], dry_run, format, no_overwrite)
 
     @OrchestratorCLICommand.Write('orch apply snmp-gateway')
     def _apply_snmp_gateway(self,

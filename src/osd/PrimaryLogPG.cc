@@ -6007,6 +6007,9 @@ int PrimaryLogPG::do_read(OpContext *ctx, OSDOp& osd_op) {
     if (ctx->op->ec_direct_read()) {
       int r = pgbackend->objects_read_local(
         soid, op.extent.offset, op.extent.length, op.flags, &osd_op.outdata);
+      if (r == -EIO) {
+        r = rep_repair_primary_object(soid, ctx);
+      }
       if (r >= 0) {
         bytes_read = r;
         // Don't update op.extent.length - causes issues with recursive
@@ -10343,6 +10346,10 @@ void PrimaryLogPG::finish_copyfrom(CopyFromCallback *cb)
     dout(20) << __func__ << ": exists, removing" << dendl;
     ctx->op_t->remove(obs.oi.soid);
     ctx->use_replace_op = true;
+    // If the source has no omap, has_omap is false and the omap won't be
+    // marked dirty below. But the existing target's omap was removed with
+    // the object; mark it dirty here so log-based recovery wipes it too.
+    ctx->clean_regions.mark_omap_dirty();
   } else {
     ctx->delta_stats.num_objects++;
     obs.exists = true;

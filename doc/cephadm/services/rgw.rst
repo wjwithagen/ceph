@@ -102,6 +102,58 @@ example spec file:
 	  ``rgw_frontend_extra_args`` into a single space-separated arguments list
 	  which is used to set the value of the ``rgw_frontends`` configuration parameter.
 
+Adding a second port to accept HTTP traffic
+-------------------------------------------
+
+When SSL is enabled, the ``rgw_frontend_http_port`` parameter configures
+an additional port on the frontend that accepts plain HTTP traffic, while
+``rgw_frontend_port`` keeps serving HTTPS. The value is an integer, it must
+differ from ``rgw_frontend_port`` and it requires ``ssl: true``. Specs that set it
+without SSL are rejected by validation.
+
+Example spec file:
+
+.. code-block:: yaml
+
+    service_type: rgw
+    service_id: foo
+    placement:
+      label: rgw
+      count_per_host: 2
+    spec:
+      rgw_realm: myrealm
+      rgw_zone: myzone
+      rgw_frontend_type: "beast"
+      rgw_frontend_port: 443
+      rgw_frontend_http_port: 8080
+      ssl: true
+      generate_cert: true
+
+With ``count_per_host`` greater than one, each daemon on a host uses the
+next consecutive port for both ports, so the range starting at
+``rgw_frontend_port`` and the range starting at ``rgw_frontend_http_port``
+must not overlap. For the same reason ``port``, ``ssl_port``, ``endpoint``
+and ``ssl_endpoint`` cannot be set in ``rgw_frontend_extra_args`` when
+``rgw_frontend_http_port`` is used with ``count_per_host`` greater than
+one: every daemon on the host would bind the same fixed port.
+A port given in ``rgw_frontend_extra_args`` must also differ from
+``rgw_frontend_port``, from ``rgw_frontend_http_port`` and from the other
+ports in ``rgw_frontend_extra_args``.
+
+
+.. note::
+   ``cephadm`` combines the arguments from the ``spec`` section with those from
+   ``rgw_frontend_extra_args`` into a single space-separated argument list
+   which is used to set the value of the ``rgw_frontends`` configuration
+   parameter. Ports given in ``rgw_frontend_extra_args`` are passed on
+   unchanged and are independent of ``rgw_frontend_http_port``.
+
+.. note::
+   Adding ``rgw_frontend_http_port`` to an existing service redeploys
+   its RGW daemons so that the new port is opened.
+
+
+
 Multisite zones
 ---------------
 
@@ -363,7 +415,7 @@ balancing on a floating virtual IP.
 
 If the RGW service is configured with SSL enabled, then the ingress service
 will use the `ssl` and `verify none` options in the backend configuration.
-Trust verification is disabled because the backends are accessed by IP 
+Trust verification is disabled because the backends are accessed by IP
 address instead of FQDN.
 
 .. image:: ../../images/HAProxy_for_RGW.svg
@@ -417,6 +469,8 @@ Service specs are YAML blocks with the following properties:
       use_keepalived_multicast: <bool>          # optional: Default is False.
       vrrp_interface_network: <string>/<string> # optional: ex: 192.168.20.0/24
       health_check_interval: <string>           # optional: Default is 2s.
+      haproxy_log_target: <string>              # optional: Default is journald. Use none to disable logging.
+      haproxy_log_level: <string>               # optional: Default is info.
       ssl: true
       certificate_source: inline                # optional: Default is cephadm-signed
       ssl_cert: |                               # optional: SSL certificate and key
@@ -547,6 +601,21 @@ where the properties of this service specification are:
 * ``monitor_networks``
     If ``monitor_networks`` is specified, an IP address that matches one of the specified
     networks will be used. If an IP address is not present, then default host IP will be used.
+* ``haproxy_log_target``
+    Where HAProxy sends its logs. Default is ``journald``: HAProxy writes its logs to stdout
+    and cephadm's Podman ``journald`` log driver forwards them to the host systemd journal.
+    Read them with ``cephadm logs --name <haproxy-daemon>`` or
+    ``journalctl -u ceph-<fsid>@<haproxy-daemon>``. Set to ``none`` to stop HAProxy access
+    logging. Note that HAProxy startup, shutdown, and configuration messages (for example,
+    worker fork/exit lines) may still appear in the journal even when the target is ``none``.
+* ``haproxy_log_level``
+    Severity filter on the HAProxy ``log`` directive. Default is ``info``. Valid values are
+    ``debug``, ``info``, ``notice``, ``warning``, and ``err``. Access logs are emitted at
+    ``info`` severity, so ``info`` (or ``debug``) is required to see per-request (HTTP) or
+    per-connection (TCP) access records. A stricter level (``notice``, ``warning``, or ``err``)
+    suppresses normal access logs and keeps only higher-severity events. ``debug`` additionally
+    enables HAProxy health-check status logging (``option log-health-checks``) and is meant for
+    troubleshooting.
 
 .. _ingress-virtual-ip:
 

@@ -20,6 +20,7 @@ from mgr_module import MonCommandFailed
 
 from cephadm.services.cephadmservice import CephadmDaemonDeploySpec, CephService, DaemonDeployContext
 from .service_registry import register_cephadm_service
+from cephadm.utils import build_ceph_volume_cmd
 
 if TYPE_CHECKING:
     from cephadm.module import CephadmOrchestrator
@@ -30,6 +31,12 @@ logger = logging.getLogger(__name__)
 @register_cephadm_service
 class OSDService(CephService):
     TYPE = 'osd'
+
+    def validate_encryption(self, spec: DriveGroupSpec) -> None:
+        if spec.method == 'raw' and spec.encrypted and not spec.tpm2:
+            raise OrchestratorError(
+                'Raw encrypted OSD deployment through cephadm requires tpm2: true. '
+                'Use method: lvm for encryption without TPM2.')
 
     def _apply_osd_config_to_daemon(
         self,
@@ -94,6 +101,7 @@ class OSDService(CephService):
             in inventory timestamps (and the check only compares timestamps, not spec content).
         """
         logger.debug(f"Processing DriveGroup {drive_group}")
+        self.validate_encryption(drive_group)
         creation_cfg, post_create_cfg = self._get_osd_spec_configs(drive_group)
         osd_id_claims = OsdIdClaims(self.mgr)
         if osd_id_claims.get():
@@ -189,13 +197,11 @@ class OSDService(CephService):
                 'wait_for_latest_osdmap failed with %d' % ret)
 
         # check result: lvm
-        osds_elems: dict = await CephadmServe(self.mgr)._run_cephadm_json(
+        osds_elems = await CephadmServe(self.mgr)._run_cephadm_json(
             host, 'osd', 'ceph-volume',
-            [
-                '--',
-                'lvm', 'list',
-                '--format', 'json',
-            ])
+            build_ceph_volume_cmd(
+                self.mgr.ceph_volume_log_level,
+                ['lvm', 'list', '--format', 'json']))
         before_osd_uuid_map = self.mgr.get_osd_uuid_map(only_up=True)
         fsid = self.mgr._cluster_fsid
         osd_uuid_map = self.mgr.get_osd_uuid_map()
@@ -244,13 +250,11 @@ class OSDService(CephService):
                     osd_uuid_map=osd_uuid_map)
 
         # check result: raw
-        raw_elems: dict = await CephadmServe(self.mgr)._run_cephadm_json(
+        raw_elems = await CephadmServe(self.mgr)._run_cephadm_json(
             host, 'osd', 'ceph-volume',
-            [
-                '--',
-                'raw', 'list',
-                '--format', 'json',
-            ])
+            build_ceph_volume_cmd(
+                self.mgr.ceph_volume_log_level,
+                ['raw', 'list', '--format', 'json']))
         for osd_uuid, osd in raw_elems.items():
             if osd.get('ceph_fsid') != fsid:
                 continue
@@ -403,7 +407,7 @@ class OSDService(CephService):
 
                 # get preview data from ceph-volume
                 for cmd in cmds:
-                    with self.mgr.async_timeout_handler(host, f'cephadm ceph-volume -- {cmd}'):
+                    with self.mgr.async_timeout_handler(host, f'cephadm ceph-volume -- --log-level {self.mgr.ceph_volume_log_level} {cmd}'):
                         out, err, code = self.mgr.wait_async(self._run_ceph_volume_command(host, cmd))
                     if out:
                         try:
@@ -475,8 +479,10 @@ class OSDService(CephService):
         })
 
         split_cmd = cmd.split(' ')
-        _cmd = ['--config-json', '-', '--']
-        _cmd.extend(split_cmd)
+        _cmd = build_ceph_volume_cmd(
+            self.mgr.ceph_volume_log_level,
+            split_cmd,
+            prefix=['--config-json', '-'])
         out, err, code = await CephadmServe(self.mgr)._run_cephadm(
             host, 'osd', 'ceph-volume',
             _cmd,
@@ -680,7 +686,9 @@ class RemoveUtil(object):
     def zap_osd(self, osd: "OSD") -> str:
         "Zaps all devices that are associated with an OSD"
         if osd.hostname is not None:
-            cmd = ['--', 'lvm', 'zap', '--osd-id', str(osd.osd_id)]
+            cmd = build_ceph_volume_cmd(
+                self.mgr.ceph_volume_log_level,
+                ['lvm', 'zap', '--osd-id', str(osd.osd_id)])
             if osd.replace_block:
                 cmd.append('--replace-block')
             if osd.replace_db:
@@ -832,7 +840,7 @@ class OSD:
             self.rm_util.set_osd_flag([self], 'out')
         else:
             self.rm_util.reweight_osd(self, 0.0)
-        self.drain_started_at = datetime.utcnow()
+        self.drain_started_at = datetime_now()
         self.draining = True
         logger.debug(f"Started draining {self}.")
         return True
@@ -843,7 +851,7 @@ class OSD:
         else:
             if self.original_weight:
                 self.rm_util.reweight_osd(self, self.original_weight)
-        self.drain_stopped_at = datetime.utcnow()
+        self.drain_stopped_at = datetime_now()
         self.draining = False
         logger.debug(f"Stopped draining {self}.")
         return True
@@ -872,7 +880,7 @@ class OSD:
     def is_empty(self) -> bool:
         if self.get_pg_count() == 0:
             if not self.drain_done_at:
-                self.drain_done_at = datetime.utcnow()
+                self.drain_done_at = datetime_now()
                 self.draining = False
             return True
         return False

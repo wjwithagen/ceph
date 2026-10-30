@@ -23,7 +23,8 @@ from ceph.deployment.service_spec import (
     NvmeofServiceSpec,
 )
 from ceph.utils import str_to_datetime, datetime_to_str, datetime_now
-from orchestrator import OrchestratorError, HostSpec, OrchestratorEvent, service_to_daemon_types
+from orchestrator import OrchestratorError, HardwareNoReport, HostSpec, OrchestratorEvent, service_to_daemon_types, \
+    NODE_PROXY_REPORT_KEYS
 from cephadm.services.cephadmservice import CephadmDaemonDeploySpec
 from ceph.deployment.tls_utils import SSLConfigException, parse_tls_pem_bundle
 
@@ -1553,6 +1554,20 @@ class HostCache():
         daemons = list(self.daemons[host].values()) if host else self._get_daemons()
         return [d for d in daemons if d.daemon_type in service_to_daemon_types(service_type)]
 
+    def get_daemons_by_daemon_type(self, daemon_type: str, host: str = '') -> List[orchestrator.DaemonDescription]:
+        """Return all daemons whose ``daemon_type`` matches *daemon_type*.
+
+        Unlike ``get_daemons_by_type()`` which accepts a *service* type
+        and maps it through ``service_to_daemon_types()``, this method
+        filters directly on ``DaemonDescription.daemon_type``.  This is
+        safe for compound service daemon types like ``haproxy`` and
+        ``keepalived`` which have no corresponding service-type key.
+        """
+        if host:
+            host = normalize_hostname(host)
+        daemons = list(self.daemons[host].values()) if host else self._get_daemons()
+        return [d for d in daemons if d.daemon_type == daemon_type]
+
     def get_daemons_by_types(self, daemon_types: List[str]) -> List[str]:
         daemon_names = []
         for daemon_type in daemon_types:
@@ -1896,10 +1911,15 @@ class NodeProxyCache:
         if hostname is None:
             return list(self.data.keys())
         if hostname not in self.data:
-            raise OrchestratorError(
+            raise HardwareNoReport(
                 f"Host '{hostname}' has no node-proxy data (unknown host or node-proxy not running)."
             )
         return [hostname]
+
+    def list_hosts(self) -> List[str]:
+        # Returns hosts with a complete node-proxy report; no blobs loaded.
+        return sorted(host for host, report in self.data.items()
+                      if all(key in report for key in NODE_PROXY_REPORT_KEYS))
 
     def fullreport(self, **kw: Any) -> Dict[str, Any]:
         """

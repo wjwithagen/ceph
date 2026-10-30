@@ -1,6 +1,11 @@
 import { ComponentFixture, TestBed } from '@angular/core/testing';
 import { SmbUsersgroupsResourceSidebarComponent } from './smb-usersgroups-resource-sidebar.component';
 import { ActivatedRoute, convertToParamMap, provideRouter, ParamMap } from '@angular/router';
+import {
+  SMB_BASE_CEPHFS,
+  SMB_CEPHFS_CONTEXT,
+  SMB_CONTEXT
+} from '~/app/shared/constants/smb.constant';
 import { BehaviorSubject } from 'rxjs';
 import { Component, Input } from '@angular/core';
 
@@ -23,12 +28,17 @@ describe('SmbUsersgroupsResourceSidebarComponent', () => {
     );
 
     const activatedRouteMock = {
-      paramMap: paramMapSubject.asObservable()
+      paramMap: paramMapSubject.asObservable(),
+      snapshot: { data: { smbBasePath: SMB_BASE_CEPHFS, isRgw: false } }
     };
 
     await TestBed.configureTestingModule({
       declarations: [SmbUsersgroupsResourceSidebarComponent, MockSidebarLayoutComponent],
-      providers: [provideRouter([]), { provide: ActivatedRoute, useValue: activatedRouteMock }]
+      providers: [
+        provideRouter([]),
+        { provide: ActivatedRoute, useValue: activatedRouteMock },
+        { provide: SMB_CONTEXT, useValue: SMB_CEPHFS_CONTEXT }
+      ]
     }).compileComponents();
 
     fixture = TestBed.createComponent(SmbUsersgroupsResourceSidebarComponent);
@@ -56,7 +66,7 @@ describe('SmbUsersgroupsResourceSidebarComponent', () => {
       const overviewItem = component.sidebarItems[0];
       expect(overviewItem.label).toBe('Overview');
       expect(overviewItem.route).toEqual([
-        '/cephfs/smb/standalone',
+        `/${SMB_BASE_CEPHFS}/standalone`,
         'standalone-url-id',
         'overview'
       ]);
@@ -75,7 +85,11 @@ describe('SmbUsersgroupsResourceSidebarComponent', () => {
       expect(component.standaloneName).toBe('');
 
       // Sidebar items should still be built, just with empty route fragments
-      expect(component.sidebarItems[0].route).toEqual(['/cephfs/smb/standalone', '', 'overview']);
+      expect(component.sidebarItems[0].route).toEqual([
+        `/${SMB_BASE_CEPHFS}/standalone`,
+        '',
+        'overview'
+      ]);
     });
   });
 

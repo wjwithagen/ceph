@@ -16,6 +16,9 @@
  * without the full complexity of the S3 REST API handlers.
  */
 
+#include <array>
+#include <fmt/compile.h>
+
 #include "rgw_sal_wrapper.h"
 #include "rgw/rgw_sal.h"
 #include "rgw/rgw_bucket.h"
@@ -86,11 +89,30 @@ static int load_bucket( rgw::sal::Driver* driver, const DoutPrefixProvider* dpp,
     bucket_id.tenant = bucket->tenant;
   }
 
-  int ret = driver->load_bucket(dpp, bucket_id, &bucket_out, y);
+  // Select the entrypoint namespace before using the shared object operations.
+  int ret = bucket->is_vector_bucket
+      ? driver->load_vector_bucket(dpp, bucket_id, &bucket_out, y)
+      : driver->load_bucket(dpp, bucket_id, &bucket_out, y);
   if (ret < 0) {
     ldpp_dout(dpp, 1) << "ERROR: sal_wrapper: load_bucket failed for '"
-                      << bucket->name << "' ret=" << ret << dendl;
+                      << bucket->name << "' (vector=" << bucket->is_vector_bucket
+                      << ") ret=" << ret << dendl;
     return ret;
+  }
+
+  // Writers take their owner from the bucket ACL. Loading metadata through SAL
+  // does not populate the in-memory ACL as the S3 frontend normally does.
+  auto& acl = bucket_out->get_acl();
+  const auto& attrs = bucket_out->get_attrs();
+  if (auto it = attrs.find(RGW_ATTR_ACL); it != attrs.end()) {
+    try {
+      auto p = it->second.cbegin();
+      acl.decode(p);
+    } catch (const buffer::error&) {
+      return -EIO;
+    }
+  } else {
+    acl.create_default(bucket_out->get_info().owner, "");
   }
 
   return 0;
@@ -161,6 +183,24 @@ static void c_meta_to_attrs(const DoutPrefixProvider* dpp,
   }
 }
 
+
+namespace {
+
+// "<major>.<minor>" formatted at compile time: fmt's FMT_COMPILE formatting of
+// integral arguments is usable in constant expressions, so the string the Rust
+// side reads is a constant and needs no runtime initialization.
+constexpr auto make_sal_wrapper_version_string() {
+  std::array<char, 32> out{};
+  fmt::format_to(out.data(), FMT_COMPILE("{}.{}"),
+                 RGW_SAL_WRAPPER_VERSION_MAJOR, RGW_SAL_WRAPPER_VERSION_MINOR);
+  return out;
+}
+
+constexpr auto sal_wrapper_version_string = make_sal_wrapper_version_string();
+static_assert(sal_wrapper_version_string.front() != '\0' &&
+              sal_wrapper_version_string.back() == '\0');
+
+} // anonymous namespace
 
 extern "C" {
 
@@ -1544,15 +1584,7 @@ uint64_t rgw_get_max_chunk_size(CRgwDriver* driver_ptr) {
 }
 
 const char* rgw_sal_wrapper_version(void) {
-  static char version[16];
-  static bool initialized = false;
-  if (!initialized) {
-    snprintf(version, sizeof(version), "%d.%d",
-             RGW_SAL_WRAPPER_VERSION_MAJOR,
-             RGW_SAL_WRAPPER_VERSION_MINOR);
-    initialized = true;
-  }
-  return version;
+  return sal_wrapper_version_string.data();
 }
 
 } // extern "C"

@@ -12,6 +12,7 @@
 #include <sys/file.h>
 #include <boost/optional/optional_io.hpp>
 #include <boost/scope_exit.hpp>
+#include "include/scope_guard.h"
 
 #include "common/admin_socket.h"
 #include "common/Clock.h"
@@ -1317,7 +1318,9 @@ void PeerReplayer::unlock_directory(const std::string &dir_root, const DirRegist
 }
 
 int PeerReplayer::build_snap_map(const std::string &dir_root,
-                                 std::map<uint64_t, std::string> *snap_map, bool is_remote) {
+                                 std::map<uint64_t, std::string> *snap_map,
+                                 bool is_remote,
+                                 SnapMetadataMap *snap_metadata_map) {
   auto snap_dir = snapshot_dir_path(m_cct, dir_root);
   dout(20) << ": dir_root=" << dir_root << ", snap_dir=" << snap_dir
            << ", is_remote=" << is_remote << dendl;
@@ -1360,34 +1363,48 @@ int PeerReplayer::build_snap_map(const std::string &dir_root,
       break;
     }
 
+    auto free_info = make_scope_guard([&info] {
+      if (info.nr_snap_metadata) {
+        ceph_free_snap_info_buffer(&info);
+      }
+    });
+
+    std::map<std::string, std::string> metadata;
+    if (info.nr_snap_metadata && (is_remote || snap_metadata_map)) {
+      metadata = decode_snap_metadata(info.snap_metadata, info.nr_snap_metadata);
+    }
+    // remote snaps must carry metadata (PRIMARY_SNAP_ID_KEY) while local
+    // snaps are only checked when the metadata was requested but failed to
+    // decode
+    if (metadata.empty() &&
+        (is_remote || (info.nr_snap_metadata && snap_metadata_map))) {
+      std::string failed_reason = std::string(lr_str) + " fs snapshot '" + snap + "' has invalid metadata";
+      derr << ": " << failed_reason << dendl;
+      m_snap_sync_stats.at(dir_root).last_failed_reason = failed_reason;
+      rv = -EINVAL;
+      break;
+    }
+
     uint64_t snap_id;
     if (is_remote) {
-      if (!info.nr_snap_metadata) {
-        std::string failed_reason = "snapshot '" + snap  + "' has invalid metadata";
-        derr << ": " << failed_reason << dendl;
-        m_snap_sync_stats.at(dir_root).last_failed_reason = failed_reason;
+      dout(20) << ": snap_path=" << snap_path << ", metadata=" << metadata << dendl;
+      auto it = metadata.find(PRIMARY_SNAP_ID_KEY);
+      if (it == metadata.end()) {
+        derr << ": snap_path=" << snap_path << " has missing \"" << PRIMARY_SNAP_ID_KEY
+              << "\" in metadata" << dendl;
         rv = -EINVAL;
+        break;
       } else {
-        auto metadata = decode_snap_metadata(info.snap_metadata, info.nr_snap_metadata);
-        dout(20) << ": snap_path=" << snap_path << ", metadata=" << metadata << dendl;
-        auto it = metadata.find(PRIMARY_SNAP_ID_KEY);
-        if (it == metadata.end()) {
-          derr << ": snap_path=" << snap_path << " has missing \"" << PRIMARY_SNAP_ID_KEY
-               << "\" in metadata" << dendl;
-          rv = -EINVAL;
-        } else {
-          snap_id = std::stoull(it->second);
-        }
-        ceph_free_snap_info_buffer(&info);
+        snap_id = std::stoull(it->second);
       }
     } else {
       snap_id = info.id;
     }
 
-    if (rv != 0) {
-      break;
-    }
     snap_map->emplace(snap_id, snap);
+    if (snap_metadata_map) {
+      snap_metadata_map->emplace(snap_id, std::move(metadata));
+    }
   }
 
   r = ceph_closedir(mnt, dirp);
@@ -1453,7 +1470,9 @@ void PeerReplayer::initialize_checkpoints(const std::string &dir_root) {
 
   // Build local snapshot map
   std::map<uint64_t, std::string> local_snap_map;
-  int r = build_snap_map(dir_root, &local_snap_map, false);
+  SnapMetadataMap local_snap_metadata_map;
+  int r = build_snap_map(dir_root, &local_snap_map, false,
+                         &local_snap_metadata_map);
   if (r < 0) {
     derr << ": failed to build local snap map for dir_root=" << dir_root
          << ": " << cpp_strerror(r) << dendl;
@@ -1482,19 +1501,24 @@ void PeerReplayer::initialize_checkpoints(const std::string &dir_root) {
 
   dout(10) << ": remote_highest_snap_id=" << remote_highest_snap_id << dendl;
 
+  // Already-COMPLETE checkpoints (oldest first). Do not include checkpoints
+  // promoted to COMPLETE in this pass so a newly added checkpoint is not
+  // immediately pruned before the user can observe it.
+  std::vector<CompleteCheckpoint> already_complete;
+  size_t newly_complete = 0;
+
   // Iterate through local snapshots and mark checkpoints as COMPLETE
   // if their snap_id is <= remote_highest_snap_id
   for (const auto &[snap_id, snap_name] : local_snap_map) {
     // Read snapshot metadata
-    auto snap_path = snapshot_path(m_cct, dir_root, snap_name);
-    std::map<std::string, std::string> snap_metadata;
-    r = read_snap_metadata(m_local_mount, snap_path, &snap_metadata);
-    if (r < 0) {
+    auto it = local_snap_metadata_map.find(snap_id);
+    if (it == local_snap_metadata_map.end()) {
       derr << ": failed to read snap metadata for snap_id=" << snap_id
-           << " snap_name=" << snap_name << ": " << cpp_strerror(r) << dendl;
+           << " snap_name=" << snap_name << dendl;
       continue;
     }
 
+    const auto& snap_metadata = it->second;
     if (!has_checkpoint(snap_metadata)) {
       continue;
     }
@@ -1519,8 +1543,52 @@ void PeerReplayer::initialize_checkpoints(const std::string &dir_root) {
       } else {
         dout(10) << ": successfully marked checkpoint as COMPLETE for snap_id=" << snap_id
                  << " snap_name=" << snap_name << dendl;
+        ++newly_complete;
       }
+    } else if (info.status == CheckpointStatus::COMPLETE) {
+      already_complete.push_back(CompleteCheckpoint{
+        snap_id, snap_name, present_checkpoint_metadata_keys(snap_metadata)});
     }
+  }
+
+  prune_old_synced_checkpoints(dir_root, already_complete, newly_complete);
+}
+
+void PeerReplayer::prune_old_synced_checkpoints(
+    const std::string &dir_root,
+    const std::vector<CompleteCheckpoint> &already_complete,
+    size_t newly_complete) {
+  auto keep_count = g_ceph_context->_conf.get_val<uint64_t>(
+    "cephfs_mirror_checkpoint_keep_count");
+
+  size_t total_complete = already_complete.size() + newly_complete;
+  if (total_complete <= keep_count || already_complete.empty()) {
+    dout(20) << ": nothing to prune, already_complete=" << already_complete.size()
+             << " newly_complete=" << newly_complete
+             << " keep_count=" << keep_count << dendl;
+    return;
+  }
+
+  size_t to_remove = std::min(already_complete.size(),
+                              total_complete - keep_count);
+  dout(5) << ": pruning " << to_remove << " old COMPLETE checkpoint(s) under "
+          << dir_root << " (already_complete=" << already_complete.size()
+          << " newly_complete=" << newly_complete
+          << " keep_count=" << keep_count << ")" << dendl;
+
+  for (size_t i = 0; i < to_remove; ++i) {
+    const auto &candidate = already_complete[i];
+    auto snap_path = snapshot_path(m_cct, dir_root, candidate.snap_name);
+    int r = remove_checkpoint_metadata(m_local_mount, snap_path,
+                                       candidate.metadata_keys);
+    if (r < 0) {
+      derr << ": failed to prune checkpoint for snap_id=" << candidate.snap_id
+           << " snap_name=" << candidate.snap_name << " dir_root=" << dir_root
+           << ": " << cpp_strerror(r) << dendl;
+      continue;
+    }
+    dout(10) << ": pruned COMPLETE checkpoint snap_id=" << candidate.snap_id
+             << " snap_name=" << candidate.snap_name << dendl;
   }
 }
 

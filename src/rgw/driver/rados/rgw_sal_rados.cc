@@ -655,6 +655,8 @@ int RadosBucket::remove_bypass_gc(int concurrent_max, bool
   return ret;
 }
 
+RadosVectorBucket::~RadosVectorBucket() = default;
+
 int RadosVectorBucket::unlink(const DoutPrefixProvider* dpp, const rgw_owner& owner, optional_yield y, bool update_entrypoint)
 {
   ldpp_dout(dpp, 20) << "s3vector --- RadosVectorBucket::unlink called" << dendl;
@@ -707,6 +709,34 @@ int RadosVectorBucket::remove(const DoutPrefixProvider* dpp,
     rgw::s3vector::notify_session_delete(dpp, ns, info.bucket.name);
   }
 #endif
+
+  // Once no vector indexes remain, remove internal objects and uploads before
+  // dropping the bucket index. A separate S3 backing bucket is left intact.
+  // This is being indicated by the fact the vector bucket is indexless
+  if (!info.is_indexless()) {
+    ListParams params;
+    params.list_versions = true;
+    params.allow_unordered = true;
+    ListResults results;
+    do {
+      results.objs.clear();
+      int r = list(dpp, params, 1000, results, y);
+      if (r < 0) {
+        return r;
+      }
+      for (const auto& obj : results.objs) {
+        rgw_obj_key key(obj.key);
+        r = rgw_remove_object(dpp, store, this, key, y);
+        if (r < 0 && r != -ENOENT) {
+          return r;
+        }
+      }
+    } while (results.is_truncated);
+    int r = abort_multiparts(dpp, store->ctx(), y);
+    if (r < 0) {
+      return r;
+    }
+  }
 
   RGWObjVersionTracker ot;
 
@@ -790,7 +820,7 @@ int RadosVectorBucket::create(const DoutPrefixProvider* dpp,
   key.bucket_id = params.bucket_id;
 
   int ret = store->getRados()->create_vector_bucket(
-      dpp, y, key, params.owner, params.zonegroup_id,
+      dpp, y, key, params.owner, params.zonegroup_id, params.zone_placement,
       params.placement_rule, params.attrs,
       params.quota, params.creation_time, params.index_type,
       params.index_shards, &bucket_version, info);
@@ -905,7 +935,12 @@ int RadosBucket::sync_owner_stats(const DoutPrefixProvider *dpp, optional_yield 
                                   RGWBucketEnt* ent)
 {
   librados::Rados& rados = *store->getRados()->get_rados_handle();
-  return store->ctl()->bucket->sync_owner_stats(dpp, rados, info.owner, info, y, ent);
+  // This shared method handles both S3 and vector buckets.
+  auto* ctl = info.is_vector() ? store->ctl()->vector_bucket : store->ctl()->bucket;
+  if (info.is_vector() && info.is_indexless()) {
+    return 0;
+  }
+  return ctl->sync_owner_stats(dpp, rados, info.owner, info, y, ent);
 }
 
 int RadosBucket::check_bucket_shards(const DoutPrefixProvider* dpp,
@@ -1021,6 +1056,10 @@ int RadosVectorBucket::put_info(const DoutPrefixProvider* dpp, bool exclusive, c
 
 int RadosBucket::check_empty(const DoutPrefixProvider* dpp, optional_yield y)
 {
+  // Indexless vector buckets have no local objects to inspect.
+  if (info.is_vector() && info.is_indexless()) {
+    return 0;
+  }
   return store->getRados()->check_bucket_empty(dpp, info, y);
 }
 
@@ -2728,11 +2767,12 @@ void RadosStore::get_quota(RGWQuota& quota)
     quota.user_quota = svc()->quota->get_user_quota();
 }
 
-void RadosStore::get_ratelimit(RGWRateLimitInfo& bucket_ratelimit, RGWRateLimitInfo& user_ratelimit, RGWRateLimitInfo& anon_ratelimit)
+void RadosStore::get_ratelimit(RGWRateLimitInfo& bucket_ratelimit, RGWRateLimitInfo& user_ratelimit, RGWRateLimitInfo& account_ratelimit, RGWRateLimitInfo& anon_ratelimit)
 {
   bucket_ratelimit = svc()->zone->get_current_period().get_config().bucket_ratelimit;
   user_ratelimit = svc()->zone->get_current_period().get_config().user_ratelimit;
   anon_ratelimit = svc()->zone->get_current_period().get_config().anon_ratelimit;
+  account_ratelimit = svc()->zone->get_current_period().get_config().account_ratelimit;
 }
 
 int RadosStore::set_buckets_enabled(const DoutPrefixProvider* dpp, vector<rgw_bucket>& buckets, bool enabled, optional_yield y)

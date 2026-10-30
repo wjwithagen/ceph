@@ -73,7 +73,7 @@ public:
       });
   }
 
-  void insert_dup_tail_addr(
+  void insert_dup_head_addr(
       const laddr_t l) {
     buffer.push_back(
       delta_t{
@@ -125,7 +125,7 @@ public:
     buffer.clear();
   }
 
-  std::optional<laddr_t> get_latest_dup_tail_addr() {
+  std::optional<laddr_t> get_latest_dup_head_addr() {
     std::optional<laddr_t> l = std::nullopt;
     for (auto it = buffer.rbegin(); it != buffer.rend(); ++it) {
       if (it->op == delta_t::op_t::ADD_DUP_ADDR) {
@@ -136,7 +136,7 @@ public:
     return l;
   }
 
-  std::optional<laddr_t> get_latest_prev_leaf() {
+  std::optional<laddr_t> get_latest_prev_addr() {
     std::optional<laddr_t> l = std::nullopt;
     for (auto it = buffer.rbegin(); it != buffer.rend(); ++it) {
       if (it->op == delta_t::op_t::ADD_PREV) {
@@ -328,20 +328,25 @@ struct d_bitmap_le_t {
 /**
  * LogKVNodeLayout
  *
- *  [ num_keys ][ prev pointer ][ last_pos ][ d_bitmap ][ key entry #1 ][ value #1 ] ...
+ *  [ num_keys ][ prev pointer ][ last_pos ][ d_bitmap ][ dup head ]
+ *  [ key entry #1 ][ value #1 ] ...
  *
  *  - num_keys:
  *      Total number of key-value pairs stored in this node.
  *
  *  - prev pointer (laddr):
- *      The location of the prev node (logical address).
- *      Set to NULL if this is the last node.
+ *      The location of the next older node of the list (logical address).
+ *      Set to NULL if this is the tail, the oldest node of the list.
  *
  *  - last_pos:
  *      The offset position where the last key-value data ends in this node.
  *
  *  - d_bitmap:
  *      bitmap to keep track of deleted entries.
+ *
+ *  - dup head (laddr):
+ *      The location of the head, the newest node, of the pg_log_dup_t list.
+ *      Only the value in the head of the pg_log_entry_t list is used.
  *
  *  - key entry:
  *      Format: [ key_len ][ val_len ]
@@ -496,9 +501,9 @@ public:
     return uint32_t(size);
   }
 
-  laddr_t get_dup_tail() const {
-    laddr_le_t &dup_tail = *layout.template Pointer<4>(buf);
-    return laddr_t(dup_tail);
+  laddr_t get_dup_head() const {
+    laddr_le_t &dup_head = *layout.template Pointer<4>(buf);
+    return laddr_t(dup_head);
   }
 
   laddr_t get_prev() const {
@@ -518,7 +523,10 @@ public:
   d_bitmap_le_t *get_d_bitmap_ptr() {
     return L::Partial(1, 1, 1, 1, 1).template Pointer<3>(buf);
   }
-  laddr_le_t *get_dup_tail_addr_ptr() {
+  const d_bitmap_le_t *get_d_bitmap_ptr() const {
+    return L::Partial(1, 1, 1, 1, 1).template Pointer<3>(buf);
+  }
+  laddr_le_t *get_dup_head_addr_ptr() {
     return L::Partial(1, 1, 1, 1, 1).template Pointer<4>(buf);
   }
   log_key_le_t *get_node_key_ptr() {
@@ -582,10 +590,10 @@ public:
     *get_node_addr_ptr() = l;
   }
 
-  void set_dup_tail(laddr_t laddr) {
+  void set_dup_head(laddr_t laddr) {
     laddr_le_t l;
     l = laddr;
-    *get_dup_tail_addr_ptr() = l;
+    *get_dup_head_addr_ptr() = l;
   }
 
   void set_size(uint32_t size) {
@@ -605,8 +613,8 @@ public:
     return uint32_t(pos);
   }
 
-  d_bitmap_t get_d_bitmap() {
-    d_bitmap_le_t &bitmap = *get_d_bitmap_ptr();
+  d_bitmap_t get_d_bitmap() const {
+    const d_bitmap_le_t &bitmap = *get_d_bitmap_ptr();
     return d_bitmap_t(bitmap);
   }
 
@@ -718,10 +726,10 @@ public:
     recorder->insert_prev_addr(l);
   }
 
-  void journal_append_dup_tail_addr(
+  void journal_append_dup_head_addr(
     const laddr_t l,
     delta_buffer_t *recorder) {
-    recorder->insert_dup_tail_addr(l);
+    recorder->insert_dup_head_addr(l);
   }
 
   void journal_append_init(
@@ -755,7 +763,7 @@ public:
     set_last_pos(0); 
     set_size(0);
     set_prev_node(L_ADDR_NULL);
-    set_dup_tail(L_ADDR_NULL);
+    set_dup_head(L_ADDR_NULL);
     set_reserved_len(0);
     set_reserved_size(0);
     
@@ -777,7 +785,7 @@ struct LogNode
   explicit LogNode(ceph::bufferptr &&ptr) : LogicalChildNode(std::move(ptr)) {
     set_layout_buf(this->get_bptr().c_str(), this->get_bptr().length());
     set_prev_node(L_ADDR_NULL);
-    set_dup_tail(L_ADDR_NULL);
+    set_dup_head(L_ADDR_NULL);
   }
   explicit LogNode(extent_len_t length) : LogicalChildNode(length) {}
 
@@ -788,7 +796,7 @@ struct LogNode
     set_size(get_size());
     set_reserved_len(rhs.get_reserved_len());
     set_reserved_size(rhs.get_reserved_size());
-    set_dup_tail(rhs.get_dup_tail_addr());
+    set_dup_head(rhs.get_dup_head_addr());
   }
   ~LogNode() {}
 
@@ -818,7 +826,7 @@ struct LogNode
   }
 
   mutable delta_buffer_t delta_buffer;
-  delta_buffer_t *maybe_get_delta_buffer() {
+  delta_buffer_t *maybe_get_delta_buffer() const {
     return is_mutation_pending() ? &delta_buffer : nullptr;
   }
 
@@ -848,7 +856,7 @@ struct LogNode
   using get_value_ret = OMapManager::omap_get_value_ret;
   get_value_ret get_value(const std::string &key, copy_t c = copy_t::DEEP);
 
-  void set_dup_tail_addr(laddr_t laddr);
+  void set_dup_head_addr(laddr_t laddr);
 
   void append_remove(ceph::bufferlist bl);
 
@@ -860,7 +868,6 @@ struct LogNode
   void remove_last_entry();
 
   void set_cur_bitmap(uint32_t begin, uint32_t end);
-  d_bitmap_t get_cur_bitmap();
   void set_bitmap(d_bitmap_t map);
 
   // start and end should exist in the node
@@ -881,7 +888,7 @@ struct LogNode
     uint32_t index = 0;
     bool remove = false;
     std::string last;
-    d_bitmap_t map = get_cur_bitmap();
+    d_bitmap_t map = get_live_bitmap();
     while(iter != iter_end()) {
       auto key = iter->get_key();
       if (s <= key && key <= e) {
@@ -914,7 +921,7 @@ struct LogNode
 
   // The deletion bitmap in effect for this transaction, i.e. including any
   // pending delta.
-  d_bitmap_t get_live_bitmap();
+  d_bitmap_t get_live_bitmap() const;
 
   /*
    * Invoke fn(entry, index) for every entry of this node that is not marked
@@ -923,7 +930,7 @@ struct LogNode
    * materialising its keys.
    */
   template <typename F>
-  void for_each_live_entry(F&& fn) {
+  void for_each_live_entry(F&& fn) const {
     d_bitmap_t bitmap = get_live_bitmap();
     uint32_t index = 0;
     auto iter = iter_begin();
@@ -944,22 +951,22 @@ struct LogNode
 
   std::ostream &print_detail_l(std::ostream &out) const final;
 
-  laddr_t get_dup_tail_addr() const {
+  laddr_t get_dup_head_addr() const {
     if (is_mutation_pending() || is_exist_mutation_pending()) {
       if (!delta_buffer.empty()) {
-	auto ret = delta_buffer.get_latest_dup_tail_addr();
+	auto ret = delta_buffer.get_latest_dup_head_addr();
 	if (ret) {
 	  return *ret;
 	}
       }
     }
-    return this->get_dup_tail();
+    return this->get_dup_head();
   }
 
   laddr_t get_prev_addr() const {
     if (is_mutation_pending() || is_exist_mutation_pending()) {
       if (!delta_buffer.empty()) {
-	auto ret = delta_buffer.get_latest_prev_leaf();
+	auto ret = delta_buffer.get_latest_prev_addr();
 	if (ret) {
 	  return *ret;
 	}

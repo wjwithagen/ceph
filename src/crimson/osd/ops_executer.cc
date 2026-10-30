@@ -490,6 +490,9 @@ template <class Func>
 auto OpsExecuter::do_write_op_attr_cache(Func&& f, OpsExecuter::modified_by m) {
   ++num_write;
   check_init_op_params(m);
+  if (!attr_cache_backup) {
+    attr_cache_backup = obc->attr_cache;
+  }
   return std::forward<Func>(f)(pg->get_backend(), obc->obs, txn, obc->attr_cache);
 }
 OpsExecuter::call_errorator::future<> OpsExecuter::do_assert_ver(
@@ -664,8 +667,10 @@ OpsExecuter::do_execute_op(OSDOp& osd_op)
       return backend.get_xattrs(os, attr_cache, osd_op, delta_stats);
     });
   case CEPH_OSD_OP_CMPXATTR:
-    return do_read_op([this, &osd_op](auto& backend, const auto& os) {
-      return backend.cmp_xattr(os, osd_op, delta_stats);
+    return do_read_attr_cache([this, &osd_op](auto& backend,
+					      const auto& attr_cache,
+					      const auto& os) {
+      return backend.cmp_xattr(os, attr_cache, osd_op, delta_stats);
     });
   case CEPH_OSD_OP_RMXATTR:
     return do_write_op_attr_cache([&osd_op](auto& backend, auto& os, auto& txn, auto& attr_cache) {
@@ -688,12 +693,12 @@ OpsExecuter::do_execute_op(OSDOp& osd_op)
       return backend.writefull(os, osd_op, txn, *osd_op_params, delta_stats);
     });
   case CEPH_OSD_OP_ROLLBACK:
-    return do_write_op([this, &head=obc,
-                        &osd_op](auto& backend, auto& os, auto& txn) {
+    return do_write_op_attr_cache([this, &head=obc, &osd_op](
+      auto& backend, auto& os, auto& txn, auto& attr_cache) {
       ceph_assert(obc->ssc);
       return backend.rollback(os, obc->ssc->snapset,
 			      osd_op, txn, *osd_op_params, delta_stats,
-                              head, pg->obc_loader, snapc);
+                              head, pg->obc_loader, snapc, attr_cache);
     });
   case CEPH_OSD_OP_APPEND:
     return do_write_op([this, &osd_op](auto& backend, auto& os, auto& txn) {
@@ -725,7 +730,8 @@ OpsExecuter::do_execute_op(OSDOp& osd_op)
                      __func__, obc->obs.oi.soid);
       whiteout = true;
     }
-    return do_write_op([this, whiteout](auto& backend, auto& os, auto& txn) {
+    return do_write_op_attr_cache([this, whiteout](
+      auto& backend, auto& os, auto& txn, auto& attr_cache) {
       struct emptyctx_t {};
       return with_effect_on_obc(
 	emptyctx_t{},
@@ -741,7 +747,7 @@ OpsExecuter::do_execute_op(OSDOp& osd_op)
 	    num_bytes = obc->obs.oi.size;
 	  }
 	  return backend.remove(os, txn, *osd_op_params,
-				delta_stats, whiteout, num_bytes);
+				delta_stats, whiteout, num_bytes, attr_cache);
 	},
 	[](auto &&ctx, ObjectContextRef obc, Ref<PG>) {
 	  return seastar::do_for_each(
@@ -1131,6 +1137,11 @@ ObjectContextRef OpsExecuter::prepare_clone(
 
   clone_obc->set_clone_state(std::move(clone_obs));
   clone_obc->ssc = obc->ssc;
+  // No op of this request has run yet, so obc->attr_cache holds the
+  // xattrs that clone_for_write() copies to the clone. The clone does
+  // not get SS_ATTR.
+  clone_obc->attr_cache = obc->attr_cache;
+  clone_obc->attr_cache.erase(SS_ATTR);
   return clone_obc;
 }
 

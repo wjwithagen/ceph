@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.22.1)
 
 project(ceph
-  VERSION 21.0.0
+  VERSION 22.0.0
   LANGUAGES CXX C ASM)
 
 foreach(policy CMP0127 CMP0135
@@ -108,6 +108,9 @@ if(WITH_CCACHE)
     set(CMAKE_CXX_COMPILER_LAUNCHER ${CCACHE_EXECUTABLE})
   endif()
 endif(WITH_CCACHE)
+
+set(CEPH_VENDOR_RELEASE "" CACHE STRING
+  "Vendor release string appended to the ceph version string")
 
 option(WITH_SCCACHE "Build with sccache.")
 if(WITH_SCCACHE)
@@ -344,8 +347,8 @@ CMAKE_DEPENDENT_OPTION(WITH_SPDK "Enable SPDK" OFF
   "CMAKE_SYSTEM_PROCESSOR MATCHES i386|i686|amd64|x86_64|AMD64|aarch64|riscv64" OFF)
 option(WITH_SYSTEM_SPDK "Require a system SPDK instead of building bundled src/spdk" OFF)
 if(WITH_SPDK)
-  if(NOT WITH_BLUESTORE)
-    message(SEND_ERROR "Please enable WITH_BLUESTORE for using SPDK")
+  if(NOT WITH_BLUESTORE AND NOT WITH_CRIMSON)
+    message(SEND_ERROR "Please enable WITH_BLUESTORE or WITH_CRIMSON for using SPDK")
   endif()
   if(WITH_SYSTEM_SPDK)
     find_package(spdk REQUIRED)
@@ -822,6 +825,31 @@ if(sanitizers)
   string(APPEND CMAKE_EXE_LINKER_FLAGS " ${sanitiers_compile_flags}")
   string(APPEND CMAKE_SHARED_LINKER_FLAGS " ${sanitiers_compile_flags}")
 endif()
+
+# Frame pointers: cheap and reliable stack walking for profilers (perf, eBPF)
+# and debuggers. Off by default for release build types, to keep production
+# packages unchanged; CI/QA package builds enable it explicitly.
+# (crimson always builds with frame pointers; see src/crimson/CMakeLists.txt)
+if(CMAKE_BUILD_TYPE STREQUAL Debug)
+  set(frame_pointers_default ON)
+else()
+  set(frame_pointers_default OFF)
+endif()
+option(WITH_FRAME_POINTERS "build with -fno-omit-frame-pointer"
+  ${frame_pointers_default})
+include(CheckCXXCompilerFlag)
+check_cxx_compiler_flag("-mno-omit-leaf-frame-pointer"
+  HAS_NO_OMIT_LEAF_FRAME_POINTER)
+set(FRAME_POINTER_COMPILE_OPTIONS
+  $<$<COMPILE_LANGUAGE:C,CXX>:-fno-omit-frame-pointer>)
+if(HAS_NO_OMIT_LEAF_FRAME_POINTER)
+  list(APPEND FRAME_POINTER_COMPILE_OPTIONS
+    $<$<COMPILE_LANGUAGE:C,CXX>:-mno-omit-leaf-frame-pointer>)
+endif()
+if(WITH_FRAME_POINTERS)
+  add_compile_options(${FRAME_POINTER_COMPILE_OPTIONS})
+endif()
+message(STATUS "frame pointers: ${WITH_FRAME_POINTERS}")
 
 # Jerasure & GF-Complete
 option(WITH_SYSTEM_JERASURE "require and build with system jerasure and gf-complete" OFF)

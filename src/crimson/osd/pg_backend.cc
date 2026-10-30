@@ -825,7 +825,8 @@ PGBackend::rollback_iertr::future<> PGBackend::rollback(
   object_stat_sum_t& delta_stats,
   crimson::osd::ObjectContextRef head,
   crimson::osd::ObjectContextLoader& obc_loader,
-  const SnapContext &snapc)
+  const SnapContext &snapc,
+  ObjectContext::attr_cache_t& attr_cache)
 {
   const ceph_osd_op& op = osd_op.op;
   snapid_t snapid = (uint64_t)op.snap.snapid;
@@ -836,7 +837,7 @@ PGBackend::rollback_iertr::future<> PGBackend::rollback(
   target_coid.snap = snapid;
   return obc_loader.with_clone_obc_only<RWState::RWWRITE>(
     head, target_coid,
-    [this, &os, &txn, &delta_stats, &osd_op_params, snapid]
+    [this, &os, &txn, &delta_stats, &osd_op_params, snapid, &attr_cache]
     (auto head_obc, auto resolved_obc) {
     if (resolved_obc->obs.oi.soid.is_head()) {
       // no-op: The resolved oid returned the head object
@@ -864,6 +865,8 @@ PGBackend::rollback_iertr::future<> PGBackend::rollback(
     // 2) Clone correct snapshot into head
     txn.clone(coll->get_cid(), ghobject_t{resolved_obc->obs.oi.soid},
                                ghobject_t{os.oi.soid});
+    //    The head now has the xattrs of the clone
+    attr_cache = resolved_obc->attr_cache;
     //    Copy clone obc.os.oi to os.oi
     os.oi.clear_flag(object_info_t::FLAG_WHITEOUT);
     os.oi.copy_user_bits(resolved_obc->obs.oi);
@@ -898,13 +901,14 @@ PGBackend::rollback_iertr::future<> PGBackend::rollback(
     // if there's no snapshot, we delete the object;
     // otherwise, do nothing.
     crimson::ct_error::enoent::handle(
-    [this, &os, snapid, &txn, &delta_stats, &snapc, &ss, &osd_op_params] {
+    [this, &os, snapid, &txn, &delta_stats, &snapc, &ss, &osd_op_params,
+     &attr_cache] {
       logger().debug("PGBackend::rollback: deleting head on {}"
                      " with snap_id of {}"
                      " because got ENOENT|whiteout on obc lookup",
                      os.oi.soid, snapid);
       return remove(os, txn, osd_op_params, delta_stats,
-                    should_whiteout(ss, snapc), os.oi.size
+                    should_whiteout(ss, snapc), os.oi.size, attr_cache
       ).handle_error_interruptible(
 	crimson::ct_error::enoent::handle([] {
 	  // We consider rolling back a non-existing head to
@@ -1051,7 +1055,8 @@ PGBackend::remove(ObjectState& os, ceph::os::Transaction& txn,
   osd_op_params_t& osd_op_params,
   object_stat_sum_t& delta_stats,
   bool whiteout,
-  int num_bytes)
+  int num_bytes,
+  ObjectContext::attr_cache_t& attr_cache)
 {
   if (!os.exists) {
     logger().debug("{} {} does not exist",__func__, os.oi.soid);
@@ -1063,6 +1068,7 @@ PGBackend::remove(ObjectState& os, ceph::os::Transaction& txn,
   }
   txn.remove(coll->get_cid(),
 	     ghobject_t{os.oi.soid, ghobject_t::NO_GEN, get_shard()});
+  attr_cache.clear();
 
   if (os.oi.is_omap()) {
     os.oi.clear_flag(object_info_t::FLAG_OMAP);
@@ -1176,6 +1182,28 @@ PGBackend::setxattr_ierrorator::future<> PGBackend::setxattr(
   });
 }
 
+PGBackend::get_attr_ierrorator::future<ceph::bufferlist>
+PGBackend::get_xattr_maybe_from_cache(
+  const ObjectState& os,
+  const ObjectContext::attr_cache_t& attr_cache,
+  std::string&& name) const
+{
+  if (!is_erasure()) {
+    logger().debug("getxattr on obj={} for attr={}", os.oi.soid, name);
+    return getxattr(os.oi.soid, std::move(name));
+  }
+  if (!os.exists) {
+    logger().debug("getxattr: object {} does not exist (erasure)", os.oi.soid);
+    return crimson::ct_error::enoent::make();
+  }
+  if (auto cache_it = attr_cache.find(name); cache_it != std::end(attr_cache)) {
+    return get_attr_ierrorator::make_ready_future<ceph::bufferlist>(
+      cache_it->second);
+  }
+  logger().debug("getxattr on obj={} for attr={}", os.oi.soid, name);
+  return crimson::ct_error::enodata::make();
+}
+
 PGBackend::get_attr_ierrorator::future<> PGBackend::getxattr(
   const ObjectState& os,
   const ObjectContext::attr_cache_t& attr_cache,
@@ -1189,24 +1217,9 @@ PGBackend::get_attr_ierrorator::future<> PGBackend::getxattr(
     bp.copy(osd_op.op.xattr.name_len, aname);
     name = "_" + aname;
   }
-  auto get_attr_maybe_from_cache =
-    [&] () mutable -> get_attr_ierrorator::future<ceph::bufferlist> {
-    if (!is_erasure()) {
-      logger().debug("getxattr on obj={} for attr={}", os.oi.soid, name);
-      return getxattr(os.oi.soid, std::move(name));
-    }
-    if (auto cache_it = attr_cache.find(name); cache_it != std::end(attr_cache)) {
-      return get_attr_ierrorator::make_ready_future<ceph::bufferlist>(
-        cache_it->second);
-    }
-    logger().debug("getxattr on obj={} for attr={}", os.oi.soid, name);
-    return crimson::ct_error::enodata::make();
-  };
-  if (is_erasure() && !os.exists) {
-    logger().debug("getxattr: object {} does not exist (erasure)", os.oi.soid);
-    return crimson::ct_error::enoent::make();
-  }
-  return get_attr_maybe_from_cache().safe_then_interruptible(
+  return get_xattr_maybe_from_cache(
+    os, attr_cache, std::move(name)
+  ).safe_then_interruptible(
     [&delta_stats, &osd_op] (ceph::bufferlist&& val) {
     osd_op.outdata = std::move(val);
     osd_op.op.xattr.value_len = osd_op.outdata.length();
@@ -1293,6 +1306,7 @@ static int do_xattr_cmp_u64(int op, uint64_t lhs, bufferlist& rhs_xattr)
 
 PGBackend::cmp_xattr_ierrorator::future<> PGBackend::cmp_xattr(
   const ObjectState& os,
+  const ObjectContext::attr_cache_t& attr_cache,
   OSDOp& osd_op,
   object_stat_sum_t& delta_stats) const
 {
@@ -1301,7 +1315,9 @@ PGBackend::cmp_xattr_ierrorator::future<> PGBackend::cmp_xattr(
   bp.copy(osd_op.op.xattr.name_len, name);
  
   logger().debug("cmpxattr on obj={} for attr={}", os.oi.soid, name);
-  return getxattr(os.oi.soid, std::move(name)).safe_then_interruptible(
+  return get_xattr_maybe_from_cache(
+    os, attr_cache, std::move(name)
+  ).safe_then_interruptible(
     [&delta_stats, &osd_op] (auto &&xattr) -> cmp_xattr_ierrorator::future<> {
     delta_stats.num_rd++;
     delta_stats.num_rd_kb += shift_round_up(osd_op.op.xattr.value_len, 10);
