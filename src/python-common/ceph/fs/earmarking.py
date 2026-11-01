@@ -25,6 +25,11 @@ log = logging.getLogger(__name__)
 
 XATTR_SUBVOLUME_EARMARK_NAME = 'user.ceph.subvolume.earmark'
 
+# FreeBSD's errno module has no ENODATA (Linux/SysV-specific); it uses
+# ENOATTR for "attribute not found" instead. Fall back accordingly so this
+# still works when the platform's libc doesn't define ENODATA.
+_ENODATA = getattr(errno, 'ENODATA', getattr(errno, 'ENOATTR', 61))
+
 
 class FSOperations(Protocol):
     """Protocol class representing the file system operations earmarking
@@ -77,7 +82,7 @@ class CephFSVolumeEarmarking:
                 errno.EINVAL, f"Invalid earmark specified: {e}"
             ) from e
         elif isinstance(e, OSError):
-            if e.errno == errno.ENODATA:
+            if e.errno == _ENODATA:
                 # Return empty string when earmark is not set
                 log.info(
                     f"No earmark set for the path while {action}. Returning empty result."

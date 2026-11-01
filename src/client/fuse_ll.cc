@@ -31,6 +31,9 @@
 #include <sys/xattr.h>
 #include <linux/magic.h>
 #endif
+#if defined(__freebsd__)
+#include "include/xattr_compat.h"
+#endif
 
 // ceph
 #include "common/debug.h"

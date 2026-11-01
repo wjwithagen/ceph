@@ -148,7 +148,7 @@ int ClassHandler::_load_class(ClassData *cls)
 	     cls->name.c_str());
     ldout(cct, 10) << "_load_class " << cls->name << " from " << fname << dendl;
 
-    cls->handle = dlopen(fname, RTLD_NOW);
+    cls->handle = dlopen(fname, RTLD_NOW | RTLD_GLOBAL);
     if (!cls->handle) {
       struct stat st;
       int r = ::stat(fname, &st);

@@ -23,6 +23,7 @@
 #include <string>
 
 #include "auth/KeyRing.h"
+#include "ceph_ver.h"
 #include "osd/OSD.h"
 #include "os/ObjectStore.h"
 #include "mon/MonClient.h"
@@ -710,6 +711,14 @@ flushjournal_out:
   global_init_chdir(g_ceph_context);
 
   if (global_init_preload_erasure_code(g_ceph_context) < 0) {
+    derr << "failed to preload erasure code plugins from "
+         << g_conf().get_val<std::string>("erasure_code_dir")
+         << ": " << cpp_strerror(r) << "; exiting" << dendl;
+    if (r == -EXDEV) {
+      derr << "erasure code plugin version does not match this ceph-osd ("
+           << CEPH_GIT_NICE_VER << "); binary and plugins must come from "
+           << "the same build" << dendl;
+    }
     forker.exit(1);
   }
 

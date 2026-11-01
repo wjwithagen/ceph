@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-set -ex
+export PS4='+ $BASH_SOURCE:$LINENO: '
+set -e
+set -xv
 
 if [ -d .git ]; then
     git submodule update --init --recursive --recommend-shallow
@@ -8,9 +10,19 @@ fi
 : ${BUILD_DIR:=build}
 : ${CEPH_GIT_DIR:=..}
 
+ALLOW_EXISTING=0
+if [ "$1" = "--allow-existing-builddir" ]; then
+    ALLOW_EXISTING=1
+    shift
+fi
+
 if [ -e $BUILD_DIR ]; then
-    echo "'$BUILD_DIR' dir already exists; either rm -rf '$BUILD_DIR' and re-run, or set BUILD_DIR env var to a different directory name"
-    exit 1
+    if [ "$ALLOW_EXISTING" = "1" ]; then
+        echo "'$BUILD_DIR' dir already exists; --allow-existing-builddir given, reusing it"
+    else
+        echo "'$BUILD_DIR' dir already exists; either rm -rf '$BUILD_DIR' and re-run, or set BUILD_DIR env var to a different directory name"
+        exit 1
+    fi
 fi
 
 PYBUILD="3"
@@ -59,8 +71,8 @@ if [ -r /etc/os-release ]; then
   esac
 elif [ "$(uname)" == FreeBSD ] ; then
   PYBUILD="3"
-  ARGS+=" -DWITH_RADOSGW_AMQP_ENDPOINT=OFF"
-  ARGS+=" -DWITH_RADOSGW_KAFKA_ENDPOINT=OFF"
+  ARGS+=" -DCMAKE_CXX_COMPILER=$cxx_compiler"
+  ARGS+=" -DCMAKE_C_COMPILER=$c_compiler"
 else
   echo Unknown release
   exit 1
@@ -76,20 +88,25 @@ elif type ccache > /dev/null 2>&1 ; then
     ARGS+=" -DWITH_CCACHE=ON"
 fi
 
-cxx_compiler="g++"
-c_compiler="gcc"
-# 20 is used for more future-proof
-for i in $(seq 20 -1 11); do
-  if type -t gcc-$i > /dev/null; then
-    cxx_compiler="g++-$i"
-    c_compiler="gcc-$i"
-    break
-  fi
-done
-ARGS+=" -DCMAKE_CXX_COMPILER=$cxx_compiler"
-ARGS+=" -DCMAKE_C_COMPILER=$c_compiler"
-
-mkdir $BUILD_DIR
+if [ "$(uname)" != FreeBSD ] ; then
+	cxx_compiler="g++"
+	c_compiler="gcc"
+	# 20 is used for more future-proof
+	for i in $(seq 20 -1 11); do
+	  if type -t gcc-$i > /dev/null; then
+		cxx_compiler="g++-$i"
+		c_compiler="gcc-$i"
+		break
+	  fi
+	ARGS+=" -DCMAKE_CXX_COMPILER=$cxx_compiler"
+	ARGS+=" -DCMAKE_C_COMPILER=$c_compiler"
+	done
+else
+	# To force Clang (default behavior on FreeBSD)
+	export CC=clang
+	export CXX=clang++
+fi
+mkdir -p $BUILD_DIR
 cd $BUILD_DIR
 
 # Only set CMAKE variable if not already set by user/environment.

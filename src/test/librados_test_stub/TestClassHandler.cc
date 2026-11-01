@@ -29,7 +29,7 @@ TestClassHandler::~TestClassHandler() {
 
 void TestClassHandler::open_class(const std::string& name,
                                   const std::string& path) {
-  void *handle = dlopen(path.c_str(), RTLD_NOW);
+  void *handle = dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL);
   if (handle == NULL) {
     std::cerr << "Failed to load class: " << name << " (" << path << "): "
               << dlerror() << std::endl;

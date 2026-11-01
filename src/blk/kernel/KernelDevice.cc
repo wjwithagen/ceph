@@ -40,6 +40,7 @@
 #include "common/errno.h"
 #if defined(__FreeBSD__)
 #include "bsm/audit_errno.h"
+#include <sys/sysctl.h>
 #endif
 #include "common/debug.h"
 #include "common/numa.h"
@@ -230,8 +231,18 @@ int KernelDevice::open(const string& p)
   r = posix_fadvise(fd_buffereds[WRITE_LIFE_NOT_SET], 0, 0, POSIX_FADV_RANDOM);
   if (r) {
     r = -r;
-    derr << __func__ << " posix_fadvise got: " << cpp_strerror(r) << dendl;
-    goto out_fail;
+    if (r == -ENODEV || r == -EOPNOTSUPP) {
+      // posix_fadvise() is advisory. FreeBSD only implements it for
+      // regular files and returns ENODEV for anything else, which includes
+      // every disk device (disks are character devices there). There is no
+      // readahead to tune, so this is a no-op, not a failure.
+      dout(10) << __func__ << " posix_fadvise not supported on this device, "
+               << "ignoring: " << cpp_strerror(r) << dendl;
+      r = 0;
+    } else {
+      derr << __func__ << " posix_fadvise got: " << cpp_strerror(r) << dendl;
+      goto out_fail;
+    }
   }
 
   if (lock_exclusive) {
@@ -271,7 +282,7 @@ int KernelDevice::open(const string& p)
     BlkDev blkdev_direct(fd_directs[WRITE_LIFE_NOT_SET]);
     BlkDev blkdev_buffered(fd_buffereds[WRITE_LIFE_NOT_SET]);
 
-    if (S_ISBLK(st.st_mode)) {
+    if (S_ISBLK(st.st_mode) || S_ISCHR(st.st_mode)) {
       int64_t s;
       r = blkdev_direct.get_size(&s);
       if (r < 0) {
@@ -487,6 +498,21 @@ int KernelDevice::detect_ebd(std::string& id)
   return -ENOENT;
 }
 
+static inline bool bdev_buffered(bool buffered)
+{
+  // FreeBSD has no buffered block devices: every disk is a character device
+  // and all I/O goes straight through physio(9)/GEOM, which requires the
+  // offset and the length of *each iovec* to be a multiple of the sector size.
+  // The "buffered" fd therefore is just a second direct fd, but without the
+  // alignment handling of the direct path (direct_read_unaligned(),
+  // rebuild_aligned_size_and_memory()).  Force all I/O onto the direct path.
+#if defined(__FreeBSD__)
+  return false;
+#else
+  return buffered;
+#endif
+}
+
 int KernelDevice::choose_fd(bool buffered, int write_hint) const
 {
 #if defined(F_SET_FILE_RW_HINT)
@@ -548,16 +574,69 @@ int KernelDevice::_aio_start()
 {
   if (aio) {
     dout(10) << __func__ << dendl;
+#if defined(HAVE_POSIXAIO)
+    // FreeBSD's POSIX AIO limits are sysctls whose defaults are far below
+    // what an OSD submits. vfs.aio.max_buf_aio counts iovecs and must
+    // cover an aio_writev() of up to IOV_MAX segments.
+    // vfs.aio.max_aio_queue_per_proc is per process, and an OSD opens at
+    // least two KernelDevices with their own queue of
+    // bdev_aio_max_queue_depth (BlueStore's block device, and BlueFS
+    // opening the same device again), plus one more for each separate
+    // db or wal device. If a limit is too low, submissions fail with
+    // EAGAIN until submit_batch() gives up and aio_submit() asserts, so
+    // refuse to start with a clear message instead.
+    // vfs.aio.max_aio_queue is system-wide and shared by all OSDs on the
+    // host, so it cannot be checked per process.
+    auto check_sysctl = [this, func = __func__](const char *name,
+                                                int needed,
+                                                const char *hint) {
+      int value = 0;
+      size_t len = sizeof(value);
+      if (::sysctlbyname(name, &value, &len, nullptr, 0) < 0) {
+        int r = -errno;
+        derr << func << " sysctl " << name << " failed: "
+             << cpp_strerror(r) << dendl;
+        return r;
+      }
+      if (value < needed) {
+        derr << func << " " << name << " is " << value
+             << ", but at least " << needed << " is required; raise it"
+             << " with 'sysctl " << name << "=" << needed << "'"
+             << hint << dendl;
+        return -EINVAL;
+      }
+      return 0;
+    };
+    int depth = static_cast<int>(cct->_conf->bdev_aio_max_queue_depth);
+    int r = check_sysctl("vfs.aio.max_buf_aio", IOV_MAX, "");
+    if (r == 0) {
+      r = check_sysctl("vfs.aio.max_aio_queue_per_proc", 2 * depth,
+                       " (each OSD opens its block device twice; add "
+                       "bdev_aio_max_queue_depth for each separate db or "
+                       "wal device)");
+    }
+    if (r == 0) {
+      r = io_queue->init(fd_directs);
+      if (r < 0) {
+        derr << __func__ << " aio queue init (kqueue) failed: "
+             << cpp_strerror(r) << dendl;
+      }
+    }
+    if (r < 0) {
+      return r;
+    }
+#else
     int r = io_queue->init(fd_directs);
     if (r < 0) {
       if (r == -EAGAIN) {
-	derr << __func__ << " io_setup(2) failed with EAGAIN; "
-	     << "try increasing /proc/sys/fs/aio-max-nr" << dendl;
+        derr << __func__ << " io_setup(2) failed with EAGAIN; "
+             << "try increasing /proc/sys/fs/aio-max-nr" << dendl;
       } else {
-	derr << __func__ << " io_setup(2) failed: " << cpp_strerror(r) << dendl;
+        derr << __func__ << " io_setup(2) failed: " << cpp_strerror(r) << dendl;
       }
       return r;
     }
+#endif
     aio_thread.create("bstore_aio");
   }
   return 0;
@@ -575,6 +654,34 @@ void KernelDevice::_aio_stop()
     aio_submit(&wakeup_ctx);
 
     aio_thread.join();
+
+#if defined(HAVE_POSIXAIO)
+    // The aio thread leaves its loop as soon as it sees aio_stop, which can
+    // be before the wakeup read above has completed, or before the thread
+    // collected it.  FreeBSD keeps a finished job until aio_return() is
+    // called for it, and looks that job up by the address of its aiocb.  A
+    // job left behind here stays in the kernel after wakeup_ctx (and with
+    // it this aio_t) is freed, and the next aio_t that is allocated at the
+    // same address gets the result of the leftover job instead of its own:
+    // the 4096 byte wakeup read hands its length to whatever request lands
+    // on that address next, and that request's own result follows the one
+    // after it ("aio to ... but returned" abort in _aio_thread()).
+    // Collect the job here.  This also keeps the kernel from writing into
+    // bl after it is gone.
+    for (auto& a : wakeup_ctx.running_aios) {
+      int e;
+      int tries = 0;
+      while ((e = aio_error(&a.aio)) == EINPROGRESS && tries++ < 10000) {
+	usleep(1000);
+      }
+      if (e == EINPROGRESS) {
+        derr << __func__ << " wakeup read still in progress after 10s"
+             << dendl;
+      } else if (e != EINVAL && e != -1) {
+        aio_return(&a.aio);
+      }
+    }
+#endif
 
     if (cct->_conf->bdev_debug_aio) {
       for (auto& i: wakeup_ctx.running_aios) {
@@ -688,6 +795,40 @@ void KernelDevice::_aio_thread()
       dout(30) << __func__ << " got " << r << " completed aios" << dendl;
       for (int i = 0; i < r; ++i) {
 	IOContext *ioc = static_cast<IOContext*>(aio[i]->priv);
+#if defined(HAVE_POSIXAIO)
+	// aio_writev()/aio_readv() on a raw GEOM provider can complete with
+	// fewer bytes than asked for (seen: a 0x5000 write that returned
+	// 4096).  That is a partial transfer, not an error: issue the rest
+	// and treat the request as finished only when all of it is done.
+	{
+	  long short_r = aio[i]->get_return_value();
+	  if (short_r > 0 && (uint64_t)short_r < aio[i]->length) {
+	    const uint64_t s_off = aio[i]->offset;
+	    const uint64_t s_len = aio[i]->length;
+	    if (aio[i]->advance(short_r, block_size)) {
+	      int retries = 0;
+	      int rr = io_queue->resubmit(
+		aio[i], &retries,
+		cct->_conf->bdev_aio_submit_retry_max,
+		cct->_conf->bdev_aio_submit_retry_initial_delay_us);
+	      if (rr >= 0) {
+		dout(1) << __func__ << " aio to 0x" << std::hex << s_off
+			<< "~" << s_len << std::dec << " returned only "
+			<< short_r << ", submitted the remaining "
+			<< aio[i]->length << " bytes" << dendl;
+		continue;
+	      }
+	      derr << __func__ << " resubmit of the rest of aio to 0x"
+		   << std::hex << s_off << "~" << s_len << std::dec
+		   << " failed: " << cpp_strerror(rr) << dendl;
+	    }
+	    // not aligned, or resubmit failed: report it the old way below
+	    aio[i]->offset = s_off;
+	    aio[i]->length = s_len;
+	    aio[i]->rval = short_r;
+	  }
+	}
+#endif
 	_aio_log_finish(ioc, aio[i]->offset, aio[i]->length);
 	if (aio[i]->queue_item.is_linked()) {
 	  std::lock_guard l(debug_queue_lock);
@@ -717,7 +858,7 @@ void KernelDevice::_aio_thread()
 		path.c_str(),
 		r,
 #if defined(HAVE_POSIXAIO)
-                aio[i]->aio.aiocb.aio_lio_opcode,
+                aio[i]->aio.aio_lio_opcode,
 #else
                 aio[i]->iocb.aio_lio_opcode,
 #endif
@@ -1118,6 +1259,7 @@ int KernelDevice::write(
   bool buffered,
   int write_hint)
 {
+  buffered = bdev_buffered(buffered);
   uint64_t len = bl.length();
   dout(20) << __func__ << " 0x" << std::hex << off << "~" << len << std::dec
 	   << " " << buffermode(buffered) 
@@ -1147,6 +1289,7 @@ int KernelDevice::aio_write(
   bool buffered,
   int write_hint)
 {
+  buffered = bdev_buffered(buffered);
   uint64_t len = bl.length();
   dout(20) << __func__ << " 0x" << std::hex << off << "~" << len << std::dec
 	   << " " << buffermode(buffered)
@@ -1168,7 +1311,7 @@ int KernelDevice::aio_write(
 
   _aio_log_start(ioc, off, len);
 
-#ifdef HAVE_LIBAIO
+#if defined(HAVE_LIBAIO) || defined(HAVE_POSIXAIO)
   if (aio && dio && !buffered) {
     if (cct->_conf->bdev_inject_crash &&
 	rand() % cct->_conf->bdev_inject_crash == 0) {
@@ -1429,6 +1572,7 @@ int KernelDevice::read(uint64_t off, uint64_t len, bufferlist *pbl,
 		      IOContext *ioc,
 		      bool buffered)
 {
+  buffered = bdev_buffered(buffered);
   dout(5) << __func__ << " 0x" << std::hex << off << "~" << len << std::dec
 	  << " " << buffermode(buffered)
 	  << dendl;
@@ -1483,7 +1627,7 @@ int KernelDevice::aio_read(
 	  << dendl;
 
   int r = 0;
-#ifdef HAVE_LIBAIO
+#if defined(HAVE_LIBAIO) || defined(HAVE_POSIXAIO)
   if (aio && dio) {
     ceph_assert(is_valid_io(off, len));
     _aio_log_start(ioc, off, len);
@@ -1548,6 +1692,7 @@ int KernelDevice::direct_read_unaligned(uint64_t off, uint64_t len, char *buf)
 int KernelDevice::read_random(uint64_t off, uint64_t len, char *buf,
                        bool buffered)
 {
+  buffered = bdev_buffered(buffered);
   dout(5) << __func__ << " 0x" << std::hex << off << "~" << len << std::dec
           << "buffered " << buffered
 	  << dendl;
@@ -1629,6 +1774,13 @@ int KernelDevice::invalidate_cache(uint64_t off, uint64_t len)
   int r = posix_fadvise(fd_buffereds[WRITE_LIFE_NOT_SET], off, len, POSIX_FADV_DONTNEED);
   if (r) {
     r = -r;
+    if (r == -ENODEV || r == -EOPNOTSUPP) {
+      // No page cache to drop: FreeBSD returns ENODEV for anything that
+      // is not a regular file, including all disk devices.
+      dout(20) << __func__ << " 0x" << std::hex << off << "~" << len << std::dec
+               << " posix_fadvise not supported on this device, ignoring" << dendl;
+      return 0;
+    }
     derr << __func__ << " 0x" << std::hex << off << "~" << len << std::dec
 	 << " error: " << cpp_strerror(r) << dendl;
   }

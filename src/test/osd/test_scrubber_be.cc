@@ -587,7 +587,7 @@ pg_info_t TestTScrubberBe::setup_pg_in_map()
   shard_id_t osd_shard =
       std::find_if(
           acting_shards.begin(), acting_shards.end(),
-          [&](pg_shard_t pg_shard) { return i_am.osd == pg_shard.osd; })
+          [&](pg_shard_t pg_shard) { return up_primary == pg_shard.osd; })
           ->shard;
 
   i_am = pg_shard_t{up_primary, osd_shard};

@@ -306,6 +306,7 @@ target_link_libraries(ceph_test_librgw_file
   ${EXTRALIBS}
   ${ALLOC_LIBS}
   )
+target_link_libraries(ceph_test_librgw_file Boost::url)
 install(TARGETS ceph_test_librgw_file DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 add_dependencies(ceph_test_librgw_file
@@ -329,6 +330,7 @@ target_link_libraries(ceph_test_librgw_file_cd
   ${EXTRALIBS}
   ${ALLOC_LIBS}
   )
+target_link_libraries(ceph_test_librgw_file_cd Boost::url)
 install(TARGETS ceph_test_librgw_file_cd DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 # ceph_test_librgw_file_gp (just the rgw_file get-put bucket ops)
@@ -343,6 +345,7 @@ target_link_libraries(ceph_test_librgw_file_gp
   ${EXTRALIBS}
   ${ALLOC_LIBS}
   )
+target_link_libraries(ceph_test_librgw_file_gp Boost::url)
 install(TARGETS ceph_test_librgw_file_gp DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 # ceph_test_librgw_file_cpref (a special case common-prefix enumeration test)
@@ -357,6 +360,7 @@ target_link_libraries(ceph_test_librgw_file_cpref
   ${EXTRALIBS}
   ${ALLOC_LIBS}
   )
+target_link_libraries(ceph_test_librgw_file_cpref Boost::url)
 install(TARGETS ceph_test_librgw_file_cpref DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 # ceph_test_librgw_file_nfsns (nfs namespace tests)
@@ -377,6 +381,7 @@ target_link_libraries(ceph_test_librgw_file_nfsns
   ${ALLOC_LIBS}
   )
   target_link_libraries(ceph_test_librgw_file_nfsns Boost::context)
+  target_link_libraries(ceph_test_librgw_file_nfsns Boost::url)
 install(TARGETS ceph_test_librgw_file_nfsns DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 # ceph_test_librgw_file_aw (nfs write transaction [atomic write] tests)
@@ -391,6 +396,7 @@ target_link_libraries(ceph_test_librgw_file_aw
   ${EXTRALIBS}
   ${ALLOC_LIBS}
   )
+target_link_libraries(ceph_test_librgw_file_aw Boost::url)
 install(TARGETS ceph_test_librgw_file_aw DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 # ceph_test_librgw_file_marker (READDIR with string and uint64 offsets)
@@ -411,6 +417,7 @@ target_link_libraries(ceph_test_librgw_file_marker
   ${ALLOC_LIBS}
   )
   target_link_libraries(ceph_test_librgw_file_marker Boost::context)
+  target_link_libraries(ceph_test_librgw_file_marker Boost::url)
 install(TARGETS ceph_test_librgw_file_marker DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 # ceph_test_librgw_file_xattr (attribute ops)
@@ -430,6 +437,7 @@ target_link_libraries(ceph_test_librgw_file_xattr
   ${ALLOC_LIBS}
   )
 target_link_libraries(ceph_test_librgw_file_xattr Boost::context)
+target_link_libraries(ceph_test_librgw_file_xattr Boost::url)
 
 # ceph_test_librgw_file_rename (mv/rename tests)
 add_executable(ceph_test_librgw_file_rename
@@ -443,6 +451,7 @@ target_link_libraries(ceph_test_librgw_file_rename
   ${EXTRALIBS}
   ${ALLOC_LIBS}
   )
+target_link_libraries(ceph_test_librgw_file_rename Boost::url)
 install(TARGETS ceph_test_librgw_file_rename DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 # ceph_test_rgw_token
@@ -812,8 +821,11 @@ add_executable(unittest_bufferlist
   bufferlist.cc
   $<TARGET_OBJECTS:unit-main>
   )
-add_ceph_unittest(unittest_bufferlist)
+add_ceph_unittest(unittest_bufferlist --gtest_filter=-*Bench*:*bench*:*Perf*:*perf*)
 target_link_libraries(unittest_bufferlist global)
+add_ceph_test(unittest_bufferlist_bench 
+  "$<TARGET_FILE:unittest_bufferlist>" --gtest_filter=*Bench*:*bench*:*Perf*:*perf*
+  )
 
 # compiletest_cxx11_client
 add_executable(compiletest_cxx11_client
@@ -1085,6 +1097,7 @@ add_ceph_unittest(unittest_ceph_assert)
 target_link_libraries(unittest_ceph_assert ceph-common global)
 endif(NOT WIN32)
 
+if(NOT FREEBSD)
 find_package(benchmark QUIET)
 if (benchmark_FOUND)
   add_executable(bench_lrus
@@ -1099,6 +1112,7 @@ if (benchmark_FOUND)
 else()
   message(STATUS "The google/benchmark library was not found. Skipping micro benchmark tests")
 endif(benchmark_FOUND)
+endif(NOT FREEBSD)
 
 add_executable(test_nvmeof_gw_utils
   test_nvmeof_gw_utils.cc

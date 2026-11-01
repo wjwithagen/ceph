@@ -51,6 +51,9 @@ using namespace std::literals::string_view_literals;
 #elif !defined(_WIN32)
 #include <sys/xattr.h>
 #endif
+#if !defined(AT_STATX_SYNC_TYPE)
+#define AT_STATX_SYNC_TYPE 0x6000
+#endif
 
 #if defined(__linux__)
 #include <linux/falloc.h>

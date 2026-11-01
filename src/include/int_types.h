@@ -7,6 +7,18 @@
 
 #ifdef __linux__
 #include <linux/types.h>
+#elif __FreeBSD__
+/* FreeBSD/non-Linux: cmake HAVE___U* detection is unreliable because
+ * these types exist in BSD kernel headers but not in userspace C++ context.
+ * Define them unconditionally. */
+typedef uint8_t  __u8;
+typedef int8_t   __s8;
+typedef uint16_t __u16;
+typedef int16_t  __s16;
+typedef uint32_t __u32;
+typedef int32_t  __s32;
+typedef uint64_t __u64;
+typedef int64_t  __s64;
 #else
 #ifndef HAVE___U8
 typedef uint8_t __u8;

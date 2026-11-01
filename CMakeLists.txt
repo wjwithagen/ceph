@@ -38,6 +38,11 @@ elseif(CMAKE_SYSTEM_NAME MATCHES "FreeBSD")
   FIND_PACKAGE(Threads)
 endif(CMAKE_SYSTEM_NAME MATCHES "Linux")
 
+if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR
+   CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
+  set(CLANG ON)
+endif()
+
 if(WIN32)
   # The Windows headers (e.g. coming from mingw or the Windows SDK) check
   # the targeted Windows version. The availability of certain functions and
@@ -403,6 +408,7 @@ endif(WITH_UADK)
 
 # needs mds and? XXX
 option(WITH_LIBCEPHFS "libcephfs client library" ON)
+option(WITH_LIBCEPHFS_PROXY "libcephfs proxy library" ON)
 
 option(WITH_LIBCEPHSQLITE "libcephsqlite client library" ON)
 if(WITH_LIBCEPHSQLITE)
@@ -638,6 +644,8 @@ endif (WITH_RADOSGW)
 
 #option for CephFS
 option(WITH_CEPHFS "CephFS is enabled" ON)
+
+option(CEPH_PYTHON_SYSTEM_SITE "Build tox/venv-based tests against system site-packages" OFF)
 
 if(NOT WIN32)
 # Please specify 3.x if you want to build with a certain version of python3.

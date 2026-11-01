@@ -11,7 +11,7 @@ function(build_isal_crypto)
   ExternalProject_Add(isal_crypto_ext
     SOURCE_DIR ${ISAL_CRYPTO_SOURCE_DIR}
     CONFIGURE_COMMAND ""
-    BUILD_COMMAND ${make_cmd} -f <SOURCE_DIR>/Makefile.unx
+    BUILD_COMMAND ${make_cmd} -f <SOURCE_DIR>/Makefile.unx CC=${CMAKE_C_COMPILER} CXX=${CMAKE_CXX_COMPILER}
     BUILD_IN_SOURCE 1
     BUILD_BYPRODUCTS ${ISAL_CRYPTO_LIBRARY}
     INSTALL_COMMAND ""

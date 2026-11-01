@@ -64,7 +64,11 @@
 
 #include "inline_memory.h"
 
+#if defined(__clang__)
+#define CEPH_BUFFER_API __attribute__((__visibility__("default")))
+#else
 #define CEPH_BUFFER_API
+#endif
 
 #ifdef WITH_CRIMSON
 namespace seastar {

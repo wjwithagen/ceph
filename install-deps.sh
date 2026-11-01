@@ -12,6 +12,7 @@
 #  version 2.1 of the License, or (at your option) any later version.
 #
 set -e
+set -vx
 
 if ! [ "${_SOURCED_LIB_BUILD}" = 1 ]; then
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -365,56 +366,95 @@ if [ x$(uname)x = xFreeBSDx ]; then
         echo "Installing extra packages not supported on FreeBSD" >&2
         exit 1
     fi
-    $SUDO pkg install -yq \
-        devel/babeltrace \
-        devel/binutils \
-        devel/git \
-        devel/gperf \
-        devel/gmake \
-        devel/cmake \
-        devel/nasm \
-        devel/boost-all \
-        devel/boost-python-libs \
-        devel/valgrind \
-        devel/pkgconf \
-        devel/libedit \
-        devel/libtool \
-        devel/google-perftools \
-        lang/cython \
-        net/openldap24-client \
-        archivers/snappy \
-        archivers/liblz4 \
-        ftp/curl \
-        misc/e2fsprogs-libuuid \
-        misc/getopt \
-        net/socat \
-        textproc/expat2 \
-        textproc/gsed \
-        lang/gawk \
-        textproc/libxml2 \
-        textproc/xmlstarlet \
-        textproc/jq \
-        textproc/py-sphinx \
-        emulators/fuse \
-        java/junit \
-        lang/python36 \
-        devel/py-pip \
-        devel/py-flake8 \
-        devel/py-tox \
-        devel/py-argparse \
-        devel/py-nose \
-        devel/py-prettytable \
-        devel/py-yaml \
-        www/py-routes \
-        www/py-flask \
-        www/node \
-        www/npm \
-        www/fcgi \
-        security/nss \
-        security/krb5 \
-        security/oath-toolkit \
-        sysutils/flock \
-        sysutils/fusefs-libs \
+    $SUDO pkg install -y \
+	devel/git \
+	devel/cmake \
+	devel/ninja \
+	devel/ccache \
+	devel/pkgconf \
+	devel/gperf \
+	devel/nasm \
+	devel/yasm \
+	devel/autoconf \
+	devel/automake \
+	devel/libtool \
+	devel/libedit \
+	devel/libatomic_ops \
+	devel/boost-libs \
+	devel/boost-python-libs \
+	devel/google-perftools \
+	devel/protobuf \
+	devel/grpc \
+	lang/lua54 \
+	lang/gawk \
+	databases/sqlite3 \
+	archivers/snappy \
+	archivers/liblz4 \
+	ftp/curl \
+	net/openldap26-client \
+	net/rabbitmq-c \
+	net/socat \
+	textproc/expat2 \
+	textproc/libxml2 \
+	textproc/xmlstarlet \
+	textproc/jq \
+	textproc/gsed \
+	security/nss \
+	security/oath-toolkit \
+	sysutils/flock \
+	sysutils/fusefs-libs \
+	sysutils/smartmontools \
+	misc/getopt \
+	misc/e2fsprogs-libuuid\
+
+    PYTHON_VERSION=$(python -c "import sys; print('%d%d' % sys.version_info[:2])")
+    $SUDO pkg install -y \
+	py${PYTHON_VERSION}-python \
+	py${PYTHON_VERSION}-cython \
+	py${PYTHON_VERSION}-setuptools \
+	py${PYTHON_VERSION}-pyopenssl \
+	py${PYTHON_VERSION}-routes \
+	py${PYTHON_VERSION}-werkzeug \
+	py${PYTHON_VERSION}-cherrypy \
+	py${PYTHON_VERSION}-pecan \
+	py${PYTHON_VERSION}-requests \
+	py${PYTHON_VERSION}-pyjwt \
+	py${PYTHON_VERSION}-sqlite3 \
+        py${PYTHON_VERSION}-prettytable \
+        py${PYTHON_VERSION}-virtualenv \
+        py${PYTHON_VERSION}-pyyaml \
+        py${PYTHON_VERSION}-bcrypt \
+	py${PYTHON_VERSION}-protobuf \
+	py${PYTHON_VERSION}-grpcio \
+	py${PYTHON_VERSION}-sphinx \
+	py${PYTHON_VERSION}-textproc \
+	
+
+# --- dropped for v21 on FreeBSD -------------------------------------------
+# Disabled by CMAKE_OFF, so the dependency is dead weight:
+#	devel/babeltrace		WITH_BABELTRACE=OFF
+#	security/krb5			WITH_GSSAPI=OFF
+#	www/node			WITH_MGR_DASHBOARD_FRONTEND=OFF
+#	www/npm				WITH_MGR_DASHBOARD_FRONTEND=OFF
+#
+# Obsolete or superseded:
+#	devel/gmake			ninja is the generator now
+#	devel/binutils			only for the old -fuse-ld=ld hack; lld works
+#	devel/boost-all			not a real port; use boost-libs
+#	emulators/fuse			duplicate of sysutils/fusefs-libs
+#	www/fcgi			civetweb-era RGW frontend, gone since Beast
+#	devel/py-argparse		stdlib since python 2.7
+#	devel/py-nose			dead upstream, replaced by pytest
+#	lang/python36			-> lang/python312
+#	net/openldap24-client		-> net/openldap26-client
+#	lang/cython			-> devel/py-cython
+#
+# Test/dev tooling, not build dependencies -- install separately if wanted:
+#	devel/valgrind
+#	java/junit
+#	devel/py-pip
+#	devel/py-flake8
+#	devel/py-tox
     exit
 else
     [ $WITH_CRIMSON ] && with_crimson=true || with_crimson=false

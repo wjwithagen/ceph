@@ -41,7 +41,7 @@ else
     KERNCORE="kernel.core_pattern"
 fi
 
-EXTRA_OPTS=""
+EXTRA_OPTS=" --erasure-code-dir=${CEPH_ROOT:-.}/build/lib --plugin-dir=${CEPH_ROOT:-.}/build/lib --debug-bdev 20 --debug-bluestore 20"
 
 #! @file ceph-helpers.sh
 #  @brief Toolbox to manage Ceph cluster dedicated to testing
@@ -667,7 +667,11 @@ EOF
     echo adding osd$id key to auth repository
     ceph -i "$key_fn" auth add osd.$id osd "allow *" mon "allow profile osd" mgr "allow profile osd"
     echo start osd.$id
-    ceph-osd -i $id $ceph_args &
+    if [ -n "$CEPH_OSD_TRUSS" ]; then
+      truss -f -o "$CEPH_OSD_TRUSS.$id" ceph-osd -i $id $ceph_args &
+    else
+      ceph-osd -i $id $ceph_args &
+    fi
 
     # If noup is set, then can't wait for this osd
     if ceph osd dump --format=json | jq '.flags_set[]' | grep -q '"noup"' ; then
@@ -1062,7 +1066,10 @@ function test_activate_osd_skip_benchmark() {
 
 ##
 # Wait until the OSD **id** is either up or down, as specified by
-# **state**. It fails after $TIMEOUT seconds.
+# **state**. 
+# It fails 
+#    if it was not running
+#    if it is not reported up after $TIMEOUT seconds.
 #
 # @param state either up or down
 # @param id osd identifier
@@ -1071,17 +1078,26 @@ function test_activate_osd_skip_benchmark() {
 function wait_for_osd() {
     local state=$1
     local id=$2
+    xtrace_state=$(set +o | grep xtrace)
 
     status=1
-    for ((i=0; i < $TIMEOUT; i++)); do
-        echo $i
-        if ! ceph osd dump | grep "osd.$id $state"; then
-            sleep 1
-        else
-            status=0
-            break
-        fi
-    done
+    # first check if the OSD is up
+    if pgrep -f "ceph-osd.*-i[[:space:]]${id}" >/dev/null 2>&1; then
+        echo "osd.${id} is running"
+        # now wait for it to be reported up
+        for ((i=0; i < $TIMEOUT; i++)); do
+            echo $i
+            if ! ceph osd dump | grep "osd.$id $state"; then
+                sleep 1
+            else
+                status=0
+                break
+            fi
+        done
+    else
+        echo "osd.${id} is NOT running"
+    fi
+    eval "$xtrace_state"
     return $status
 }
 
@@ -1683,7 +1699,7 @@ function is_pg_clean() {
 
 #######################################################################
 
-calc() { $AWK "BEGIN{print $*}"; }
+calc() { $AWK "BEGIN{print ($*) }"; }
 
 ##
 # Return a list of numbers that are increasingly larger and whose

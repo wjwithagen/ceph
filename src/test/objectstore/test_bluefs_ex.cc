@@ -12,6 +12,7 @@
 #include <random>
 #include <thread>
 #include <stack>
+#include <sys/wait.h>
 #include <gtest/gtest.h>
 #include "global/global_init.h"
 #include "common/ceph_argparse.h"

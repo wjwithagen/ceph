@@ -39,7 +39,14 @@ from .checkpoint import (
 
 log = logging.getLogger(__name__)
 
+# libcephfs's setxattr() flag semantics mirror Linux's xattr(2) constants
+# (CREATE=1, REPLACE=2), independent of the host OS -- os.XATTR_CREATE is
+# only available when Python itself is built against Linux, so define it
+# locally rather than depending on a Linux-only os module attribute for a
+# value that has nothing to do with the local filesystem.
+CEPH_XATTR_CREATE = 1
 CEPHFS_IMAGE_POLICY_UPDATE_THROTTLE_INTERVAL = 1
+
 
 class FSPolicy:
     class InstanceListener(InstanceWatcher.Listener):
@@ -422,7 +429,7 @@ class FSSnapshotMirror:
         log.info(f'setting {local_cluster_id}::{local_fsid} on remote')
         try:
             remote_fs.setxattr('/', 'ceph.mirror.info',
-                               f'cluster_id={local_cluster_id} fs_id={local_fsid}'.encode('utf-8'), os.XATTR_CREATE)
+                               f'cluster_id={local_cluster_id} fs_id={local_fsid}'.encode('utf-8'), CEPH_XATTR_CREATE)
         except cephfs.Error as e:
             if e.errno == errno.EEXIST:
                 try:

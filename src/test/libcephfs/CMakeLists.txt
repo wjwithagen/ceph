@@ -38,7 +38,7 @@ if(WITH_LIBCEPHFS)
     ${EXTRALIBS}
     ${CMAKE_DL_LIBS}
     )
-  if(NOT WIN32)
+  if(NOT WIN32 AND NOT CLANG)
     target_link_options(ceph_test_libcephfs PRIVATE -Wl,--copy-dt-needed-entries)
   endif()
   install(TARGETS ceph_test_libcephfs
@@ -55,7 +55,7 @@ if(WITH_LIBCEPHFS)
     ${EXTRALIBS}
     ${CMAKE_DL_LIBS}
     )
-  if(NOT WIN32)
+  if(NOT WIN32 AND NOT CLANG)
     target_link_options(ceph_test_libcephfs_snapdiff PRIVATE -Wl,--copy-dt-needed-entries)
   endif()
   install(TARGETS ceph_test_libcephfs_snapdiff
@@ -72,7 +72,7 @@ if(WITH_LIBCEPHFS)
     ${EXTRALIBS}
     ${CMAKE_DL_LIBS}
     )
-  if(NOT WIN32)
+  if(NOT WIN32 AND NOT CLANG)
     target_link_options(ceph_test_libcephfs_suidsgid PRIVATE -Wl,--copy-dt-needed-entries)
   endif()
   install(TARGETS ceph_test_libcephfs_suidsgid
@@ -89,7 +89,7 @@ if(WITH_LIBCEPHFS)
     ${EXTRALIBS}
     ${CMAKE_DL_LIBS}
     )
-  if(NOT WIN32)
+  if(NOT WIN32 AND NOT CLANG)
     target_link_options(ceph_test_libcephfs_vxattr PRIVATE -Wl,--copy-dt-needed-entries)
   endif()
   install(TARGETS ceph_test_libcephfs_vxattr
@@ -106,7 +106,7 @@ if(WITH_LIBCEPHFS)
     ${EXTRALIBS}
     ${CMAKE_DL_LIBS}
     )
-  if(NOT WIN32)
+  if(NOT WIN32 AND NOT CLANG)
     target_link_options(ceph_test_libcephfs_newops PRIVATE -Wl,--copy-dt-needed-entries)
   endif()
   install(TARGETS ceph_test_libcephfs_newops
@@ -124,7 +124,7 @@ if(WITH_LIBCEPHFS)
       ${EXTRALIBS}
       ${CMAKE_DL_LIBS}
     )
-    if(NOT WIN32)
+    if(NOT WIN32 AND NOT CLANG)
       target_link_options(ceph_test_libcephfs_reclaim PRIVATE -Wl,--copy-dt-needed-entries)
     endif()
     install(TARGETS ceph_test_libcephfs_reclaim
@@ -141,7 +141,7 @@ if(WITH_LIBCEPHFS)
     ${EXTRALIBS}
     ${CMAKE_DL_LIBS}
   )
-  if(NOT WIN32)
+  if(NOT WIN32 AND NOT CLANG)
     target_link_options(ceph_test_libcephfs_lazyio PRIVATE -Wl,--copy-dt-needed-entries)
   endif()
   install(TARGETS ceph_test_libcephfs_lazyio
@@ -158,7 +158,7 @@ if(WITH_LIBCEPHFS)
     ${EXTRALIBS}
     ${CMAKE_DL_LIBS}
   )
-  if(NOT WIN32)
+  if(NOT WIN32 AND NOT CLANG)
     target_link_options(ceph_test_libcephfs_access PRIVATE -Wl,--copy-dt-needed-entries)
   endif()
   install(TARGETS ceph_test_libcephfs_access

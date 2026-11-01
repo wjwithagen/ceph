@@ -5,7 +5,9 @@
 #include "Compression.h"
 #include "common/pretty_binary.h"
 #include "common/debug.h"
-#include <asm-generic/errno-base.h>
+#include <cerrno>
+#include <iostream>
+#include <sstream>
 #include <vector>
 #include <limits>
 

@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <iostream>
+#include <semaphore>
 #include <memory>
 #include <time.h>
 #include <sys/mount.h>

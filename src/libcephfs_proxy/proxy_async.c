@@ -1,5 +1,6 @@
 
 #include <unistd.h>
+#include "include/compat.h"
 
 #include "proxy_async.h"
 #include "proxy_requests.h"
