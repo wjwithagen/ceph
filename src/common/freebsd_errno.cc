@@ -130,76 +130,72 @@ static const __s32 ceph_to_hostos_conv[256] = {
 // and the Linux error as value
 // Use the fact that the arry is initialised per default on all 0's
 // And we do not translate for 0's, but return the original value.
-static constexpr std::array<__s32, 256> make_hostos_to_ceph_conv() {
-  std::array<__s32, 256> conv{};
-        //        FreeBSD errno Linux errno
-        H2C_ERRNO(EDEADLK,      35);    /* Resource deadlock avoided */
-        H2C_ERRNO(EAGAIN,       11);    /* Resource temporarily unavailable */
-        H2C_ERRNO(EINPROGRESS,  115);   /* Operation now in progress */
-        H2C_ERRNO(EALREADY,     114);   /* Operation already in progress */
-        H2C_ERRNO(ENOTSOCK,     88);    /* Socket operation on non-socket */
-        H2C_ERRNO(EDESTADDRREQ, 89);    /* Destination address required */
-        H2C_ERRNO(EMSGSIZE,     90);    /* Message too long */
-        H2C_ERRNO(EPROTOTYPE,   91);    /* Protocol wrong type for socket */
-        H2C_ERRNO(ENOPROTOOPT,  92);    /* Protocol not available */
-        H2C_ERRNO(EPROTONOSUPPORT, 93); /* Protocol not supported */
-        H2C_ERRNO(ESOCKTNOSUPPORT, 94); /* Socket type not supported */
-        H2C_ERRNO(EOPNOTSUPP,   95);    /* Operation not supported */
-        H2C_ERRNO(EPFNOSUPPORT, 96);    /* Protocol family not supported */
-        H2C_ERRNO(EAFNOSUPPORT, 97);    /* Address family not supported by protocol family */
-        H2C_ERRNO(EADDRINUSE,   98);    /* Address already in use */
-        H2C_ERRNO(EADDRNOTAVAIL, 99);   /* Can't assign requested address */
-        H2C_ERRNO(ENETDOWN,     100);   /* Network is down */
-        H2C_ERRNO(ENETUNREACH,  101);   /* Network is unreachable */
-        H2C_ERRNO(ENETRESET,    102);   /* Network dropped connection on reset */
-        H2C_ERRNO(ECONNABORTED, 103);   /* Software caused connection abort */
-        H2C_ERRNO(ECONNRESET,   104);   /* Connection reset by peer */
-        H2C_ERRNO(ENOBUFS,      105);   /* No buffer space available */
-        H2C_ERRNO(EISCONN,      106);   /* Socket is already connected */
-        H2C_ERRNO(ENOTCONN,     107);   /* Socket is not connected */
-        H2C_ERRNO(ESHUTDOWN,    108);   /* Can't send after socket shutdown */
-        H2C_ERRNO(ETOOMANYREFS, 109);   /* Too many references: can't splice */
-        H2C_ERRNO(ETIMEDOUT,    110);   /* Operation timed out */
-        H2C_ERRNO(ECONNREFUSED, 111);   /* Connection refused */
-        H2C_ERRNO(ELOOP,        40);    /* Too many levels of symbolic links */
-        H2C_ERRNO(ENAMETOOLONG, 36);    /* File name too long */
-        H2C_ERRNO(EHOSTDOWN,    112);   /* Host is down */
-        H2C_ERRNO(EHOSTUNREACH, 113);   /* No route to host */
-        H2C_ERRNO(ENOTEMPTY,    39);    /* Directory not empty */
-        H2C_ERRNO(EPROCLIM,     EPERM); /* Too many processes */
-        H2C_ERRNO(EUSERS,       87);    /* Too many users */
-        H2C_ERRNO(EDQUOT,       122);   /* Disc quota exceeded */
-        H2C_ERRNO(ESTALE,       116);   /* Stale NFS file handle */
-        H2C_ERRNO(EREMOTE,      66);    /* Too many levels of remote in path */
-        H2C_ERRNO(EBADRPC,      EPERM); /* RPC struct is bad */
-        H2C_ERRNO(ERPCMISMATCH, EPERM); /* RPC version wrong */
-        H2C_ERRNO(EPROGUNAVAIL, EPERM); /* RPC prog. not avail */
-        H2C_ERRNO(EPROGMISMATCH, EPERM);/* Program version wrong */
-        H2C_ERRNO(EPROCUNAVAIL, EPERM); /* Bad procedure for program */
-        H2C_ERRNO(ENOLCK,       37);    /* No locks available */
-        H2C_ERRNO(ENOSYS,       38);    /* Function not implemented  => ENOSYS on FreeBSD */
-        H2C_ERRNO(EFTYPE,       EPERM); /* Inappropriate file type or format */
-        H2C_ERRNO(EAUTH,        EPERM); /* Authentication error */
-        H2C_ERRNO(ENEEDAUTH,    EPERM); /* Need authenticator */
-        H2C_ERRNO(EIDRM,        43);    /* Identifier removed */
-        H2C_ERRNO(ENOMSG,       42);    /* No message of desired type */
-        H2C_ERRNO(EOVERFLOW,    75);    /* Value too large to be stored in data type */
-        H2C_ERRNO(ECANCELED,    125);   /* Operation canceled */
-        H2C_ERRNO(EILSEQ,       84);    /* Illegal byte sequence */
-        H2C_ERRNO(ENOATTR,      61);    /* Attribute not found */
-        H2C_ERRNO(EDOOFUS,      EPERM); /* Programming error */
-        H2C_ERRNO(EBADMSG,      74);    /* Bad message */
-        H2C_ERRNO(EMULTIHOP,    72);    /* Multihop attempted */
-        H2C_ERRNO(ENOLINK,      67);    /* Link has been severed */
-        H2C_ERRNO(EPROTO,       71);    /* Protocol error */
-        H2C_ERRNO(ENOTCAPABLE,  EPERM); /* Capabilities insufficient */
-        H2C_ERRNO(ECAPMODE,     EPERM); /* Not permitted in capability mode */
-        H2C_ERRNO(ENOTRECOVERABLE, 131);/* State not recoverable */
-        H2C_ERRNO(EOWNERDEAD,   130);   /* Previous owner died */
-
-        return conv;
-}
-static constexpr auto hostos_to_ceph_conv = make_hostos_to_ceph_conv();
+static const __s32 hostos_to_ceph_conv[256] = {
+	//        FreeBSD errno Linux errno
+	H2C_ERRNO(EDEADLK,	35),   	/* Resource deadlock avoided */
+        H2C_ERRNO(EAGAIN,	11),   	/* Resource temporarily unavailable */
+        H2C_ERRNO(EINPROGRESS,	115),	/* Operation now in progress */
+        H2C_ERRNO(EALREADY,	114),	/* Operation already in progress */
+        H2C_ERRNO(ENOTSOCK,	88),	/* Socket operation on non-socket */
+        H2C_ERRNO(EDESTADDRREQ,	89),	/* Destination address required */
+        H2C_ERRNO(EMSGSIZE,	90),	/* Message too long */
+        H2C_ERRNO(EPROTOTYPE,	91),	/* Protocol wrong type for socket */
+        H2C_ERRNO(ENOPROTOOPT,	92),	/* Protocol not available */
+        H2C_ERRNO(EPROTONOSUPPORT, 93),	/* Protocol not supported */
+        H2C_ERRNO(ESOCKTNOSUPPORT, 94),	/* Socket type not supported */
+        H2C_ERRNO(EOPNOTSUPP,	95),	/* Operation not supported */
+        H2C_ERRNO(EPFNOSUPPORT,	96),	/* Protocol family not supported */
+        H2C_ERRNO(EAFNOSUPPORT,	97),	/* Address family not supported by protocol family */
+        H2C_ERRNO(EADDRINUSE,	98),	/* Address already in use */
+        H2C_ERRNO(EADDRNOTAVAIL, 99),	/* Can't assign requested address */
+        H2C_ERRNO(ENETDOWN,	100),	/* Network is down */
+        H2C_ERRNO(ENETUNREACH,	101),	/* Network is unreachable */
+        H2C_ERRNO(ENETRESET,	102),	/* Network dropped connection on reset */
+        H2C_ERRNO(ECONNABORTED,	103),	/* Software caused connection abort */
+        H2C_ERRNO(ECONNRESET,	104),	/* Connection reset by peer */
+        H2C_ERRNO(ENOBUFS,	105),	/* No buffer space available */
+        H2C_ERRNO(EISCONN,	106),	/* Socket is already connected */
+        H2C_ERRNO(ENOTCONN,	107),	/* Socket is not connected */
+        H2C_ERRNO(ESHUTDOWN,	108),	/* Can't send after socket shutdown */
+        H2C_ERRNO(ETOOMANYREFS,	109),	/* Too many references: can't splice */
+        H2C_ERRNO(ETIMEDOUT,	110),	/* Operation timed out */
+        H2C_ERRNO(ECONNREFUSED,	111),	/* Connection refused */
+        H2C_ERRNO(ELOOP,	40),	/* Too many levels of symbolic links */
+        H2C_ERRNO(ENAMETOOLONG,	36),	/* File name too long */
+        H2C_ERRNO(EHOSTDOWN,	112),	/* Host is down */
+        H2C_ERRNO(EHOSTUNREACH,	113),	/* No route to host */
+        H2C_ERRNO(ENOTEMPTY,	39),	/* Directory not empty */
+        H2C_ERRNO(EPROCLIM,	EPERM),	/* Too many processes */
+        H2C_ERRNO(EUSERS,	87),	/* Too many users */
+        H2C_ERRNO(EDQUOT,	122),	/* Disc quota exceeded */
+        H2C_ERRNO(ESTALE,	116),	/* Stale NFS file handle */
+        H2C_ERRNO(EREMOTE,	66),	/* Too many levels of remote in path */
+        H2C_ERRNO(EBADRPC,	EPERM),	/* RPC struct is bad */
+        H2C_ERRNO(ERPCMISMATCH,	EPERM),	/* RPC version wrong */
+        H2C_ERRNO(EPROGUNAVAIL,	EPERM),	/* RPC prog. not avail */
+        H2C_ERRNO(EPROGMISMATCH, EPERM),/* Program version wrong */
+        H2C_ERRNO(EPROCUNAVAIL,	EPERM),	/* Bad procedure for program */
+        H2C_ERRNO(ENOLCK,	37),	/* No locks available */
+        H2C_ERRNO(ENOSYS,	38),	/* Function not implemented */
+        H2C_ERRNO(EFTYPE,	EPERM),	/* Inappropriate file type or format */
+        H2C_ERRNO(EAUTH,	EPERM),	/* Authentication error */
+        H2C_ERRNO(ENEEDAUTH,	EPERM),	/* Need authenticator */
+        H2C_ERRNO(EIDRM,	43),	/* Identifier removed */
+        H2C_ERRNO(ENOMSG,	42),	/* No message of desired type */
+        H2C_ERRNO(EOVERFLOW,	75),	/* Value too large to be stored in data type */
+        H2C_ERRNO(ECANCELED,	125),	/* Operation canceled */
+        H2C_ERRNO(EILSEQ,	84),	/* Illegal byte sequence */
+        H2C_ERRNO(ENOATTR,	61),	/* Attribute not found */
+        H2C_ERRNO(EDOOFUS,	EPERM),	/* Programming error */
+        H2C_ERRNO(EBADMSG,	74),	/* Bad message */
+        H2C_ERRNO(EMULTIHOP,	72),	/* Multihop attempted */
+        H2C_ERRNO(ENOLINK,	67),	/* Link has been severed */
+        H2C_ERRNO(EPROTO,	71),	/* Protocol error */
+        H2C_ERRNO(ENOTCAPABLE,	EPERM),	/* Capabilities insufficient */
+        H2C_ERRNO(ECAPMODE,	EPERM),	/* Not permitted in capability mode */
+        H2C_ERRNO(ENOTRECOVERABLE, 131),/* State not recoverable */
+        H2C_ERRNO(EOWNERDEAD,	130),	/* Previous owner died */
+	};
 
 // converts from linux errno values to host values
 __s32 ceph_to_hostos_errno(__s32 r)
