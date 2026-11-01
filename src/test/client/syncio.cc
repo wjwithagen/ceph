@@ -22,7 +22,6 @@
 #include <sys/statvfs.h>
 
 #include "test/client/TestClient.h"
-#include "client/FSCrypt.h"
 
 TEST_F(TestClient, LlreadvLlwritevInvalidFileHandleSync) {
     /* Test provding null or invalid file handle returns an error
@@ -131,9 +130,11 @@ TEST_F(TestClient, LlreadvLlwritevLargeBuffersSync) {
   };
 
   int maxio_size = INT_MAX;
+#ifdef FSCRYPT_MAXIO_SIZE
   if (fse.encrypted) {
     maxio_size = FSCRYPT_MAXIO_SIZE;
   }
+#endif
 
 
   rc = client->ll_writev(fh, iov_out, 2, 0);

@@ -22,7 +22,6 @@
 #include <sys/statvfs.h>
 
 #include "test/client/TestClient.h"
-#include "client/FSCrypt.h"
 
 TEST_F(TestClient, LlreadvLlwritev) {
   int mypid = getpid();
@@ -780,9 +779,11 @@ TEST_F(TestClient, LlreadvLlwritevLargeBuffers) {
   bytes_written = writefinish.wait();
 
   int maxio_size = INT_MAX;
+#ifdef FSCRYPT_MAXIO_SIZE
   if (fse.encrypted) {
     maxio_size = FSCRYPT_MAXIO_SIZE;
   }
+#endif
 
   // total write length is clamped to INT_MAX in write paths
   ASSERT_EQ(bytes_written, maxio_size);
