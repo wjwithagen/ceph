@@ -17,6 +17,8 @@
 #ifndef CEPH_CRYPTO_ONWIRE_H
 #define CEPH_CRYPTO_ONWIRE_H
 
+#include <string>
+#include <string_view>
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
