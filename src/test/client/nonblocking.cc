@@ -22,6 +22,7 @@
 #include <sys/statvfs.h>
 
 #include "test/client/TestClient.h"
+#include "client/FSCrypt.h"
 
 TEST_F(TestClient, LlreadvLlwritev) {
   int mypid = getpid();

@@ -22,6 +22,7 @@
 #include <sys/statvfs.h>
 
 #include "test/client/TestClient.h"
+#include "client/FSCrypt.h"
 
 TEST_F(TestClient, LlreadvLlwritevInvalidFileHandleSync) {
     /* Test provding null or invalid file handle returns an error
