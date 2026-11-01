@@ -12,6 +12,7 @@
  */
 
 #include "ThreadMonitor.h"
+#include "include/compat.h"
 
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mgr
@@ -87,7 +88,7 @@ void ThreadMonitor::monitoring_loop() {
     // Phase 1: under lock — update RSS counters and copy all state needed for CPU computation.
     long long process_rss_pages = 0;
     if (!read_process_statm(process_rss_pages)) {
-      derr << "Failed to read process memory info from /proc/self/statm." << dendl;
+      derr << "Failed to read process memory info from " PROCPREFIX "/proc/self/statm." << dendl;
       std::this_thread::sleep_for(monitoring_interval);
       continue;
     }
@@ -199,7 +200,7 @@ ThreadMonitor::ThreadResult ThreadMonitor::process_thread_stats(const ThreadEntr
 }
 
 bool ThreadMonitor::read_thread_stat(pid_t tid, long long& utime, long long& stime) {
-  std::string stat_path = "/proc/self/task/" + std::to_string(tid) + "/stat";
+  std::string stat_path = PROCPREFIX "/proc/self/task/" + std::to_string(tid) + "/stat";
   std::ifstream stat_file(stat_path);
   if (!stat_file.is_open()) {
     dout(20) << __func__ << "Could not open " << stat_path << dendl;
@@ -228,7 +229,7 @@ bool ThreadMonitor::read_thread_stat(pid_t tid, long long& utime, long long& sti
 }
 
 bool ThreadMonitor::read_process_statm(long long& rss_pages) {
-  std::string statm_path = "/proc/self/statm";
+  std::string statm_path = PROCPREFIX "/proc/self/statm";
   std::ifstream statm_file(statm_path);
 
   if (!statm_file.is_open()) {

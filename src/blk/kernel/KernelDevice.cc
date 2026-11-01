@@ -292,6 +292,12 @@ int KernelDevice::open(const string& p)
     } else {
       size = st.st_size;
     }
+    if (size == 0) {
+      derr << __func__ << " backing device/file " << path
+           << " has no usable size" << dendl;
+      r = -EINVAL;
+      goto out_fail;
+    }
 
     char partition[PATH_MAX], devname[PATH_MAX];
     if ((r = blkdev_buffered.partition(partition, PATH_MAX)) ||
