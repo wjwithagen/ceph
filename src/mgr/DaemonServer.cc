@@ -1156,7 +1156,9 @@ void DaemonServer::_check_offlines_pgs(
       report->bad_already_inactive.insert(q.first);
       dangerous = true;
     }
-    if (pg_acting.size() < pi->min_size) {
+    bool below_min_size = pi && osdmap.num_acting_below_min_size(
+      *pi, std::vector<int>(pg_acting.begin(), pg_acting.end()));
+    if (below_min_size) {
       report->bad_become_inactive.insert(q.first);
       dangerous = true;
     }
@@ -3448,6 +3450,14 @@ void DaemonServer::adjust_pgs()
 	const pg_pool_t& p = i.second;
         const auto& pool_name = osdmap.get_pool_name(i.first);
         current_pools[i.first] = pool_name;
+
+        //If it has the nopgchange flag skip the pool
+        if (p.has_flag(pg_pool_t::FLAG_NOPGCHANGE)) {
+          dout(10) << "Pool " << i.first << " has the flag NOPGCHANGE "
+                   << "so will be skipped" << dendl;
+          continue;
+        }
+
 	// adjust pg_num?
 	if (p.get_pg_num_target() != p.get_pg_num()) {
 	  dout(20) << "pool " << i.first

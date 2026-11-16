@@ -121,8 +121,9 @@ void OSDECProfileGetRequest::decode_json(JSONObj* obj) {
 
 void OSDECProfileGetReply::dump(Formatter* f) const {
   encode_json("crush-device-class", crush_device_class, f);
-  encode_json("crush-failure-domain", crush_failure_domain, f);
-  encode_json("crush-num-failure-domains", crush_num_failure_domains, f);
+  encode_json("crush-zone-failure-domain", crush_zone_failure_domain, f);
+  encode_json("crush-osd-failure-domain", crush_osd_failure_domain, f);
+  encode_json("crush-num-osd-failure-domains", crush_num_osd_failure_domains, f);
   encode_json("crush-osds-per-failure-domain", crush_osds_per_failure_domain,
               f);
   encode_json("crush-root", crush_root, f);
@@ -141,9 +142,19 @@ void OSDECProfileGetReply::dump(Formatter* f) const {
 
 void OSDECProfileGetReply::decode_json(JSONObj* obj) {
   JSONDecoder::decode_json("crush-device-class", crush_device_class, obj);
-  JSONDecoder::decode_json("crush-failure-domain", crush_failure_domain, obj);
+  // Read old key first, then let new key override if present
+  JSONDecoder::decode_json("crush-failure-domain", crush_osd_failure_domain, obj);
   JSONDecoder::decode_json("crush-num-failure-domains",
-                           crush_num_failure_domains, obj);
+                           crush_num_osd_failure_domains, obj);
+  JSONDecoder::decode_json("crush-zone-failure-domain", crush_zone_failure_domain, obj);
+  std::string new_osd_failure_domain;
+  if (JSONDecoder::decode_json("crush-osd-failure-domain", new_osd_failure_domain, obj)) {
+    crush_osd_failure_domain = new_osd_failure_domain;
+  }
+  int new_num_osd_failure_domains = 0;
+  if (JSONDecoder::decode_json("crush-num-osd-failure-domains", new_num_osd_failure_domains, obj)) {
+    crush_num_osd_failure_domains = new_num_osd_failure_domains;
+  }
   JSONDecoder::decode_json("crush-osds-per-failure-domain",
                            crush_osds_per_failure_domain, obj);
   JSONDecoder::decode_json("crush-root", crush_root, obj);
@@ -189,6 +200,21 @@ void OSDECPoolCreateRequest::decode_json(JSONObj* obj) {
   JSONDecoder::decode_json("pg_num", pg_num, obj);
   JSONDecoder::decode_json("pgp_num", pgp_num, obj);
   JSONDecoder::decode_json("erasure_code_profile", erasure_code_profile, obj);
+}
+
+void OSDPoolMigrateRequest::dump(Formatter* f) const {
+  encode_json("prefix", "osd pool migrate", f);
+  encode_json("pool", pool, f);
+  encode_json("pg_num", pg_num, f);
+  encode_json("enable_ec_optimizations", enable_ec_optimizations, f);
+  encode_json("yes_i_really_mean_it", yes_i_really_mean_it, f);
+}
+
+void OSDPoolMigrateRequest::decode_json(JSONObj* obj) {
+  JSONDecoder::decode_json("pool", pool, obj);
+  JSONDecoder::decode_json("pg_num", pg_num, obj);
+  JSONDecoder::decode_json("enable_ec_optimizations", enable_ec_optimizations, obj);
+  JSONDecoder::decode_json("yes_i_really_mean_it", yes_i_really_mean_it, obj);
 }
 
 void OSDSetRequest::dump(Formatter* f) const {

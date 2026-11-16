@@ -225,9 +225,9 @@ void PG::clear_publish_stats()
   pg_stats.reset();
 }
 
-pg_stat_t PG::get_stats() const
+std::optional<pg_stat_t> PG::get_stats() const
 {
-  return pg_stats.value_or(pg_stat_t{});
+  return pg_stats;
 }
 
 void PG::apply_stats(
@@ -400,7 +400,7 @@ void PG::on_replica_activate()
   scrubber.on_replica_activate();
 }
 
-void PG::on_activate_complete()
+void PG::on_activate_complete(HBHandle *handle)
 {
   /* Confusingly, on_activate_complete is invoked when the primary and replicas
    * have recorded the current interval.  At that point, the PG may either become
@@ -1022,6 +1022,7 @@ PG::interruptible_future<PG::rep_op_fut_t>
 PG::submit_transaction(
   ObjectContextRef&& obc,
   ObjectContextRef&& new_clone,
+  ObjectContextRef&& rollback_to,
   ceph::os::Transaction&& txn,
   osd_op_params_t&& osd_op_p,
   std::vector<pg_log_entry_t>&& log_entries)
@@ -1054,6 +1055,7 @@ PG::submit_transaction(
       peering_state.get_acting_recovery_backfill(),
       std::move(obc),
       std::move(new_clone),
+      std::move(rollback_to),
       std::move(txn),
       std::move(osd_op_p),
       peering_state.get_last_peering_reset(),
@@ -2135,4 +2137,11 @@ void PG::merge_from(
   rctx.transaction.collection_set_bits(coll_ref->get_cid(), split_bits);
   snap_mapper.update_bits(split_bits);
 }
+
+std::optional<hobject_t> PG::consider_updating_migration_watermark(
+  std::set<hobject_t> &deleted) {
+  // TODO: Implement migration watermark logic
+  return std::nullopt;  // For now, return empty
+}
+
 }

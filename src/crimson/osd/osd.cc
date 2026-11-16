@@ -662,14 +662,13 @@ seastar::future<> OSD::start()
     return _add_me_to_crush();
   });
   co_await _add_device_class();
-  if (is_rotational.has_value()) {
-    co_await shard_services.invoke_on_all([this](auto &local_service) {
-      local_service.local_state.initialize_scheduler(local_service.get_cct(), *is_rotational);
-    });
-  } else {
+  if (!is_rotational.has_value()) {
     WARN("no device class set, defaulting is_rotational to false");
     is_rotational = false;
   }
+  co_await shard_services.invoke_on_all([this](auto &local_service) {
+    local_service.local_state.initialize_scheduler(local_service.get_cct(), *is_rotational);
+  });
   monc->sub_want("osd_pg_creates", last_pg_create_epoch, 0);
   monc->sub_want("mgrmap", 0, 0);
   monc->sub_want("osdmap", 0, 0);
@@ -888,6 +887,7 @@ seastar::future<> OSD::start_asok_admin()
     asok->register_command(make_asok_hook<SendBeaconHook>(*this));
     asok->register_command(make_asok_hook<RunOSDBenchHook>(*this));
     asok->register_command(make_asok_hook<FlushPgStatsHook>(*this));
+    asok->register_command(make_asok_hook<GetLatestOSDMapHook>(*this));
     asok->register_command(
       make_asok_hook<DumpPGStateHistory>(std::as_const(pg_shard_manager)));
     asok->register_command(make_asok_hook<DumpMetricsHook>());
@@ -1038,6 +1038,9 @@ OSD::do_ms_dispatch(
     return handle_osd_map(boost::static_pointer_cast<MOSDMap>(m));
   case CEPH_MSG_OSD_OP:
     return handle_osd_op(conn, boost::static_pointer_cast<MOSDOp>(m));
+  case CEPH_MSG_PING:
+    // clients ping connections with laggy ops, only to detect their reset
+    return seastar::now();
   case MSG_OSD_PG_CREATE2:
     return handle_pg_create(
       conn, boost::static_pointer_cast<MOSDPGCreate2>(m));
@@ -1075,6 +1078,8 @@ OSD::do_ms_dispatch(
   case MSG_OSD_BACKFILL_RESERVE:
     [[fallthrough]];
   case MSG_OSD_RECOVERY_RESERVE:
+    [[fallthrough]];
+  case MSG_OSD_POOLMIGRATION_RESERVE:
     [[fallthrough]];
   case MSG_OSD_PG_LOG:
     return handle_peering_op(conn, boost::static_pointer_cast<MOSDPeeringOp>(m));
@@ -1262,6 +1267,18 @@ seastar::future<uint64_t> OSD::send_pg_stats()
   co_return osd_stat.seq;
 }
 
+seastar::future<epoch_t> OSD::wait_for_latest_osdmap()
+{
+  LOG_PREFIX(OSD::wait_for_latest_osdmap);
+  ceph_assert(seastar::this_shard_id() == PRIMARY_CORE);
+  const auto [newest, oldest] = co_await monc->get_version("osdmap");
+  DEBUG("newest osdmap: {}, mine: {}", newest, osdmap->get_epoch());
+  // the OSD-level gate is updated only after all PGs have advanced
+  co_return co_await
+    get_shard_services().local_state.osdmap_gate.wait_for_map_untracked(
+      newest, &get_shard_services());
+}
+
 seastar::future<> OSD::handle_osd_map(Ref<MOSDMap> m)
 {
   /* Ensure that only one MOSDMap is processed at a time.  Allowing concurrent
@@ -1432,7 +1449,7 @@ seastar::future<> OSD::committed_osd_maps(
     co_await pg_shard_manager.broadcast_map_to_pgs(osdmap->get_epoch());
   } else {
     if (pg_shard_manager.is_prestop()) {
-      got_stop_ack();
+      got_stop_ack("committed_osd_maps");
     }
   }
 
@@ -1586,7 +1603,7 @@ seastar::future<> OSD::handle_mark_me_down(
 {
   ceph_assert(seastar::this_shard_id() == PRIMARY_CORE);
   if (pg_shard_manager.is_prestop()) {
-    got_stop_ack();
+    got_stop_ack("handle_mark_me_down");
   }
   co_return;
 }
@@ -1894,6 +1911,17 @@ seastar::future<> OSD::check_osdmap_features()
   }
 }
 
+void OSD::got_stop_ack(const char* from)
+{
+  LOG_PREFIX(OSD::got_stop_ack);
+  if (!stop_acked.available()) {
+    INFO("osd.{}: stop acked via {}", whoami, from);
+    stop_acked.set_value();
+  } else {
+    DEBUG("osd.{}: stop already acked, ignoring {}", whoami, from);
+  }
+}
+
 seastar::future<> OSD::prepare_to_stop()
 {
   if (osdmap && osdmap->is_up(whoami)) {
@@ -1913,7 +1941,7 @@ seastar::future<> OSD::prepare_to_stop()
 	    osdmap->get_addrs(whoami),
 	    osdmap->get_epoch(),
 	    true)).then([this] {
-	return stop_acked.get_future();
+	return stop_acked.get_shared_future();
       }));
     } catch (seastar::timed_out_error&) {}
   }

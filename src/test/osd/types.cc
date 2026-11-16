@@ -19,11 +19,13 @@
 #include "include/types.h"
 #include "osd/osd_types.h"
 #include "osd/OSDMap.h"
+#include "crush/crush.h"
 #include "gtest/gtest.h"
 #include "include/coredumpctl.h"
 #include "common/Thread.h"
 #include "include/stringify.h"
 #include "osd/ReplicatedBackend.h"
+#include "messages/MOSDOpReply.h"
 
 #include <iostream> // for std::cout
 #include <sstream>
@@ -130,6 +132,191 @@ TEST(pg_pool_t, encodeDecode)
       compare_pg_pool_t(p1, p2);
     }
   }
+}
+
+class PgPoolStretchEncodingTest : public ::testing::Test {
+protected:
+  // a peer without OSD_STRETCH_ZONES (an earlier release, or any peer before
+  // the upgrade commit) gets the older format, without num_zones and replica
+  static constexpr uint64_t full_features = CEPH_FEATURES_ALL;
+  static constexpr uint64_t older_features =
+    CEPH_FEATURES_ALL & ~CEPH_FEATURE_OSD_STRETCH_ZONES;
+
+  static pg_pool_t make_stretch_pool(unsigned zones, unsigned replica,
+                                     unsigned min_size_per_zone) {
+    pg_pool_t p;
+    p.type = pg_pool_t::TYPE_REPLICATED;
+    p.size = zones * replica;
+    p.min_size = min_size_per_zone;
+    p.num_zones = zones;
+    p.replica = replica;
+    p.crush_rule = 1;
+    p.peering_crush_bucket_count = zones;
+    p.peering_crush_bucket_target = zones;
+    p.peering_crush_bucket_barrier = 8;
+    p.peering_crush_mandatory_member = CRUSH_ITEM_NONE;
+    p.set_pg_num(8);
+    p.set_pgp_num(8);
+    return p;
+  }
+
+  static pg_pool_t make_local_pool(unsigned size, unsigned min_size) {
+    pg_pool_t p;
+    p.type = pg_pool_t::TYPE_REPLICATED;
+    p.size = size;
+    p.min_size = min_size;
+    p.num_zones = 1;
+    p.replica = size;
+    p.crush_rule = 0;
+    p.set_pg_num(8);
+    p.set_pgp_num(8);
+    return p;
+  }
+
+  // a pool of global stretch mode as earlier releases have it: one zone and
+  // min_size over all its copies
+  static pg_pool_t make_one_zone_stretch_pool(unsigned size, unsigned min_size) {
+    pg_pool_t p = make_stretch_pool(2, size / 2, min_size);
+    p.num_zones = 1;
+    p.replica = size;
+    return p;
+  }
+
+  static pg_pool_t round_trip(const pg_pool_t& in, uint64_t features) {
+    bufferlist bl;
+    in.encode(bl, features);
+    auto it = bl.cbegin();
+    pg_pool_t out;
+    out.decode(it);
+    return out;
+  }
+
+  static uint8_t encoded_struct_v(const pg_pool_t& p, uint64_t features) {
+    bufferlist bl;
+    p.encode(bl, features);
+    return static_cast<uint8_t>(bl[0]);
+  }
+};
+
+// Test the full format is version 35
+TEST_F(PgPoolStretchEncodingTest, FullFeaturesEncodeVersion35) {
+  EXPECT_EQ(35u, encoded_struct_v(make_stretch_pool(2, 2, 1), full_features));
+}
+
+// Test a peer without OSD_STRETCH_ZONES gets the version of pool migration,
+// and an earlier release its own
+TEST_F(PgPoolStretchEncodingTest, OlderFeaturesEncodeBeforeVersion35) {
+  EXPECT_EQ(34u, encoded_struct_v(make_stretch_pool(2, 2, 1), older_features));
+  EXPECT_EQ(32u, encoded_struct_v(make_stretch_pool(2, 2, 1),
+                                  older_features & ~CEPH_FEATURE_SERVER_UMBRELLA));
+}
+
+// Test a peer without OSD_STRETCH_ZONES keeps a pool's migration
+TEST_F(PgPoolStretchEncodingTest, OlderFormatKeepsMigration) {
+  pg_pool_t in = make_local_pool(3, 2);
+  in.migration_src = 4;
+  in.migration_root = 4;
+  in.lowest_migrated_pg = 2;
+  const pg_pool_t out = round_trip(in, older_features);
+  EXPECT_EQ(in.migration_src, out.migration_src);
+  EXPECT_EQ(in.migration_root, out.migration_root);
+  EXPECT_EQ(2u, out.lowest_migrated_pg);
+}
+
+// Test the full format keeps num_zones, replica and the per-zone min_size
+TEST_F(PgPoolStretchEncodingTest, FullFormatRoundTrip) {
+  const pg_pool_t out = round_trip(make_stretch_pool(2, 2, 1), full_features);
+  EXPECT_EQ(2u, out.get_num_zones());
+  EXPECT_EQ(2u, out.get_replica());
+  EXPECT_EQ(4u, out.get_size());
+  EXPECT_EQ(1u, out.get_min_size());
+}
+
+// Test a pool over zones reads, in the older format, as one zone with
+// min_size over all its copies, as an older reader understands it
+TEST_F(PgPoolStretchEncodingTest, OlderFormatReadsAsOneZone) {
+  const pg_pool_t out = round_trip(make_stretch_pool(2, 3, 2), older_features);
+  EXPECT_EQ(1u, out.get_num_zones());
+  EXPECT_EQ(6u, out.get_replica());
+  EXPECT_EQ(6u, out.get_size());
+  EXPECT_EQ(4u, out.get_min_size());
+}
+
+// Test a pool of global stretch mode before the commit keeps one zone and its
+// min_size over repeated older format round trips, healthy, with an odd
+// min_size, and halved in degraded stretch mode
+TEST_F(PgPoolStretchEncodingTest, OlderFormatOneZonePoolIsUnchanged) {
+  for (unsigned min_size : {1u, 2u, 3u}) {
+    SCOPED_TRACE("min_size " + std::to_string(min_size));
+    pg_pool_t p = make_one_zone_stretch_pool(4, min_size);
+    if (min_size == 1) {
+      p.peering_crush_bucket_count = 1;
+    }
+    for (int i = 0; i < 5; ++i) {
+      p = round_trip(p, older_features);
+    }
+    EXPECT_TRUE(p.is_stretch_pool());
+    EXPECT_EQ(1u, p.get_num_zones());
+    EXPECT_EQ(4u, p.get_replica());
+    EXPECT_EQ(4u, p.get_size());
+    EXPECT_EQ(min_size, p.get_min_size());
+  }
+}
+
+// Test an individual stretch pool over three zones from an earlier release
+// keeps one zone and min_size over all its copies, as in that release
+TEST_F(PgPoolStretchEncodingTest, OlderFormatIndividualStretchPoolKeepsMinSize) {
+  pg_pool_t in = make_local_pool(3, 2);
+  in.peering_crush_bucket_count = 2;
+  in.peering_crush_bucket_target = 3;
+  in.peering_crush_bucket_barrier = 8;
+  in.peering_crush_mandatory_member = CRUSH_ITEM_NONE;
+  const pg_pool_t out = round_trip(in, older_features);
+  EXPECT_TRUE(out.is_stretch_pool());
+  EXPECT_EQ(1u, out.get_num_zones());
+  EXPECT_EQ(3u, out.get_replica());
+  EXPECT_EQ(3u, out.get_size());
+  EXPECT_EQ(2u, out.get_min_size());
+}
+
+// Test an EC pool that an older release's stretch set gave stretch values,
+// keeping its size, decodes as one zone with its min_size
+TEST_F(PgPoolStretchEncodingTest, OlderFormatErasurePoolIsOneZone) {
+  pg_pool_t in = make_local_pool(3, 2);
+  in.type = pg_pool_t::TYPE_ERASURE;
+  in.peering_crush_bucket_count = 2;
+  in.peering_crush_bucket_target = 2;
+  in.peering_crush_bucket_barrier = 8;
+  in.peering_crush_mandatory_member = CRUSH_ITEM_NONE;
+  const pg_pool_t out = round_trip(in, older_features);
+  EXPECT_TRUE(out.is_stretch_pool());
+  EXPECT_EQ(1u, out.get_num_zones());
+  EXPECT_EQ(3u, out.get_size());
+  EXPECT_EQ(2u, out.get_min_size());
+}
+
+// Test a local pool is unchanged by either format
+TEST_F(PgPoolStretchEncodingTest, LocalPoolUnchangedByEitherFormat) {
+  const pg_pool_t in = make_local_pool(3, 2);
+  for (uint64_t f : {full_features, older_features}) {
+    const pg_pool_t out = round_trip(in, f);
+    EXPECT_EQ(1u, out.get_num_zones());
+    EXPECT_EQ(3u, out.get_replica());
+    EXPECT_EQ(3u, out.get_size());
+    EXPECT_EQ(2u, out.get_min_size());
+  }
+}
+
+// Test the switch from the older to the full format at the commit does not
+// convert a pool: the commit's own update does
+TEST_F(PgPoolStretchEncodingTest, OlderThenFullFormatKeepsPool) {
+  const pg_pool_t older =
+    round_trip(make_one_zone_stretch_pool(4, 2), older_features);
+  const pg_pool_t full = round_trip(older, full_features);
+  EXPECT_EQ(1u, full.get_num_zones());
+  EXPECT_EQ(4u, full.get_replica());
+  EXPECT_EQ(4u, full.get_size());
+  EXPECT_EQ(2u, full.get_min_size());
 }
 
 TEST(hobject, prefixes0)
@@ -1863,6 +2050,47 @@ TEST(pg_pool_t_test, get_random_pg_position) {
   }
 }
 
+// min_size counts the copies in each zone, so the pool line shows the zones
+// and copies in each zone before it; a pool in one zone prints as before
+TEST_F(PgPoolStretchEncodingTest, PrintShowsZonesBeforeMinSize) {
+  auto printed = [](const pg_pool_t& p) {
+    ostringstream out;
+    p.print(out);
+    return out.str();
+  };
+  EXPECT_NE(std::string::npos,
+            printed(make_stretch_pool(2, 2, 1)).find(
+              " size 4 num_zones 2 replica 2 min_size 1 crush_rule 1 "))
+    << printed(make_stretch_pool(2, 2, 1));
+
+  pg_pool_t ec = make_stretch_pool(2, 6, 5);
+  ec.type = pg_pool_t::TYPE_ERASURE;
+  EXPECT_NE(std::string::npos,
+            printed(ec).find(" size 12 num_zones 2 min_size 5 crush_rule 1 "))
+    << printed(ec);
+
+  EXPECT_NE(std::string::npos,
+            printed(make_local_pool(3, 2)).find(
+              " size 3 min_size 2 crush_rule 0 "))
+    << printed(make_local_pool(3, 2));
+}
+
+// Without ec_data_shard_count, k comes from the nonprimary shards, which a
+// num_zones > 1 pool repeats in every zone.
+TEST(pg_pool_t_test, get_ec_data_shard_count_multi_zone_fallback) {
+  const int k = 4, m = 2, num_zones = 2;
+  pg_pool_t p;
+  p.type = pg_pool_t::TYPE_ERASURE;
+  p.size = num_zones * (k + m);
+  p.num_zones = num_zones;
+  for (int zone = 0; zone < num_zones; ++zone) {
+    for (int i = 1; i < k; ++i) {
+      p.nonprimary_shards.insert(shard_id_t(i + (k + m) * zone));
+    }
+  }
+  EXPECT_EQ(k, p.get_ec_data_shard_count());
+}
+
 TEST(shard_id_t, iostream) {
     set<shard_id_t> shards;
     shards.insert(shard_id_t(0));
@@ -3088,6 +3316,79 @@ TEST(pg_history_t, merge_never_touched_peer_does_not_open_false_rebuild_span)
       << "merging a blank peer must not move last_rebuild_active_start past "
          "rebuild_span_reported and create a false open span";
   EXPECT_EQ(later_report, local.rebuild_span_reported);
+}
+
+static ceph::ref_t<MOSDOpReply> reply_roundtrip(
+  const ceph::ref_t<MOSDOpReply>& in,
+  uint64_t features)
+{
+  in->encode_payload(features);
+  auto out = ceph::make_message<MOSDOpReply>();
+  out->set_header(in->get_header());
+  ceph::buffer::list payload = in->get_payload();
+  out->set_payload(payload);
+  out->set_data(in->get_data());
+  out->decode_payload();
+  return out;
+}
+
+TEST(MOSDOpReply, core_hint_roundtrip)
+{
+  const osd_core_hint_t hint{3, 6810};
+
+  auto reply = ceph::make_message<MOSDOpReply>();
+  reply->set_core_hint(hint);
+  auto decoded = reply_roundtrip(reply, CEPH_FEATURES_ALL);
+  EXPECT_EQ(decoded->get_header().version, 9);
+  ASSERT_TRUE(decoded->get_core_hint().has_value());
+  EXPECT_EQ(*decoded->get_core_hint(), hint);
+  EXPECT_EQ(fmt::format("{}", *decoded->get_core_hint()), "core 3 port 6810");
+}
+
+// the hint is optional: a v9 reply may name none
+TEST(MOSDOpReply, no_core_hint)
+{
+  auto reply = ceph::make_message<MOSDOpReply>();
+  auto decoded = reply_roundtrip(reply, CEPH_FEATURES_ALL);
+  EXPECT_EQ(decoded->get_header().version, 9);
+  EXPECT_FALSE(decoded->get_core_hint().has_value());
+}
+
+// no feature gates it: any peer gets v9, and older ones ignore the hint
+TEST(MOSDOpReply, core_hint_regardless_of_features)
+{
+  auto reply = ceph::make_message<MOSDOpReply>();
+  reply->set_core_hint(osd_core_hint_t{3, 6810});
+  auto decoded = reply_roundtrip(
+    reply, CEPH_FEATURES_ALL & ~CEPH_FEATURE_SERVER_VAMPIRE);
+  EXPECT_EQ(decoded->get_header().version, 9);
+  ASSERT_TRUE(decoded->get_core_hint().has_value());
+  EXPECT_EQ(*decoded->get_core_hint(), (osd_core_hint_t{3, 6810}));
+}
+
+// a v8 decoder reads a v9 reply: all of it but the trailing hint
+TEST(MOSDOpReply, v9_read_as_v8)
+{
+  auto reply = ceph::make_message<MOSDOpReply>();
+  reply->set_tid(42);
+  reply->set_result(-2);
+  reply->set_reply_versions(eversion_t(5, 7), 7);
+  reply->set_core_hint(osd_core_hint_t{3, 6810});
+  reply->encode_payload(CEPH_FEATURES_ALL);
+  ASSERT_EQ(reply->get_header().version, 9);
+
+  auto out = ceph::make_message<MOSDOpReply>();
+  auto header = reply->get_header();
+  header.version = 8;  // as a decoder knowing up to v8 takes it
+  out->set_header(header);
+  ceph::buffer::list payload = reply->get_payload();
+  out->set_payload(payload);
+  out->decode_payload();
+  EXPECT_EQ(out->get_tid(), 42u);
+  EXPECT_EQ(out->get_result(), -2);
+  EXPECT_EQ(out->get_replay_version(), eversion_t(5, 7));
+  EXPECT_EQ(out->get_user_version(), 7u);
+  EXPECT_FALSE(out->get_core_hint().has_value());
 }
 
 /*

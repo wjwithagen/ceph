@@ -1,14 +1,16 @@
 # -*- coding: utf-8 -*-
 # pylint: disable=too-many-lines
+import errno
 from copy import deepcopy
 from unittest.mock import Mock, patch
 from urllib.parse import urlencode
 
 from nfs.export import AppliedExportResults
+from object_format import ErrorResponse
 
 from .. import mgr
 from ..controllers._version import APIVersion
-from ..controllers.nfs import NFSGaneshaExports, NFSGaneshaUi
+from ..controllers.nfs import NFSGaneshaCluster, NFSGaneshaExports, NFSGaneshaUi
 from ..tests import ControllerTestCase
 from ..tools import NotificationQueue, TaskManager
 
@@ -242,3 +244,184 @@ class NFSGaneshaUiControllerTest(ControllerTestCase):
         self._get('/ui-api/nfs-ganesha/status')
         self.assertStatus(200)
         self.assertJsonBody({'available': False, 'message': 'Test'})
+
+
+class NFSGaneshaClusterTest(ControllerTestCase):
+    _cluster_info = {
+        'mycluster': {
+            'virtual_ip': None,
+            'backend': [{'hostname': 'host1', 'ip': '10.0.0.1', 'port': 2049, 'status': 'running'}],
+            'placement': {'count': 1},
+            'enable_nfsv3': False,
+            'enable_rdma': False,
+            'deployment_type': 'standalone',
+            'ingress_mode': None,
+            'port': None,
+            'monitor_port': None
+        }
+    }
+
+    @classmethod
+    def setup_server(cls):
+        NotificationQueue.start_queue()
+        TaskManager.init()
+        cls.setup_controllers([NFSGaneshaCluster])
+
+    @classmethod
+    def tearDownClass(cls):
+        super().tearDownClass()
+        NotificationQueue.stop()
+
+    def test_list_clusters(self):
+        mgr.remote = Mock(return_value=['myc', 'myc2'])
+        self._get('/api/nfs-ganesha/cluster',
+                  version=APIVersion.EXPERIMENTAL)
+        self.assertStatus(200)
+        self.assertJsonBody(['myc', 'myc2'])
+
+    def test_list_clusters_with_info(self):
+        cluster_info = {
+            'myc': {
+                'deployment_type': 'standalone',
+                'virtual_ip': None,
+                'backend': [],
+                'placement': {},
+                'enable_rdma': False,
+            }
+        }
+        mgr.remote = Mock(return_value=cluster_info)
+        self._get('/api/nfs-ganesha/cluster?info=true',
+                  version=APIVersion.EXPERIMENTAL)
+        self.assertStatus(200)
+        body = self.json_body()
+        self.assertEqual(len(body), 1)
+        self.assertEqual(body[0]['name'], 'myc')
+
+    def test_create_cluster(self):
+        mgr.remote = Mock(return_value=None)
+        self._post('/api/nfs-ganesha/cluster',
+                   {'cluster_id': 'newc'},
+                   version=APIVersion(1, 0))
+        self.assertStatus(201)
+        mgr.remote.assert_called_once_with(
+            'nfs', 'cluster_create',
+            cluster_id='newc',
+            placement=None,
+            ingress=None,
+            virtual_ip=None,
+            ingress_mode=None,
+            port=None,
+            enable_rdma=False,
+            rdma_port=None,
+            enable_nfsv3=False,
+            ingress_placement=None,
+            bind_addrs=None,
+            monitoring_addrs=None,
+            monitoring_port=None,
+            networks=None,
+        )
+
+    def test_create_cluster_with_placement(self):
+        """The controller passes the placement dict through unchanged; the nfs
+        module is responsible for normalising it to a placement string."""
+        placement = {'hosts': ['host1', 'host2'], 'count': 2}
+        mgr.remote = Mock(return_value=None)
+        self._post('/api/nfs-ganesha/cluster',
+                   {'cluster_id': 'newc', 'placement': placement},
+                   version=APIVersion(1, 0))
+        self.assertStatus(201)
+        _, kwargs = mgr.remote.call_args
+        self.assertEqual(kwargs['placement'], placement)
+
+    def test_create_cluster_with_networks(self):
+        """The controller passes networks through unchanged; the nfs module
+        is responsible for stripping whitespace."""
+        networks = ['10.0.0.0/24', ' 192.168.1.0/24 ']
+        mgr.remote = Mock(return_value=None)
+        self._post('/api/nfs-ganesha/cluster',
+                   {'cluster_id': 'newc', 'networks': networks},
+                   version=APIVersion(1, 0))
+        self.assertStatus(201)
+        _, kwargs = mgr.remote.call_args
+        self.assertEqual(kwargs['networks'], networks)
+
+    def test_create_cluster_empty_networks_passes_through(self):
+        """An empty networks list is passed through as-is; the nfs module
+        collapses it to None."""
+        mgr.remote = Mock(return_value=None)
+        self._post('/api/nfs-ganesha/cluster',
+                   {'cluster_id': 'newc', 'networks': []},
+                   version=APIVersion(1, 0))
+        self.assertStatus(201)
+        _, kwargs = mgr.remote.call_args
+        self.assertEqual(kwargs['networks'], [])
+
+    def test_create_cluster_failure_propagates(self):
+        """Remote failure must surface as an HTTP error, not silently succeed."""
+        mgr.remote = Mock(side_effect=RuntimeError('orch error'))
+        self._post('/api/nfs-ganesha/cluster',
+                   {'cluster_id': 'newc'},
+                   version=APIVersion(1, 0))
+        self.assertStatus(400)
+
+    def test_create_cluster_cli_failure_propagates(self):
+        """CLI-style (retval, body, status) failure must raise NFSException."""
+        mgr.remote = Mock(return_value=(-1, '', 'Pool creation failed'))
+        self._post('/api/nfs-ganesha/cluster',
+                   {'cluster_id': 'newc'},
+                   version=APIVersion(1, 0))
+        self.assertStatus(400)
+
+    def test_create_cluster_with_vip_and_ingress(self):
+        """The controller passes the ingress_mode string through unchanged;
+        the nfs module resolves it to an IngressType."""
+        mgr.remote = Mock(return_value=None)
+        self._post('/api/nfs-ganesha/cluster',
+                   {'cluster_id': 'newc',
+                    'ingress': True,
+                    'virtual_ip': '10.0.0.100/24',
+                    'ingress_mode': 'haproxy-standard'},
+                   version=APIVersion(1, 0))
+        self.assertStatus(201)
+        _, kwargs = mgr.remote.call_args
+        self.assertEqual(kwargs['virtual_ip'], '10.0.0.100/24')
+        # raw string is forwarded; the nfs module converts it to IngressType
+        self.assertEqual(kwargs['ingress_mode'], 'haproxy-standard')
+
+    def test_delete_cluster(self):
+        mgr.remote = Mock(return_value=None)
+        self._delete('/api/nfs-ganesha/cluster/myc',
+                     version=APIVersion(1, 0))
+        self.assertStatus(204)
+        mgr.remote.assert_called_once_with(
+            'nfs', 'cluster_rm', cluster_id='myc'
+        )
+
+    def test_delete_cluster_failure_propagates(self):
+        """Remote failure during delete must surface as an HTTP error."""
+        mgr.remote = Mock(side_effect=RuntimeError('orch error'))
+        self._delete('/api/nfs-ganesha/cluster/myc',
+                     version=APIVersion(1, 0))
+        self.assertStatus(400)
+
+    def test_delete_cluster_cli_failure_propagates(self):
+        """CLI-style (retval, body, status) failure during delete must raise NFSException."""
+        mgr.remote = Mock(return_value=(-1, '', 'Cluster not found'))
+        self._delete('/api/nfs-ganesha/cluster/myc',
+                     version=APIVersion(1, 0))
+        self.assertStatus(400)
+
+    def test_get_cluster(self):
+        mgr.remote = Mock(return_value=self._cluster_info)
+
+        self._get('/api/nfs-ganesha/cluster/mycluster', version=APIVersion.EXPERIMENTAL)
+        self.assertStatus(200)
+        self.assertJsonBody({'name': 'mycluster', **self._cluster_info['mycluster']})
+
+    def test_get_cluster_not_found(self):
+        mgr.remote = Mock(side_effect=ErrorResponse(
+            'cluster does not exist', -errno.ENOENT))
+
+        self._get('/api/nfs-ganesha/cluster/nonexistent', version=APIVersion.EXPERIMENTAL)
+        self.assertStatus(200)
+        self.assertJsonBody(None)

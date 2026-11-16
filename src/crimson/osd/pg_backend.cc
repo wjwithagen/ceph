@@ -99,7 +99,8 @@ PGBackend::decode_metadata2(
 {
   loaded_object_md_t::ref ret(new loaded_object_md_t());
   if (auto oiiter = attrs.find(OI_ATTR); oiiter != attrs.end()) {
-    bufferlist bl = std::move(oiiter->second);
+    // keep the encoded OI in attr_cache too
+    bufferlist bl = oiiter->second;
     try {
       ret->os = ObjectState(object_info_t(bl), true);
       ceph_assert(oid == ret->os.oi.soid);
@@ -122,7 +123,7 @@ PGBackend::decode_metadata2(
     bool object_corrupted = true;
     if (auto ssiter = attrs.find(SS_ATTR); ssiter != attrs.end()) {
       object_corrupted = false;
-      bufferlist bl = std::move(ssiter->second);
+      bufferlist bl = ssiter->second;
       if (bl.length()) {
         ret->ssc = new crimson::osd::SnapSetContext(oid.get_snapdir());
         try {
@@ -826,7 +827,8 @@ PGBackend::rollback_iertr::future<> PGBackend::rollback(
   crimson::osd::ObjectContextRef head,
   crimson::osd::ObjectContextLoader& obc_loader,
   const SnapContext &snapc,
-  ObjectContext::attr_cache_t& attr_cache)
+  ObjectContext::attr_cache_t& attr_cache,
+  crimson::osd::ObjectContextRef& rollback_to)
 {
   const ceph_osd_op& op = osd_op.op;
   snapid_t snapid = (uint64_t)op.snap.snapid;
@@ -837,7 +839,8 @@ PGBackend::rollback_iertr::future<> PGBackend::rollback(
   target_coid.snap = snapid;
   return obc_loader.with_clone_obc_only<RWState::RWWRITE>(
     head, target_coid,
-    [this, &os, &txn, &delta_stats, &osd_op_params, snapid, &attr_cache]
+    [this, &os, &txn, &delta_stats, &osd_op_params, snapid, &attr_cache,
+     &rollback_to]
     (auto head_obc, auto resolved_obc) {
     if (resolved_obc->obs.oi.soid.is_head()) {
       // no-op: The resolved oid returned the head object
@@ -865,8 +868,15 @@ PGBackend::rollback_iertr::future<> PGBackend::rollback(
     // 2) Clone correct snapshot into head
     txn.clone(coll->get_cid(), ghobject_t{resolved_obc->obs.oi.soid},
                                ghobject_t{os.oi.soid});
-    //    The head now has the xattrs of the clone
-    attr_cache = resolved_obc->attr_cache;
+    //    The backend needs the clone obc, as PrimaryLogPG::_rollback_to()
+    //    adds it to the PGTransaction
+    rollback_to = resolved_obc;
+    //    The head now has the xattrs of the clone. On EC pools,
+    //    ECTransaction copies them from the clone obc, as on the
+    //    classic OSD.
+    if (!is_erasure()) {
+      attr_cache = resolved_obc->attr_cache;
+    }
     //    Copy clone obc.os.oi to os.oi
     os.oi.clear_flag(object_info_t::FLAG_WHITEOUT);
     os.oi.copy_user_bits(resolved_obc->obs.oi);
@@ -1183,17 +1193,13 @@ PGBackend::setxattr_ierrorator::future<> PGBackend::setxattr(
 }
 
 PGBackend::get_attr_ierrorator::future<ceph::bufferlist>
-PGBackend::get_xattr_maybe_from_cache(
+PGBackend::get_xattr_from_cache(
   const ObjectState& os,
   const ObjectContext::attr_cache_t& attr_cache,
   std::string&& name) const
 {
-  if (!is_erasure()) {
-    logger().debug("getxattr on obj={} for attr={}", os.oi.soid, name);
-    return getxattr(os.oi.soid, std::move(name));
-  }
   if (!os.exists) {
-    logger().debug("getxattr: object {} does not exist (erasure)", os.oi.soid);
+    logger().debug("getxattr: object {} does not exist", os.oi.soid);
     return crimson::ct_error::enoent::make();
   }
   if (auto cache_it = attr_cache.find(name); cache_it != std::end(attr_cache)) {
@@ -1217,7 +1223,7 @@ PGBackend::get_attr_ierrorator::future<> PGBackend::getxattr(
     bp.copy(osd_op.op.xattr.name_len, aname);
     name = "_" + aname;
   }
-  return get_xattr_maybe_from_cache(
+  return get_xattr_from_cache(
     os, attr_cache, std::move(name)
   ).safe_then_interruptible(
     [&delta_stats, &osd_op] (ceph::bufferlist&& val) {
@@ -1235,31 +1241,22 @@ PGBackend::get_attr_ierrorator::future<> PGBackend::get_xattrs(
   OSDOp& osd_op,
   object_stat_sum_t& delta_stats) const
 {
-  auto get_attrs_maybe_from_cache =
-    [&] () {
-    if (!is_erasure()) {
-      logger().debug("getxattrx on obj={} goes into objstore", os.oi.soid);
-      return crimson::os::with_store<&crimson::os::FuturizedStore::Shard::get_attrs>(
-        store, coll, ghobject_t{os.oi.soid}, 0);
+  if (!os.exists) {
+    logger().debug("getxattrs: object {} does not exist", os.oi.soid);
+    return crimson::ct_error::enoent::make();
+  }
+  std::vector<std::pair<std::string, bufferlist>> user_xattrs;
+  uint64_t total_len = 0;
+  for (const auto& [key, val] : attr_cache) {
+    if (key.size() > 1 && key[0] == '_') {
+      total_len += val.length();
+      user_xattrs.emplace_back(key.substr(1), val);
     }
-    return crimson::os::FuturizedStore::Shard::get_attrs_ertr::make_ready_future<
-      crimson::os::FuturizedStore::Shard::attrs_t>(attr_cache);
-  };
-  return get_attrs_maybe_from_cache().safe_then(
-    [&delta_stats, &osd_op](auto&& attrs) {
-    std::vector<std::pair<std::string, bufferlist>> user_xattrs;
-    uint64_t total_len = 0;
-    for (auto& [key, val] : attrs) {
-      if (key.size() > 1 && key[0] == '_') {
-	total_len += val.length();
-	user_xattrs.emplace_back(key.substr(1), std::move(val));
-      }
-    }
-    ceph::encode(user_xattrs, osd_op.outdata);
-    delta_stats.num_rd++;
-    delta_stats.num_rd_kb += shift_round_up(total_len, 10);
-    return get_attr_errorator::now();
-  });
+  }
+  ceph::encode(user_xattrs, osd_op.outdata);
+  delta_stats.num_rd++;
+  delta_stats.num_rd_kb += shift_round_up(total_len, 10);
+  return get_attr_ierrorator::now();
 }
 
 namespace {
@@ -1315,7 +1312,7 @@ PGBackend::cmp_xattr_ierrorator::future<> PGBackend::cmp_xattr(
   bp.copy(osd_op.op.xattr.name_len, name);
  
   logger().debug("cmpxattr on obj={} for attr={}", os.oi.soid, name);
-  return get_xattr_maybe_from_cache(
+  return get_xattr_from_cache(
     os, attr_cache, std::move(name)
   ).safe_then_interruptible(
     [&delta_stats, &osd_op] (auto &&xattr) -> cmp_xattr_ierrorator::future<> {
@@ -1977,18 +1974,29 @@ void PGBackend::set_metadata(
   const hobject_t &obj,
   object_info_t &oi,
   const SnapSet *ss /* non-null iff head */,
-  ceph::os::Transaction& txn)
+  ceph::os::Transaction& txn,
+  ObjectContext::attr_cache_t& attr_cache)
 {
   ceph_assert((obj.is_head() && ss) || (!obj.is_head() && !ss));
+  // On EC pools, ECTransaction updates attr_cache from the transaction,
+  // as on the classic OSD. It must read the old OI from attr_cache first,
+  // to plan the write and to make the rollback info.
+  const bool update_cache = !is_erasure();
   {
     ceph::bufferlist bv;
     oi.encode(bv, CEPH_FEATURES_ALL);
     txn.setattr(coll->get_cid(), ghobject_t{obj}, OI_ATTR, bv);
+    if (update_cache) {
+      attr_cache[OI_ATTR] = std::move(bv);
+    }
   }
   if (ss) {
     ceph::bufferlist bss;
     encode(*ss, bss);
     txn.setattr(coll->get_cid(), ghobject_t{obj}, SS_ATTR, bss);
+    if (update_cache) {
+      attr_cache[SS_ATTR] = std::move(bss);
+    }
   }
 }
 

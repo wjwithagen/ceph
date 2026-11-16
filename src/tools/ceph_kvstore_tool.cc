@@ -48,7 +48,7 @@ void usage(const char *pname)
     << "  set <prefix> <key> [ver <N>|in <file>]\n"
     << "  rm <prefix> <key>\n"
     << "  rm-prefix <prefix>\n"
-    << "  store-copy <path> [num-keys-per-tx] [rocksdb|...] \n"
+    << "  store-copy <path> [num-keys-per-tx] [rocksdb|...]  (type required for bluestore-kv)\n"
     << "  store-crc <path>\n"
     << "  compact\n"
     << "  compact-prefix <prefix>\n"
@@ -172,13 +172,17 @@ int main(int argc, const char *argv[])
       prefix = url_unescape(argv[4]);
 
     bool do_crc = (cmd == "list-crc");
-    st.list(prefix, do_crc, pretty_binary_key, false);
+    if (st.list(prefix, do_crc, pretty_binary_key, false) < 0) {
+      return 1;
+    }
 
   } else if (cmd == "dump") {
     string prefix;
     if (argc > 4)
       prefix = url_unescape(argv[4]);
-    st.list(prefix, false, pretty_binary_key, true);
+    if (st.list(prefix, false, pretty_binary_key, true) < 0) {
+      return 1;
+    }
 
   } else if (cmd == "exists") {
     string key;
@@ -410,7 +414,10 @@ int main(int argc, const char *argv[])
       return 1;
     }
     std::ofstream fs(argv[4]);
-    uint32_t crc = st.traverse(string(), true, pretty_binary_key, false, &fs);
+    uint32_t crc;
+    if (st.traverse(string(), true, pretty_binary_key, false, &fs, &crc) < 0) {
+      return 1;
+    }
     std::cout << "store at '" << argv[4] << "' crc " << crc << std::endl;
 
   } else if (cmd == "compact") {

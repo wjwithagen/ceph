@@ -588,6 +588,62 @@ function delete_pool() {
     ceph osd pool delete $poolname $poolname --yes-i-really-really-mean-it
 }
 
+##
+# Add the replicated CRUSH rule **name** for a pool over zones, as
+# ceph osd pool create --num_zones builds one: it takes **root**, or
+# only the devices of **device_class** under it, chooses **num_zones**
+# buckets of type **zone_type**, and **replicas_per_zone** of type
+# **osd_type** in each. The rule id is one more than the highest in
+# use.
+#
+# @param dir path name of the environment
+# @param name the name of the rule
+# @param root the CRUSH root the rule takes
+# @param zone_type the CRUSH type of the zones
+# @param num_zones the number of zones
+# @param osd_type the CRUSH type of the replicas' failure domain
+# @param replicas_per_zone the number of replicas in each zone
+# @param device_class (optional) the device class the rule takes
+# @return 0 on success, 1 on error
+#
+function add_stretch_rule() {
+    local dir=$1
+    local name=$2
+    local root=$3
+    local zone_type=$4
+    local num_zones=$5
+    local osd_type=$6
+    local replicas_per_zone=$7
+    local device_class=$8
+    local map=$dir/add_stretch_rule.crushmap
+
+    local take=$root
+    if [ -n "$device_class" ]; then
+        take+=" class $device_class"
+    fi
+    # chooseleaf of type osd can return OSDs that are out
+    local choose=chooseleaf
+    if [ "$osd_type" = osd ]; then
+        choose=choose
+    fi
+    local id
+    id=$(ceph osd crush rule dump --format json | jq 'map(.rule_id) | max + 1') || return 1
+    ceph osd getcrushmap -o $map || return 1
+    crushtool -d $map -o $map.txt || return 1
+    cat >> $map.txt <<EOF
+rule $name {
+        id $id
+        type replicated
+        step take $take
+        step choose firstn $num_zones type $zone_type
+        step $choose firstn $replicas_per_zone type $osd_type
+        step emit
+}
+EOF
+    crushtool -c $map.txt -o $map.new || return 1
+    ceph osd setcrushmap -i $map.new || return 1
+}
+
 #######################################################################
 
 function run_mgr() {
@@ -1681,15 +1737,28 @@ function test_wait_osd_id_used_by_pgs() {
 # as reported by ceph pg dump pgs. Note that a repair also sets this
 # date.
 #
+# 'pg dump pgs' is mgr-mediated, and lags behind the OSD. With **source**
+# set to 'query', the stamp is instead taken from the PG's history, as
+# reported by its primary OSD ('pg query'). That is also the stamp the OSD
+# bases the scrub scheduling on.
+#
 # @param pgid the id of the PG
+# @param sname the stamp name (default: last_scrub_stamp)
+# @param source either 'dump' (the default) or 'query'
 # @param STDOUT the date and time of the last scrub
 # @return 0 on success, 1 on error
 #
 function get_last_scrub_stamp() {
     local pgid=$1
     local sname=${2:-last_scrub_stamp}
-    ceph --format json pg dump pgs 2>/dev/null | \
-        jq -r ".pg_stats | .[] | select(.pgid==\"$pgid\") | .$sname"
+    local source=${3:-dump}
+    if [ "$source" = query ]; then
+        ceph pg $pgid query -f json 2>/dev/null | \
+            jq -r ".info.history.$sname // empty"
+    else
+        ceph --format json pg dump pgs 2>/dev/null | \
+            jq -r ".pg_stats | .[] | select(.pgid==\"$pgid\") | .$sname"
+    fi
 }
 
 function test_get_last_scrub_stamp() {
@@ -1702,6 +1771,8 @@ function test_get_last_scrub_stamp() {
     create_rbd_pool || return 1
     wait_for_clean || return 1
     stamp=$(get_last_scrub_stamp 1.0)
+    test -n "$stamp" || return 1
+    stamp=$(get_last_scrub_stamp 1.0 last_scrub_stamp query)
     test -n "$stamp" || return 1
     teardown $dir || return 1
 }

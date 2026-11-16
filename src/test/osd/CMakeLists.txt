@@ -14,6 +14,7 @@ target_link_libraries(ceph_test_rados
   ${CMAKE_DL_LIBS}
   cls_cas_internal
   cls_cas_client
+  json_structures
   )
 install(TARGETS
   ceph_test_rados
@@ -60,6 +61,13 @@ add_executable(unittest_osd_types
   )
 add_ceph_unittest(unittest_osd_types)
 target_link_libraries(unittest_osd_types global)
+
+# unittest_ec_coroutines
+add_executable(unittest_ec_coroutines
+  test_ec_coroutines.cc
+  )
+add_ceph_unittest(unittest_ec_coroutines)
+target_link_libraries(unittest_ec_coroutines Boost::context)
 
 # unittest_ecbackend_l (legacy EC)
 add_executable(unittest_ecbackend_l
@@ -188,6 +196,26 @@ add_executable(unittest_ec_with_crush
 add_ceph_unittest(unittest_ec_with_crush)
 target_link_libraries(unittest_ec_with_crush osd os global ${CMAKE_DL_LIBS} ${BLKID_LIBRARIES})
 add_dependencies(unittest_ec_with_crush erasure_code_plugins)
+# unittest_ec_acting_stretch
+add_executable(unittest_ec_acting_stretch
+  TestECActingStretch.cc
+  $<TARGET_OBJECTS:unit-main>
+  $<TARGET_OBJECTS:store_test_fixture>
+  $<TARGET_OBJECTS:pg_backend_test_fixture>
+  $<TARGET_OBJECTS:ec_peering_test_fixture>
+  )
+add_ceph_unittest(unittest_ec_acting_stretch)
+target_link_libraries(unittest_ec_acting_stretch osd os global ${CMAKE_DL_LIBS} ${BLKID_LIBRARIES})
+add_dependencies(unittest_ec_acting_stretch ec_isa ec_jerasure)
+
+# unittest_stretch_ec_min_size
+add_executable(unittest_stretch_ec_min_size
+  TestStretchECMinSize.cc
+  $<TARGET_OBJECTS:unit-main>
+  )
+add_ceph_unittest(unittest_stretch_ec_min_size)
+target_link_libraries(unittest_stretch_ec_min_size osd global ${BLKID_LIBRARIES})
+
 # unittest_hitset
 add_executable(unittest_hitset
   hitset.cc
@@ -262,6 +290,7 @@ target_link_libraries(unittest_ec_omap_journal osd global ${BLKID_LIBRARIES})
 # Not including unittest_osdmap, as it is slow. It is tested elsewhere.
 set(OSD_UNITTESTS
   unittest_backend_basics
+  unittest_ec_coroutines
   unittest_ec_omap_journal
   unittest_ec_transaction
   unittest_ec_transaction_l

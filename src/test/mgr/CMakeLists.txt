@@ -78,8 +78,23 @@ add_executable(unittest_mgr_map_cache
   test_mgrmapcache.cc
   ${CMAKE_SOURCE_DIR}/src/mgr/MgrMapCache.cc)
 add_ceph_unittest(unittest_mgr_map_cache)
-target_link_libraries(unittest_mgr_map_cache ceph-common
+target_link_libraries(unittest_mgr_map_cache ceph-common global
   Python3::Python ${CMAKE_DL_LIBS} ${GSSAPI_LIBRARIES})
+
+# unittest_mgr_mgroprequest
+add_executable(unittest_mgr_mgroprequest
+  test_mgroprequest.cc
+  ${CMAKE_SOURCE_DIR}/src/mgr/MgrOpRequest.cc
+)
+add_ceph_unittest(unittest_mgr_mgroprequest)
+if(WITH_LTTNG)
+  add_dependencies(unittest_mgr_mgroprequest mgr_op_tp)
+endif()
+target_link_libraries(unittest_mgr_mgroprequest
+  ceph-common
+  global
+  Python3::Python
+)
 
 #scripts
 if(WITH_MGR_DASHBOARD_FRONTEND)
@@ -89,3 +104,14 @@ if(WITH_MGR_DASHBOARD_FRONTEND)
 
   add_ceph_test(mgr-dashboard-smoke.sh ${CMAKE_CURRENT_SOURCE_DIR}/mgr-dashboard-smoke.sh)
 endif(WITH_MGR_DASHBOARD_FRONTEND)
+
+# ceph_test_mgr_fake_osd
+add_executable(ceph_test_mgr_fake_osd
+  test_mgr_fake_osd.cc
+  )
+target_link_libraries(ceph_test_mgr_fake_osd
+  ceph-common
+  global
+  ${EXTRALIBS}
+  ${CMAKE_DL_LIBS}
+  )

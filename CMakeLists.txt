@@ -345,19 +345,26 @@ endif()
 
 CMAKE_DEPENDENT_OPTION(WITH_SPDK "Enable SPDK" OFF
   "CMAKE_SYSTEM_PROCESSOR MATCHES i386|i686|amd64|x86_64|AMD64|aarch64|riscv64" OFF)
+CMAKE_DEPENDENT_OPTION(WITH_CRIMSON_SPDK "Enable SPDK for crimson SeaStore" ON
+  "WITH_CRIMSON;CMAKE_SYSTEM_PROCESSOR MATCHES amd64|x86_64|AMD64|aarch64" OFF)
 option(WITH_SYSTEM_SPDK "Require a system SPDK instead of building bundled src/spdk" OFF)
-if(WITH_SPDK)
-  if(NOT WITH_BLUESTORE AND NOT WITH_CRIMSON)
-    message(SEND_ERROR "Please enable WITH_BLUESTORE or WITH_CRIMSON for using SPDK")
-  endif()
+if(WITH_SPDK AND NOT WITH_BLUESTORE)
+  message(SEND_ERROR "Please enable WITH_BLUESTORE for using WITH_SPDK")
+endif()
+if(WITH_SPDK OR WITH_CRIMSON_SPDK)
   if(WITH_SYSTEM_SPDK)
     find_package(spdk REQUIRED)
   else()
     include(BuildSPDK)
     build_spdk()
   endif()
+endif()
+if(WITH_SPDK)
   set(HAVE_SPDK TRUE)
-endif(WITH_SPDK)
+endif()
+if(WITH_CRIMSON_SPDK)
+  set(HAVE_CRIMSON_SPDK TRUE)
+endif()
 
 if(WITH_BLUESTORE)
   if(NOT AIO_FOUND AND NOT HAVE_POSIXAIO AND NOT WITH_SPDK)
@@ -540,11 +547,7 @@ set(CRYPTO_LIBS OpenSSL::Crypto)
 
 option(WITH_DPDK "Enable DPDK messaging" OFF)
 if(WITH_DPDK)
-  find_package(DPDK)
-  if(NOT DPDK_FOUND)
-    include(BuildDPDK)
-    build_dpdk(${CMAKE_BINARY_DIR}/src/dpdk)
-  endif()
+  find_package(DPDK REQUIRED)
   set(HAVE_DPDK TRUE)
 endif()
 
@@ -566,18 +569,19 @@ option(WITH_CATCH2 "Enable Catch2 unit tests" ON)
 option(WITH_SYSTEM_CATCH2 "Enable Catch2 unit tests (require system packages)" OFF)
 
 if(WITH_CATCH2)
-  # Save pre-existing definitions (if any):
-  set(ORIG_CPM_LOCAL_PACKAGES_ONLY ${CPM_USE_LOCAL_PACKAGES_ONLY})
+  include(CPM)
 
-    if(WITH_SYSTEM_CATCH2)
-   set(CPM_LOCAL_PACKAGES_ONLY ON)
+  # Save pre-existing definitions (if any):
+  set(ORIG_CPM_LOCAL_PACKAGES_ONLY ${CPM_LOCAL_PACKAGES_ONLY})
+
+  if(WITH_SYSTEM_CATCH2)
+    set(CPM_LOCAL_PACKAGES_ONLY ON)
   endif()
 
-  include(${CMAKE_MODULE_PATH}/CPM.cmake)
   CPMAddPackage("gh:catchorg/Catch2@3.8.1")
 
   # Restore the original CPM settings in case someone else wants to use the module:
-  set(CPM_USE_LOCAL_PACKAGES_ONLY, ${ORIG_CPM_USE_LOCAL_PACKAGES_ONLY})
+  set(CPM_LOCAL_PACKAGES_ONLY ${ORIG_CPM_LOCAL_PACKAGES_ONLY})
 
   # CPM skips the fetch silently if downloads are disabled,
   # e.g. with FETCHCONTENT_FULLY_DISCONNECTED=ON on deb builds
@@ -692,19 +696,11 @@ if(WITH_RADOSGW)
 endif (WITH_RADOSGW)
 
 if(WITH_RADOSGW_FDB)
- include(${CMAKE_MODULE_PATH}/CPM.cmake)
+ find_package(FoundationDB REQUIRED)
+ include(CPM)
 
  CPMAddPackage("gh:eyalz800/zpp_bits@4.5.1")
  message("-- enabled zpp_bits")
-
-# JFW: sadly, I'm having trouble getting FoundationDB to build, but this is VERY close
-# to "just working". But, how would we install the RPMs, etc.? This will need looking at
-# before this can be non-experimental:
-# CPMAddPackage("gh:apple/foundationdb@7.3.63")
- message("FoundationDB support is EXPERIMENTAL and requires manual setup:")
- message(" wget https://github.com/apple/foundationdb/releases/download/7.3.63/foundationdb-clients-7.3.63-1.el7.x86_64.rpm")
- message(" wget https://github.com/apple/foundationdb/releases/download/7.3.63/foundationdb-server-7.3.63-1.el7.x86_64.rpm")
- message("-- enabled FoundationDB (whether its there or not)")
 
 endif()
 

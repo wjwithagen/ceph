@@ -1,10 +1,14 @@
 import { HttpClientTestingModule } from '@angular/common/http/testing';
 import { ComponentFixture, TestBed } from '@angular/core/testing';
+import { By } from '@angular/platform-browser';
+import { Router } from '@angular/router';
+import { RouterTestingModule } from '@angular/router/testing';
 import { of, throwError } from 'rxjs';
 import { take } from 'rxjs/operators';
 
 import { NfsService } from '~/app/shared/api/nfs.service';
 import { OrchestratorService } from '~/app/shared/api/orchestrator.service';
+import { TableComponent } from '~/app/shared/datatable/table/table.component';
 import { CellTemplate } from '~/app/shared/enum/cell-template.enum';
 import { SharedModule } from '~/app/shared/shared.module';
 import { configureTestBed } from '~/testing/unit-test-helper';
@@ -21,7 +25,7 @@ describe('NfsClusterComponent', () => {
 
   configureTestBed({
     declarations: [NfsClusterComponent],
-    imports: [HttpClientTestingModule, SharedModule]
+    imports: [HttpClientTestingModule, RouterTestingModule, SharedModule]
   });
 
   beforeEach(() => {
@@ -52,6 +56,11 @@ describe('NfsClusterComponent', () => {
     expect(component).toBeTruthy();
   });
 
+  it('should refresh the cluster table every 5 seconds', () => {
+    const table = fixture.debugElement.query(By.directive(TableComponent));
+    expect(table.componentInstance.autoReload).toBe(5000);
+  });
+
   describe('columns', () => {
     it('should configure columns for Name, Status, Shares and Protocol', () => {
       expect(component.columns.map((column) => column.name)).toEqual([
@@ -71,9 +80,9 @@ describe('NfsClusterComponent', () => {
       ]);
     });
 
-    it('should render Status as a tag with status class mapping', () => {
+    it('should render Status with the status class mapping', () => {
       const statusColumn = component.columns.find((column) => column.prop === 'status');
-      expect(statusColumn.cellTransformation).toBe(CellTemplate.tag);
+      expect(statusColumn.cellTemplate).toBeTruthy();
       expect(statusColumn.customTemplateConfig.map).toEqual({
         Running: { class: 'tag-success' },
         Degraded: { class: 'tag-warning' },
@@ -152,7 +161,7 @@ describe('NfsClusterComponent', () => {
       );
     });
 
-    it('should leave status blank when no backends are running', async () => {
+    it('should show a dash when no backends are running', async () => {
       await expectClusterRows(
         [
           {
@@ -164,11 +173,11 @@ describe('NfsClusterComponent', () => {
           } as NFSCluster
         ],
         [],
-        [{ name: 'cluster1', status: '' }]
+        [{ name: 'cluster1', status: '-' }]
       );
     });
 
-    it('should leave status blank when backends are missing', async () => {
+    it('should show a dash when backends are missing', async () => {
       await expectClusterRows(
         [
           {
@@ -181,8 +190,8 @@ describe('NfsClusterComponent', () => {
         ],
         [],
         [
-          { name: 'cluster1', status: '' },
-          { name: 'cluster2', status: '' }
+          { name: 'cluster1', status: '-', eventsLink: ['/services', 'nfs.cluster1', 'events'] },
+          { name: 'cluster2', status: '-', eventsLink: ['/services', 'nfs.cluster2', 'events'] }
         ]
       );
     });
@@ -243,6 +252,28 @@ describe('NfsClusterComponent', () => {
           protocol: 'NFSv3, NFSv4'
         })
       ]);
+    });
+  });
+
+  it('should link cluster name to the cephfs cluster overview page', () => {
+    Object.defineProperty(TestBed.inject(Router), 'url', {
+      get: () => '/cephfs/nfs/cluster'
+    });
+    component.ngOnInit();
+    expect(component.columns[0].prop).toBe('name');
+    expect(component.columns[0].cellTransformation).toBe(CellTemplate.redirect);
+    expect(component.columns[0].customTemplateConfig).toEqual({
+      redirectLink: ['/cephfs/nfs/cluster', '::prop', 'overview']
+    });
+  });
+
+  it('should link cluster name to the rgw cluster overview page', () => {
+    Object.defineProperty(TestBed.inject(Router), 'url', {
+      get: () => '/rgw/nfs/cluster'
+    });
+    component.ngOnInit();
+    expect(component.columns[0].customTemplateConfig).toEqual({
+      redirectLink: ['/rgw/nfs/cluster', '::prop', 'overview']
     });
   });
 });

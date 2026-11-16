@@ -3173,6 +3173,21 @@ int RGWBucketInstanceMetadataHandler::put_prepare(
     bci.info.bucket.explicit_placement = old_bci->info.bucket.explicit_placement;
     bci.info.placement_rule = old_bci->info.placement_rule;
 
+    /* keep existing layout logs */
+    if (bci.info.layout.logs.empty()) {
+      bci.info.layout.logs = old_bci->info.layout.logs;
+    }
+
+    // reject metadata with empty logs, since logs not being empty is
+    // an invariant assumed broadly in codebase. indexless buckets are
+    // created without logs (see init_default_bucket_layout()), so the
+    // invariant does not apply to them
+    if (!bci.info.is_indexless() && bci.info.layout.logs.empty()) {
+      ldpp_dout(dpp, 0) << "ERROR: " << __func__ <<
+        "(): bucket info's layout logs may not be empty" << dendl;
+      return -EINVAL;
+    }
+
     //if the bucket is being deleted, create and store a special log type for
     //bucket instance cleanup in multisite setup
     if (!bci.info.is_vector() && bci.info.bucket_deleted() &&
@@ -3189,7 +3204,7 @@ int RGWBucketInstanceMetadataHandler::put_prepare(
           ldpp_dout(dpp, 1) << "WARNING: failed writing data log for bucket="
           << bci.info.bucket << ", shard_id=" << i << "of generation="
           << index_log.gen << dendl;
-          } // datalog error is not fatal
+        } // datalog error is not fatal
       }
     }
   }
@@ -3205,7 +3220,8 @@ int RGWBucketInstanceMetadataHandler::put_prepare(
   bci.info.objv_tracker.write_version = objv_tracker.write_version;
 
   return 0;
-}
+} // RGWBucketInstanceMetadataHandler::put_prepare
+
 
 int RGWBucketInstanceMetadataHandler::put_post(
     const DoutPrefixProvider* dpp, optional_yield y,

@@ -3765,7 +3765,7 @@ int BlueStore::_init_alloc()
           << ", free 0x" << alloc->get_free()
           << ", fragmentation " << alloc->get_fragmentation()
           << std::dec << dendl;
-
+  dtr_init_alloc_done();
   return 0;
 }
 
@@ -4203,13 +4203,20 @@ int BlueStore::_is_bluefs(bool create, bool* ret)
 * opens both DB and dependant super_meta, FreelistManager and allocator
 * in the proper order
 */
-int BlueStore::_open_db_and_around(bool read_only, bool to_repair,
-                                   alloc_recovery_policy_t policy)
+int BlueStore::_open_db_and_around(
+  bool read_only,
+  bool to_repair,
+  alloc_recovery_policy_t policy,
+  bool replay_deferred)
 {
+  dout(5) << __func__ << "read_only=" << read_only
+          << ", to_repair=" << to_repair
+          << ", deferred=" << (replay_deferred?"apply,remove":"no action")
+          << dendl;
+  ceph_assert(read_only == false || replay_deferred == false);
+  std::vector<std::string> keys_to_remove;
   alloc_recovery_policy = policy;
   alloc_recovery_skipped_onodes = 0;
-
-  dout(5) << __func__ << "::NCB::read_only=" << read_only << ", to_repair=" << to_repair << dendl;
   {
     string type;
     int r = read_meta("type", &type);
@@ -4269,6 +4276,11 @@ int BlueStore::_open_db_and_around(bool read_only, bool to_repair,
   if (bdev_label_multi) {
     _main_bdev_label_try_reserve();
   }
+  // This is the place where we can apply deferred writes
+  // without risk of some interaction with RocksDB allocating.
+  if (replay_deferred) {
+    _deferred_replay(&keys_to_remove);
+  }
 
   // Re-open in the proper mode(s).
 
@@ -4284,6 +4296,14 @@ int BlueStore::_open_db_and_around(bool read_only, bool to_repair,
 
   if (!read_only) {
     _post_init_alloc();
+  }
+
+  if (replay_deferred && !keys_to_remove.empty()) {
+    KeyValueDB::Transaction deferred_keys_remove_txn = db->get_transaction();
+    for (auto& s : keys_to_remove) {
+      deferred_keys_remove_txn->rm_single_key(PREFIX_DEFERRED, s);
+    }
+    db->submit_transaction_sync(deferred_keys_remove_txn);
   }
 
   // when function is called in repair mode (to_repair=true) we skip db->open()/create()
@@ -4576,6 +4596,16 @@ int BlueStore::_open_db(bool create, bool to_repair_db, bool read_only)
   }
   dout(1) << __func__ << " opened " << kv_backend
 	  << " path " << kv_dir_fn << " options " << options << dendl;
+  KeyValueDB::Iterator it = db->get_iterator(PREFIX_DEFERRED);
+  if (it) {
+    it->seek_to_first();
+    dout(10) << __func__ << " Listing L start" << dendl;
+    while (it->valid()) {
+      dout(10) << __func__ << " " << pretty_binary_string(it->key()) << dendl;
+      it->next();
+    }
+    dout(10) << __func__ << " Listing L end" << dendl;
+  }
   return 0;
 }
 
@@ -5754,14 +5784,7 @@ int BlueStore::mount_readonly()
     }
   });
 
-  _kv_start();
-  auto stop_kv = make_scope_guard([&] {
-    if (!mounted) {
-      _kv_stop();
-    }
-  });
-
-  r = _deferred_replay();
+  r = _deferred_replay(nullptr);
   if (r < 0) {
     return r;
   }
@@ -5815,6 +5838,8 @@ int BlueStore::_mount_readonly()
   if (r < 0) {
     goto out_db;
   }
+  // replay pending deferred, but do not prepare keys for removal
+  _deferred_replay(nullptr);
   return 0;
 
 out_db:
@@ -5837,8 +5862,6 @@ int BlueStore::umount_readonly()
 
   if (!_kv_only) {
     mempool_thread.shutdown();
-    dout(20) << __func__ << " stopping kv thread" << dendl;
-    _kv_stop();
     // skip cache cleanup step on fast shutdown
     if (likely(!m_fast_shutdown)) {
       _shutdown_cache();
@@ -5904,8 +5927,7 @@ int BlueStore::_mount()
     return -EINVAL;
   }
 
-  dout(5) << __func__ << "::NCB::calling open_db_and_around(read/write)" << dendl;
-  int r = _open_db_and_around(false);
+  int r = _open_db_and_around(false, false, alloc_recovery_policy_t::strict, true);
   if (r < 0) {
     return r;
   }
@@ -5942,11 +5964,6 @@ int BlueStore::_mount()
       _kv_stop();
     }
   });
-
-  r = _deferred_replay();
-  if (r < 0) {
-    return r;
-  }
 
   mempool_thread.init();
 
@@ -6313,10 +6330,10 @@ void BlueStore::_fsck_repair_shared_blobs(
     if(it == refs_map.end()) {
       return true;
     }
+    // every valid pextent holds a reference
     for (auto& p : b.get_extents()) {
       if (p.is_valid()) {
 	it->second.get(p.offset, p.length);
-	break;
       }
     }
     return true;
@@ -7335,10 +7352,11 @@ int BlueStore::_fsck(BlueStore::FSCKDepth depth, bool repair, bluestore_stats_t 
 
   // in deep mode we need R/W write access to be able to replay deferred ops
   const bool read_only = !(repair || depth == FSCK_DEEP);
-  int r = _open_db_and_around(read_only, false,
+  int r = _open_db_and_around(
+    read_only, false,
     read_only ? alloc_recovery_policy_t::tolerate_corrupt_onodes
-              : alloc_recovery_policy_t::strict);
-
+              : alloc_recovery_policy_t::strict,
+    !read_only);
   if (r < 0) {
     return r;
   }
@@ -7364,17 +7382,6 @@ int BlueStore::_fsck(BlueStore::FSCKDepth depth, bool repair, bluestore_stats_t 
     mempool_thread.shutdown();
     _shutdown_cache();
   });
-  // we need finisher and kv_{sync,finalize}_thread *just* for replay
-  // enable in repair or deep mode modes only
-  if (!read_only) {
-    _kv_start();
-    r = _deferred_replay();
-    _kv_stop();
-  }
-
-  if (r < 0) {
-    return r;
-  }
   return _fsck_on_open(depth, repair, store_stats);
 }
 
@@ -8561,6 +8568,37 @@ void BlueStore::inject_bluefs_file(std::string_view dir, std::string_view name, 
 
   bluefs->fsync(p_handle);
   bluefs->close_writer(p_handle);
+}
+
+// Applies selected reshard scheme.
+// The function modifies onode and writes it directly to db
+// without sequencer; requires prior operations to onodes be
+// fully committed to db.
+void BlueStore::debug_force_reshard(
+  coll_t cid, ghobject_t oid,
+  const std::vector<bluestore_onode_t::shard_info>& new_shard_info,
+  unsigned shard_index_begin,
+  unsigned shard_index_end,
+  uint32_t spanning_scan_begin,
+  uint32_t spanning_scan_end)
+{
+  bluestore::ExtentMap::ReshardPlan rp(
+    new_shard_info, shard_index_begin, shard_index_end, spanning_scan_begin, spanning_scan_end);
+  OnodeRef o;
+  CollectionRef c = _get_collection(cid);
+  ceph_assert(c);
+  {
+    std::unique_lock l{ c->lock }; // just to avoid internal asserts
+    o = c->get_onode(oid, false);
+    ceph_assert(o);
+    o->extent_map.fault_range(db, 0, OBJECT_MAX_SIZE);
+  }
+  KeyValueDB::Transaction txn;
+  txn = db->get_transaction();
+  o->extent_map.request_reshard(0, OBJECT_MAX_SIZE);
+  o->extent_map.reshard_action(rp, db, txn);
+  _record_onode(o, txn);
+  db->submit_transaction_sync(txn);
 }
 
 int BlueStore::compact()
@@ -11750,6 +11788,7 @@ void BlueStore::_kv_sync_thread()
   deque<DeferredBatch*> deferred_stable_queue; ///< deferred ios done + stable
   std::unique_lock l{kv_lock};
   ceph_assert(!kv_sync_started);
+  ceph_assert(!db_was_opened_read_only);
   kv_sync_started = true;
   kv_cond.notify_all();
 
@@ -11916,7 +11955,7 @@ void BlueStore::_kv_sync_thread()
       auto sync_start = mono_clock::now();
 #endif
       // submit synct synchronously (block and wait for it to commit)
-      int r = db_was_opened_read_only || cct->_conf->bluestore_debug_omit_kv_commit ?
+      int r = cct->_conf->bluestore_debug_omit_kv_commit ?
 	0 : db->submit_transaction_sync(synct);
       ceph_assert(r == 0);
 
@@ -12301,7 +12340,7 @@ void BlueStore::_deferred_aio_finish(OpSequencer *osr)
   }
 }
 
-int BlueStore::_deferred_replay()
+int BlueStore::_deferred_replay(std::vector<std::string>* keys_to_remove)
 {
   dout(10) << __func__ << " start" << dendl;
   int count = 0;
@@ -12315,48 +12354,54 @@ int BlueStore::_deferred_replay()
       }
     );
   }
-  CollectionRef ch = _get_collection(coll_t::meta());
-  bool fake_ch = false;
-  if (!ch) {
-    // hmm, replaying initial mkfs?
-    ch = static_cast<Collection*>(create_new_collection(coll_t::meta()).get());
-    fake_ch = true;
-  }
-  OpSequencer *osr = static_cast<OpSequencer*>(ch->osr.get());
+  dtr_deferred_replay_start();
+  IOContext ioctx(cct, nullptr);
   KeyValueDB::Iterator it = db->get_iterator(PREFIX_DEFERRED);
-  for (it->lower_bound(string()); it->valid(); it->next(), ++count) {
+  for (it->lower_bound(string()); it->valid(); /*iterator update outside*/) {
     dout(20) << __func__ << " replay " << pretty_binary_string(it->key())
 	     << dendl;
-    bluestore_deferred_transaction_t *deferred_txn =
-      new bluestore_deferred_transaction_t;
+    if (keys_to_remove) {
+      keys_to_remove->push_back(it->key());
+    }
+    bluestore_deferred_transaction_t deferred_txn;
     bufferlist bl = it->value();
     auto p = bl.cbegin();
     try {
-      decode(*deferred_txn, p);
+      decode(deferred_txn, p);
+
+      bool has_some = _eliminate_outdated_deferred(&deferred_txn, bluefs_extents);
+      if (has_some) {
+        dtr_deferred_replay_track(deferred_txn);
+        for (auto& op: deferred_txn.ops) {
+          dout(10) << __func__ << std::hex << " 0x" << op.data.length()
+            << std::dec << " writing to " << op.extents << dendl;
+          for (auto& e : op.extents) {
+            bufferlist t;
+            op.data.splice(0, e.length, &t);
+            bdev->aio_write(e.offset, t, &ioctx, false);
+          }
+        }
+      } else {
+        dout(10) << __func__ << deferred_txn.seq << " fully eliminated" << dendl;
+      }
     } catch (ceph::buffer::error& e) {
       derr << __func__ << " failed to decode deferred txn "
 	   << pretty_binary_string(it->key()) << dendl;
-      delete deferred_txn;
       r = -EIO;
-      goto out;
     }
-    bool has_some = _eliminate_outdated_deferred(deferred_txn, bluefs_extents);
-    if (has_some) {
-      TransContext *txc = _txc_create(ch.get(), osr,  nullptr);
-      txc->deferred_txn = deferred_txn;
-      txc->set_state(TransContext::STATE_KV_DONE);
-      _txc_state_proc(txc);
-    } else {
-      delete deferred_txn;
+    // update loop iteration here, so we can inject action
+    ++count;
+    it->next();
+    if (ioctx.num_pending.load() >= 1 || !it->valid()) {
+      // must submit after each deferred, see https://tracker.ceph.com/issues/70581
+      dout(20) << __func__ << " submitting IO batch" << dendl;
+      bdev->aio_submit(&ioctx);
+      ioctx.aio_wait();
+      dout(20) << __func__ << " wait done" << dendl;
+      ioctx.release_running_aios();
     }
   }
- out:
-  dout(20) << __func__ << " draining osr" << dendl;
-  _osr_register_zombie(osr);
-  _osr_drain_all();
-  if (fake_ch) {
-    new_coll_map.clear();
-  }
+  dtr_deferred_replay_end();
   dout(10) << __func__ << " completed " << count << " events" << dendl;
   return r;
 }
@@ -12384,7 +12429,7 @@ bool BlueStore::_eliminate_outdated_deferred(bluestore_deferred_transaction_t* d
     PExtentVector new_extents;
     ceph::buffer::list new_data;
     uint32_t data_offset = 0; // this tracks location of extent 'e' inside it->data
-    dout(30) << __func__ << " input extents: " << it->extents << dendl;
+    dout(10) << __func__ << " input extents: " << it->extents << dendl;
     for (auto& e: it->extents) {
       interval_set<uint64_t> region;
       region.insert(e.offset, e.length);
@@ -12415,7 +12460,7 @@ bool BlueStore::_eliminate_outdated_deferred(bluestore_deferred_transaction_t* d
       }
       data_offset += e.length;
     }
-    dout(30) << __func__ << " output extents: " << new_extents << dendl;
+    dout(10) << __func__ << " output extents: " << new_extents << dendl;
     if (it->data.length() != new_data.length()) {
       dout(10) << __func__ << " trimmed deferred extents: " << it->extents << "->" << new_extents << dendl;
     }
@@ -14254,7 +14299,7 @@ int BlueStore::_do_gc(
     }
   }
   if (dirty_range_updated) {
-    o->extent_map.fault_range(db, *dirty_start, *dirty_end);
+    o->extent_map.fault_range(db, *dirty_start, *dirty_end - *dirty_start);
   }
 
   dout(30) << __func__ << " alloc write" << dendl;
@@ -14424,11 +14469,9 @@ int BlueStore::_do_write_v2(
     }
   } else {
     // normal uncompressed path
-    BlueStore::Writer wr(this, txc, &wctx, o);
     uint64_t start = p2align(offset, min_alloc_size);
     uint64_t end = p2roundup(offset + length, min_alloc_size);
-    wr.left_affected_range = start;
-    wr.right_affected_range = end;
+    BlueStore::Writer wr(this, txc, &wctx, o, start, end);
     std::tie(wr.left_shard_bound, wr.right_shard_bound) =
       o->extent_map.fault_range_ex(db, start, end - start);
     wr.do_write(offset, bl);
@@ -14460,6 +14503,8 @@ int BlueStore::_do_write_v2_compressed(
     *_dout << i.offset << "~" << i.length << " ";
   }
   *_dout << std::dec << dendl;
+  uint32_t changes_start = regions.front().offset;
+  uint32_t changes_end = regions.back().offset + regions.back().length;
   for (const auto& i : regions) {
     ceph::buffer::list data_bl;
     if (i.offset <= offset && offset < i.offset + i.length) {
@@ -14493,10 +14538,10 @@ int BlueStore::_do_write_v2_compressed(
     } else {
       wr.do_write(i.offset, data_bl);
     }
+    changes_start = std::min(changes_start, wr.left_affected_range);
+    changes_end = std::max(changes_end, wr.right_affected_range);
   }
   estimator->finish();
-  uint32_t changes_start = regions.front().offset;
-  uint32_t changes_end = regions.back().offset + regions.back().length;
   o->extent_map.compress_extent_map(changes_start, changes_end - changes_start);
   o->extent_map.dirty_range(changes_start, changes_end - changes_start);
   o->extent_map.maybe_reshard(changes_start, changes_end);
@@ -15760,6 +15805,21 @@ void BlueStore::log_latency_fn_scrub(
 }
 
 #if defined(WITH_LTTNG)
+static bool txc_tracepoints_enabled()
+{
+#if defined(WITH_EVENTTRACE)
+  return true;
+#else
+  return tracepoint_enabled(bluestore, transaction_initial_state) ||
+    tracepoint_enabled(bluestore, transaction_initial_state_rocksdb) ||
+    tracepoint_enabled(bluestore, transaction_state_duration) ||
+    tracepoint_enabled(bluestore, transaction_kv_submit_latency) ||
+    tracepoint_enabled(bluestore, transaction_kv_sync_latency) ||
+    tracepoint_enabled(bluestore, transaction_commit_latency) ||
+    tracepoint_enabled(bluestore, transaction_total_duration);
+#endif
+}
+
 void BlueStore::BlueStoreThrottle::emit_initial_tracepoint(
   KeyValueDB &db,
   TransContext &txc,
@@ -15770,44 +15830,14 @@ void BlueStore::BlueStoreThrottle::emit_initial_tracepoint(
     pending_deferred_ios += txc.ios;
   }
 
+  if (!txc_tracepoints_enabled()) {
+    return;
+  }
+
   uint64_t started = 0;
   uint64_t completed = 0;
   if (should_trace(&started, &completed)) {
     txc.tracing = true;
-    uint64_t rocksdb_base_level,
-      rocksdb_estimate_pending_compaction_bytes,
-      rocksdb_cur_size_all_mem_tables,
-      rocksdb_compaction_pending,
-      rocksdb_mem_table_flush_pending,
-      rocksdb_num_running_compactions,
-      rocksdb_num_running_flushes,
-      rocksdb_actual_delayed_write_rate;
-    db.get_property(
-      "rocksdb.base-level",
-      &rocksdb_base_level);
-    db.get_property(
-      "rocksdb.estimate-pending-compaction-bytes",
-      &rocksdb_estimate_pending_compaction_bytes);
-    db.get_property(
-      "rocksdb.cur-size-all-mem-tables",
-      &rocksdb_cur_size_all_mem_tables);
-    db.get_property(
-      "rocksdb.compaction-pending",
-      &rocksdb_compaction_pending);
-    db.get_property(
-      "rocksdb.mem-table-flush-pending",
-      &rocksdb_mem_table_flush_pending);
-    db.get_property(
-      "rocksdb.num-running-compactions",
-      &rocksdb_num_running_compactions);
-    db.get_property(
-      "rocksdb.num-running-flushes",
-      &rocksdb_num_running_flushes);
-    db.get_property(
-      "rocksdb.actual-delayed-write-rate",
-      &rocksdb_actual_delayed_write_rate);
-
-  
     tracepoint(
       bluestore,
       transaction_initial_state,
@@ -15821,19 +15851,53 @@ void BlueStore::BlueStoreThrottle::emit_initial_tracepoint(
       completed,
       ceph::to_seconds<double>(mono_clock::now() - start_throttle_acquire));
 
-    tracepoint(
-      bluestore,
-      transaction_initial_state_rocksdb,
-      txc.osr->get_sequencer_id(),
-      (uint64_t)&txc,
-      rocksdb_base_level,
-      rocksdb_estimate_pending_compaction_bytes,
-      rocksdb_cur_size_all_mem_tables,
-      rocksdb_compaction_pending,
-      rocksdb_mem_table_flush_pending,
-      rocksdb_num_running_compactions,
-      rocksdb_num_running_flushes,
-      rocksdb_actual_delayed_write_rate);
+    if (tracepoint_enabled(bluestore, transaction_initial_state_rocksdb)) {
+      uint64_t rocksdb_base_level = 0,
+        rocksdb_estimate_pending_compaction_bytes = 0,
+        rocksdb_cur_size_all_mem_tables = 0,
+        rocksdb_compaction_pending = 0,
+        rocksdb_mem_table_flush_pending = 0,
+        rocksdb_num_running_compactions = 0,
+        rocksdb_num_running_flushes = 0,
+        rocksdb_actual_delayed_write_rate = 0;
+      db.get_property(
+        "rocksdb.base-level",
+        &rocksdb_base_level);
+      db.get_property(
+        "rocksdb.estimate-pending-compaction-bytes",
+        &rocksdb_estimate_pending_compaction_bytes);
+      db.get_property(
+        "rocksdb.cur-size-all-mem-tables",
+        &rocksdb_cur_size_all_mem_tables);
+      db.get_property(
+        "rocksdb.compaction-pending",
+        &rocksdb_compaction_pending);
+      db.get_property(
+        "rocksdb.mem-table-flush-pending",
+        &rocksdb_mem_table_flush_pending);
+      db.get_property(
+        "rocksdb.num-running-compactions",
+        &rocksdb_num_running_compactions);
+      db.get_property(
+        "rocksdb.num-running-flushes",
+        &rocksdb_num_running_flushes);
+      db.get_property(
+        "rocksdb.actual-delayed-write-rate",
+        &rocksdb_actual_delayed_write_rate);
+      do_tracepoint(
+        bluestore,
+        transaction_initial_state_rocksdb,
+        txc.osr->get_sequencer_id(),
+        (uint64_t)&txc,
+        rocksdb_base_level,
+        rocksdb_estimate_pending_compaction_bytes,
+        rocksdb_cur_size_all_mem_tables,
+        rocksdb_compaction_pending,
+        rocksdb_mem_table_flush_pending,
+        rocksdb_num_running_compactions,
+        rocksdb_num_running_flushes,
+        rocksdb_actual_delayed_write_rate);
+    }
   }
 }
 #endif
@@ -15905,7 +15969,9 @@ void BlueStore::BlueStoreThrottle::finish_start_transaction(
 void BlueStore::BlueStoreThrottle::complete_kv(TransContext &txc)
 {
   pending_kv_ios -= 1;
-  ios_completed_since_last_traced++;
+  if (txc_tracepoints_enabled()) {
+    ios_completed_since_last_traced++;
+  }
   if (txc.tracing) {
     tracepoint(
       bluestore,

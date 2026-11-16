@@ -6,6 +6,9 @@
   ``next_scheduled_time``. Scripts or tools that parse this output
   must be updated accordingly.
 
+* libcephsqlite: concurrent readers is now supported. The VFS implements the
+  full sqlite3 locking protocol.
+
 * RBD: The ``rbd mirror snapshot schedule add`` and
   ``rbd trash purge schedule add`` commands now accept a ``w`` suffix to
   specify the schedule interval in weeks (e.g. ``2w``), in addition to the
@@ -39,6 +42,41 @@
   be removed in the X release. People wanting to continue using
   Elasticsearch can populate it with bucket notifications. The
   upcoming S3 Inventory feature also covers some of the use case.
+
+* RADOS: Erasure-coded (FastEC) and replicated pools can be stretched over two
+  zones, one pool at a time, with ``ceph osd pool create --num_zones 2`` or
+  ``ceph osd pool set <pool> num_zones 2``. See "Upgrading from Earlier
+  Releases" in :ref:`stretch_mode`.
+
+  - When ``require_osd_release`` is raised to this release, each pool of a
+    cluster stretched with ``ceph mon enable_stretch_mode`` gets two zones and
+    a ``min_size`` counted in each zone (2 becomes 1, 3 becomes 2).
+  - From then on, ``osd_pool_default_size`` counts the copies in each zone of
+    a stretched pool, replacing ``mon_stretch_pool_size``. Only the value in
+    the ``global`` section of the configuration database is converted. A value
+    set in a Monitor's ``ceph.conf`` or in a ``mon`` section is not, and gives
+    new pools that many copies in each zone. The new
+    ``POOL_DEFAULT_CONFIG_OVERRIDE`` health warning reports such a value:
+    remove it.
+
+* RADOS: ``ceph osd pool create`` takes named parameters, such as
+  ``--pool_type``, ``--replica``, ``--k`` and ``--m``, and still accepts the
+  positional ones. A parameter that is not given comes from a pool creation
+  default, which ``ceph osd pool default set`` and ``ceph osd pool default
+  get`` manage. See :ref:`pool-creation-defaults`.
+
+* RADOS: An erasure code profile or CRUSH rule, other than the defaults, is
+  now deleted with the last pool that uses it. Scripts that reuse one after
+  deleting its pools must create it again.
+
+* RADOS: Changing an erasure code profile that a pool uses now needs
+  ``--yes-i-really-mean-it``: ``--force`` is no longer enough.
+
+* RADOS: When ``require_osd_release`` is raised to this release, each
+  erasure-coded pool that uses the ``default`` erasure code profile gets a
+  profile of its own, such as ``mypool-k2-m2``, as does each new pool created
+  without a named profile.
+
 * RGW: The default value of ``rgw_rest_conn_connect_to_resolved_ips`` changed
   from ``false`` to ``true``.
 
@@ -70,6 +108,12 @@
   evaluation rules. They had previously only consulted the role's trust policy.
   This means that account users will now require an Allow from identity policy
   to assume roles in other accounts.
+* RGW: Lifecycle transition to a cloud-s3 storage class now skips current
+  object versions that have an unexpired object lock retention period or a
+  legal hold, as it already did for non-current versions. Previously such a
+  version could be replaced by a delete marker or, with ``retain_head_object``
+  and ``retain_current_version`` enabled, by a cloud-tiered stub, leaving its
+  data only on the cloud endpoint.
 
 * ``src/script/ceph-backport.sh`` now runs on macOS in addition to Linux: it
   re-execs under GNU bash >= 4 when the system bash is too old, and honors a
@@ -1428,3 +1472,13 @@ Relevant tracker: https://tracker.ceph.com/issues/71677
   OSDs deployed prior to the Pacific release with a 64 KiB allocation unit.
   It can be disabled with the new ``bluestore_warn_on_legacy_min_alloc_size``
   option, globally or per OSD / device class using a configuration mask.
+
+* RGW: The output format of "radosgw-admin topic dump" has changed. The command
+  used to print a bare JSON array of the pending notifications. It now prints an
+  object holding that array under "eventEntries", together with "truncated" and
+  "marker". The command also honours "--max-entries" from the caller's point of
+  view: at most that many notifications are returned, and "--marker" resumes the
+  dump from where the previous one stopped. Scripts that parse the output of this
+  command have to be adjusted.
+
+  Relevant tracker: https://tracker.ceph.com/issues/78695

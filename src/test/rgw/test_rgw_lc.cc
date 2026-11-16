@@ -12,6 +12,7 @@
 #include <vector>
 #include <chrono>
 #include <stdexcept>
+#include <fmt/chrono.h>
 
 static const char* xmldoc_1 =
 R"(<Filter>
@@ -495,5 +496,36 @@ TEST(ExpHdr, S3ExpirationHeaderCurrentVersionOnly)
 
     EXPECT_TRUE(rgw::lc::s3_expiration_header(
                   &dpp, versioned_key, notags, mtime, attrs).empty());
+  }
+}
+
+TEST(LCListResumeMarker, EntryKinds)
+{
+  using Entry = rgw_bucket_dir_entry;
+
+  const struct {
+    const char* instance;
+    uint16_t flags;
+    bool list_versions;
+    const char* marker_instance;
+  } cases[] = {
+    // null version, null delete marker and noncurrent null version
+    {"", Entry::FLAG_VER | Entry::FLAG_CURRENT, true, "null"},
+    {"", Entry::FLAG_VER | Entry::FLAG_CURRENT | Entry::FLAG_DELETE_MARKER, true, "null"},
+    {"", Entry::FLAG_VER, true, "null"},
+    // unchanged: a version, a plain entry, an unversioned listing
+    {"v1", Entry::FLAG_VER, true, "v1"},
+    {"", 0, true, ""},
+    {"", Entry::FLAG_VER, false, ""},
+  };
+
+  for (const auto& c : cases) {
+    Entry entry;
+    entry.key = cls_rgw_obj_key("obj", c.instance);
+    entry.flags = c.flags;
+    EXPECT_EQ(rgw_obj_key("obj", c.marker_instance),
+              rgw::lc::list_resume_marker(entry, c.list_versions))
+        << "instance='" << c.instance << "' flags=" << c.flags
+        << " list_versions=" << c.list_versions;
   }
 }

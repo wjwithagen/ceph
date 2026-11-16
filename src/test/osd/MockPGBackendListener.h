@@ -530,17 +530,13 @@ public:
     return false;
   }
 
-#if POOL_MIGRATION
-  void update_migration_watermark(const hobject_t &watermark) override {
-  }
-#endif
+void update_migration_watermark(const hobject_t &watermark) override {
+}
 
-#if POOL_MIGRATION
-  std::optional<hobject_t> consider_updating_migration_watermark(
-    std::set<hobject_t> &deleted) override {
-    return std::nullopt;
-  }
-#endif
+std::optional<hobject_t> consider_updating_migration_watermark(
+  std::set<hobject_t> &deleted) override {
+  return std::nullopt;
+}
 
   void log_operation(
     std::vector<pg_log_entry_t>&& logv,
@@ -717,6 +713,10 @@ public:
 
   PerfCounters *get_logger() override {
     return perf_logger;
+  }
+
+  PerfCounters &get_perf_logger() override {
+    return *perf_logger;
   }
 
   ceph_tid_t get_tid() override;

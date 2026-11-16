@@ -892,6 +892,86 @@ touch pin/placeholder
 
         self.await_data_pool_empty()
 
+    def test_stale_snap_remote_dentry_purging_stray(self):
+        """
+        That a stale remote snap dentry is not loaded and linked to a stray
+        inode that is being purged.
+
+        Unlinking a multiversion inode (here: a directory) that is covered by
+        a snapshot leaves a remote snap dentry (<name>_<snapid>) in the parent
+        dirfrag pointing at the stray. Once the snapshot is removed, that
+        dentry is stale. A partial (keyed) dirfrag fetch used to advance
+        fnode.snap_purged_thru without examining the snap keys, so a later
+        complete fetch skipped the stale check, loaded the stale remote dentry
+        and linked it to the purging stray -- tripping the get_num_ref() == 0
+        assert in MDCache::remove_inode().
+
+        See: https://tracker.ceph.com/issues/80206
+        """
+        self.fs.set_allow_new_snaps(True)
+        # Named lookups do keyed (partial) dirfrag fetches only, so that
+        # nothing but the scrub below fetches p/d's dirfrag completely.
+        self.config_set('mds', 'mds_dir_prefetch', False)
+
+        self.mount_a.run_shell(["mkdir", "-p", "p/d"])
+        d_ino = self.mount_a.path_to_ino("p/d")
+
+        # Hold the directory open to keep its stray from being purged until
+        # the test lets go of it.
+        p = self.mount_a.open_dir_background("p/d/sub")
+        self.mount_a.run_shell(["mkdir", "p/.snap/s1"])
+        self.mount_a.run_shell(["rmdir", "p/d/sub"])
+
+        # Commit p/d's dirfrag (with the remote snap dentry) and the stray's
+        # backtrace.
+        self.fs.rank_tell(["flush", "journal"])
+        snap_keys = [k for k in self.fs.list_dirfrag(d_ino)
+                     if k.startswith("sub_") and k != "sub_head"]
+        log.info(f"remote snap dentry keys: {snap_keys}")
+        self.assertEqual(len(snap_keys), 1)
+
+        # Fresh MDS: the stray is reloaded (pinned by the client's caps), the
+        # remote snap dentry is not in cache.
+        self.fs.rank_fail()
+        self.fs.wait_for_daemons()
+        gid = self.fs.get_rank()['gid']
+
+        # Make the remote snap dentry stale.
+        self.mount_a.run_shell(["rmdir", "p/.snap/s1"])
+        self.fs.rank_tell(["flush", "journal"])
+        self.assertEqual(self.get_mdc_stat("strays_enqueued"), 0)
+
+        # Keep the stray in its purge window: _purge_stray_purged() runs once
+        # the purge queue persists the item, but the purge_stray EUpdate is
+        # held back by the paused MDLog.
+        self.fs.rank_asok(["config", "set", "mds_log_pause", "true"])
+        try:
+            self.mount_a.kill_background(p)
+            self._wait_for_counter("mds_cache", "strays_enqueued", 1)
+
+            # Keyed fetch of p/d's dirfrag: the lookup of a name that never
+            # existed fails with ENOENT...
+            try:
+                self.fs.run_scrub(["start", "/p/d/missing"])
+            except CommandFailedError:
+                pass
+            # ... followed by a complete fetch.
+            self.fs.run_scrub(["start", "/p/d"])
+            self.assertTrue(self.fs.wait_until_scrub_complete(sleep=5, timeout=60))
+        finally:
+            self.fs.rank_asok(["config", "set", "mds_log_pause", "false"])
+
+        self.wait_until_equal(
+            lambda: self.get_mdc_stat("num_strays"),
+            expect_val=0, timeout=60
+        )
+        self.assertEqual(self.fs.get_rank()['gid'], gid)
+
+        # The stale remote snap dentry must have been purged from disk.
+        self.fs.rank_tell(["flush", "journal"])
+        self.assertEqual(
+            [k for k in self.fs.list_dirfrag(d_ino) if k in snap_keys], [])
+
     def test_fancy_layout(self):
         """
         purge stray file with fancy layout
@@ -1242,3 +1322,92 @@ touch pin/placeholder
         # Cleanup
         self.mount_a.run_shell(["rm", "-rf", "kill_unlink_hl_test"])
         self.mount_a.run_shell(["rm", "-rf", "kill_unlink_hl_recovery"])
+
+
+class TestStrayRenameRace(CephFSTestCase):
+    CLIENTS_REQUIRED = 4
+    MDSS_REQUIRED = 3
+
+    def test_rename_onto_shared_names_with_fragmentation(self):
+        """
+        That an MDS survives many clients renaming files onto the same
+        few names in one directory while that directory keeps being
+        split and merged.
+
+        A rename that replaces an existing file prepares a stray dentry
+        for the victim and caches it in the request.  When the request
+        then has to drop all its locks and wait (e.g. to auth pin a
+        source inode whose dirfrag is being fragmented), concurrent
+        renames may replace the victim, and the retried request used to
+        trip over the stray dentry cached for the old victim.
+
+        See: https://tracker.ceph.com/issues/79321
+        """
+
+        duration = 300
+        names = 8
+        writers = 16  # per client
+        readers = 2   # per client
+
+        self.fs.set_max_mds(2)
+        self.fs.wait_for_daemons()
+
+        self.config_set('mds', 'mds_bal_split_size', '10')
+        self.config_set('mds', 'mds_bal_merge_size', '2')
+        self.config_set('mds', 'mds_bal_fragment_interval', '1')
+        # debug_mds 20 slows the MDS down too much to hit the race.
+        self.config_set('mds', 'debug_mds', '10')
+
+        self.mount_a.run_shell(["mkdir", "shared"])
+        self.mount_a.run_shell_payload(
+            f"for k in $(seq 0 {names - 1}); do echo 0 > shared/f$k; done")
+
+        def rank_gids():
+            return {r['rank']: r['gid'] for r in self.fs.get_ranks()}
+
+        gids = rank_gids()
+
+        writer = dedent(f"""
+            end=$((SECONDS + {duration}))
+            n=0
+            while [ $SECONDS -lt $end ]; do
+                k=$((RANDOM % {names}))
+                t=shared/f$k.tmp.$$.$n
+                echo $n > $t && mv -f $t shared/f$k || exit 1
+                n=$((n + 1))
+            done
+        """)
+        reader = dedent(f"""
+            end=$((SECONDS + {duration}))
+            while [ $SECONDS -lt $end ]; do
+                cat shared/f$((RANDOM % {names})) > /dev/null || exit 1
+            done
+        """)
+
+        procs = []
+        for m in self.mounts:
+            for _ in range(writers):
+                procs.append(m.run_shell_payload(writer, wait=False,
+                                                 timeout=duration + 300))
+            for _ in range(readers):
+                procs.append(m.run_shell_payload(reader, wait=False,
+                                                 timeout=duration + 300))
+
+        # Fail early if an MDS aborts and a standby takes over.
+        end = time.time() + duration
+        while time.time() < end:
+            self.assertEqual(rank_gids(), gids)
+            time.sleep(5)
+
+        for p in procs:
+            p.stdin.close()
+            p.wait()
+
+        self.assertEqual(rank_gids(), gids)
+
+        splits = sum(self.fs.rank_asok(['perf', 'dump', 'mds'], rank=r)
+                     ['mds']['dir_split'] for r in gids)
+        log.info(f"directory splits during the run: {splits}")
+        self.assertGreater(splits, 0)
+
+        self.mount_a.run_shell(["rm", "-rf", "shared"])

@@ -1237,8 +1237,16 @@ class MgrModule(ceph_module.BaseMgrModule, MgrModuleLoggingMixin):
             if osd["up"] and osd["in"]:
                 ready += 1
 
-        need = cast(int, self.get_ceph_option("osd_pool_default_size"))
-        return ready >= need
+        return ready >= self.default_pool_size()
+
+    def default_pool_size(self) -> int:
+        """
+        The size of a new replicated pool: osd_pool_default_num_zones times
+        osd_pool_default_size, which counts the copies in each zone.
+        """
+        replica = cast(int, self.get_ceph_option("osd_pool_default_size"))
+        num_zones = cast(int, self.get_ceph_option("osd_pool_default_num_zones"))
+        return num_zones * replica
 
     @API.perm('w')
     @API.expose
@@ -1410,7 +1418,11 @@ class MgrModule(ceph_module.BaseMgrModule, MgrModuleLoggingMixin):
             self.create_mgr_pool()
         uri = f"file:///{self.MGR_POOL_NAME}:{self.module_name}/main.db?vfs=ceph"
         self.log.debug(f"using uri {uri}")
-        db = sqlite3.connect(uri, check_same_thread=False, uri=True, isolation_level=None)  # type: ignore[call-arg]
+        busy_timeout = 60.0
+        lock_renewal_timeout = self.get_ceph_option('cephsqlite_lock_renewal_timeout')
+        if lock_renewal_timeout is not None:
+            busy_timeout = max(10.0, 2 * (float(lock_renewal_timeout) / 1000.0))
+        db = sqlite3.connect(uri, check_same_thread=False, uri=True, isolation_level=None, timeout=busy_timeout)  # type: ignore[call-arg]
         # if libcephsqlite reconnects, update the addrv for blocklist
         with db:
             cur = db.execute('SELECT json_extract(ceph_status(), "$.addr");')

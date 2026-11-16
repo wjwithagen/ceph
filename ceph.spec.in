@@ -23,6 +23,7 @@
 %bcond_with make_check
 %bcond_with cmake_verbose_logging
 %bcond_without ceph_test_package
+%bcond_with radosgw_fdb
 %ifarch s390
 %bcond_with tcmalloc
 %else
@@ -235,6 +236,9 @@ BuildRequires:	selinux-policy-devel
 %endif
 BuildRequires:	gperf
 BuildRequires:  cmake > 3.5
+%if %{with radosgw_fdb}
+BuildRequires:  foundationdb-clients >= 7.3
+%endif
 BuildRequires:	pkgconfig(fuse3)
 BuildRequires:	git
 BuildRequires:	pkgconfig(grpc++)
@@ -422,6 +426,12 @@ BuildRequires:	python3-devel
 %endif
 %if 0%{?openruyi}
 BuildRequires:	ninja
+%endif
+%if 0%{with crimson}
+BuildRequires:	meson
+BuildRequires:	python3dist(jinja2)
+BuildRequires:	python3dist(pyelftools)
+BuildRequires:	python3dist(tabulate)
 %endif
 # distro-conditional make check dependencies
 %if 0%{with make_check}
@@ -1792,6 +1802,7 @@ cmake .. \
 %else
     -DWITH_RADOSGW_AMQP_ENDPOINT:BOOL=OFF \
 %endif
+    -DWITH_RADOSGW_FDB:BOOL=%{with radosgw_fdb} \
 %if 0%{with kafka_endpoint}
     -DWITH_RADOSGW_KAFKA_ENDPOINT:BOOL=ON \
 %else
@@ -2614,6 +2625,9 @@ fi
 %doc %{_docdir}/ceph/sample.ceph.conf
 %dir %{_libdir}/ceph
 %{_libdir}/ceph/libceph-common.so.*
+%if 0%{with lancedb}
+%{_libdir}/ceph/librgw_lancedb.so.*
+%endif
 %{_bindir}/rgw-standalone
 %{_bindir}/rgw-standalone-admin
 %dir %{_localstatedir}/lib/ceph/radosgw
@@ -2841,6 +2855,10 @@ fi
 
 %files -n librgw2
 %{_libdir}/librgw.so.*
+%if 0%{with lancedb}
+%dir %{_libdir}/ceph
+%{_libdir}/ceph/librgw_lancedb.so.*
+%endif
 %if %{with lttng}
 %{_libdir}/librgw_op_tp.so.*
 %{_libdir}/librgw_rados_tp.so.*

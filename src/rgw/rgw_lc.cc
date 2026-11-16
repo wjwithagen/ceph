@@ -521,7 +521,7 @@ public:
         return false;
       } else {
 	fetch_barrier();
-        list_params.marker = pre_obj.key;
+        list_params.marker = rgw::lc::list_resume_marker(pre_obj, list_params.list_versions);
         int ret = fetch(dpp, y);
         if (ret < 0) {
           ldpp_dout(dpp, 0) << "ERROR: list_op returned ret=" << ret
@@ -737,7 +737,8 @@ static void send_log_record(const DoutPrefixProvider* dpp,
       logging_type,
       obj, input, op_name, etag, size, dpp, y,
       /*async_completion=*/true,
-      /*log_source_bucket=*/false);
+      /*log_source_bucket=*/false,
+      /*bucket_deleted=*/ false);
   if (ret < 0) {
     ldpp_dout(dpp, 1) << "WARNING: bucket logging failed for lc object: "
                       << obj->get_name() << " op: " << op_name
@@ -1177,7 +1178,7 @@ static bool is_valid_op(const lc_op& op)
 {
       return (op.status &&
               (op.expiration > 0
-               || op.expiration_date != boost::none
+               || op.expiration_date
                || op.noncur_expiration > 0
                || op.dm_expiration
                || !op.transitions.empty()
@@ -1320,7 +1321,7 @@ public:
     bool is_expired;
     auto& op = oc.op;
     if (op.expiration <= 0) {
-      if (op.expiration_date == boost::none) {
+      if (!op.expiration_date) {
         ldpp_dout(dpp, 20) << __func__ << "(): key=" << o.key
 			  << ": no expiration set in rule, skipping"
 			  << dendl;
@@ -1500,6 +1501,7 @@ class LCOpAction_Transition : public LCOpAction {
 protected:
   virtual bool check_current_state(bool is_current) = 0;
   virtual ceph::real_time get_effective_mtime(lc_op_ctx& oc) = 0;
+  virtual int perf_counter() const = 0;
 public:
   LCOpAction_Transition(const transition_action& _transition)
     : transition(_transition) {}
@@ -1518,7 +1520,7 @@ public:
     auto mtime = get_effective_mtime(oc);
     bool is_expired;
     if (transition.days < 0) {
-      if (transition.date == boost::none) {
+      if (!transition.date) {
         ldpp_dout(dpp, 20) << __func__ << "(): key=" << o.key
 			  << ": no transition day/date set in rule, skipping"
 			  << dendl;
@@ -1708,9 +1710,11 @@ public:
 
     if (!r && oc.tier->is_tier_type_s3()) {
       ldpp_dout(oc.dpp, 30) << "Found cloud s3 tier: " << target_placement.storage_class << dendl;
-      if (!oc.o.is_current() &&
-          !pass_object_lock_check(oc.driver, oc.obj.get(), oc.dpp, y)) {
-        /* Skip objects which has object lock enabled. */
+      /* Skip objects which have an active retention or legal hold, current
+       * versions included: with retain_head_object and retain_current_version
+       * the head is rewritten as a cloud-tier stub, which would leave the
+       * locked data only on the cloud endpoint. */
+      if (!pass_object_lock_check(oc.driver, oc.obj.get(), oc.dpp, y)) {
         ldpp_dout(oc.dpp, 10) << "Object(key:" << oc.o.key << ") is locked. Skipping transition to cloud-s3 tier: " << target_placement.storage_class << dendl;
         return 0;
       }
@@ -1757,6 +1761,9 @@ public:
     ldpp_dout(oc.dpp, 2) << "TRANSITIONED:" << oc.bucket
 			 << ":" << o.key << " -> "
 			 << transition.storage_class << dendl;
+    if (perfcounter) {
+      perfcounter->inc(perf_counter(), 1);
+    }
     if (oc.batch_counters) {
       oc.batch_counters->record_transitioned();
     }
@@ -1773,18 +1780,12 @@ protected:
   ceph::real_time get_effective_mtime(lc_op_ctx& oc) override {
     return oc.o.meta.mtime;
   }
+
+  int perf_counter() const override { return l_rgw_lc_transition_current; }
+
 public:
   LCOpAction_CurrentTransition(const transition_action& _transition)
     : LCOpAction_Transition(_transition) {}
-    int process(lc_op_ctx& oc, optional_yield y) override {
-      int r = LCOpAction_Transition::process(oc, y);
-      if (r == 0) {
-        if (perfcounter) {
-          perfcounter->inc(l_rgw_lc_transition_current, 1);
-        }
-      }
-      return r;
-    }
 };
 
 class LCOpAction_NonCurrentTransition : public LCOpAction_Transition {
@@ -1796,20 +1797,14 @@ protected:
   ceph::real_time get_effective_mtime(lc_op_ctx& oc) override {
     return oc.effective_mtime;
   }
+
+  int perf_counter() const override { return l_rgw_lc_transition_noncurrent; }
+
 public:
   LCOpAction_NonCurrentTransition(op_env& env,
 				  const transition_action& _transition)
     : LCOpAction_Transition(_transition)
     {}
-    int process(lc_op_ctx& oc, optional_yield y) override {
-      int r = LCOpAction_Transition::process(oc, y);
-      if (r == 0) {
-        if (perfcounter) {
-          perfcounter->inc(l_rgw_lc_transition_noncurrent, 1);
-        }
-      }
-      return r;
-    }
 };
 
 void LCOpRule::build()
@@ -1819,7 +1814,7 @@ void LCOpRule::build()
   auto& op = env.op;
 
   if (op.expiration > 0 ||
-      op.expiration_date != boost::none) {
+      op.expiration_date) {
     actions.emplace_back(new LCOpAction_CurrentExpiration(env));
   }
 
@@ -3269,6 +3264,18 @@ RGWLC::~RGWLC()
 
 namespace rgw::lc {
 
+rgw_obj_key list_resume_marker(const rgw_bucket_dir_entry& entry,
+                               bool list_versions)
+{
+  rgw_obj_key marker(entry.key);
+
+  if (list_versions && marker.instance.empty() && (entry.flags & rgw_bucket_dir_entry::FLAG_VER)) {
+    marker.instance = "null";
+  }
+
+  return marker;
+}
+
 int fix_lc_shard_entry(const DoutPrefixProvider *dpp,
                        rgw::sal::Driver* driver,
 		       rgw::sal::Lifecycle* sal_lc,
@@ -3317,11 +3324,9 @@ int fix_lc_shard_entry(const DoutPrefixProvider *dpp,
 }
 
 std::string s3_expiration_header(
-  DoutPrefixProvider* dpp,
-  const rgw_obj_key& obj_key,
-  const RGWObjTags& obj_tagset,
-  const ceph::real_time& mtime,
-  const std::map<std::string, buffer::list>& bucket_attrs)
+    DoutPrefixProvider* dpp, const rgw_obj_key& obj_key,
+    const RGWObjTags& obj_tagset, const ceph::real_time& mtime,
+    const std::map<std::string, buffer::list>& bucket_attrs)
 {
   CephContext* cct = dpp->get_cct();
   RGWLifecycleConfiguration config(cct);
@@ -3341,25 +3346,23 @@ std::string s3_expiration_header(
 
   bufferlist::const_iterator iter{&aiter->second};
   try {
-      config.decode(iter);
+    config.decode(iter);
   } catch (const buffer::error& e) {
-      ldpp_dout(dpp, 0) << __func__
-			<<  "() decode life cycle config failed"
-			<< dendl;
-      return hdr;
+    ldpp_dout(dpp, 0) << __func__ << "() decode life cycle config failed"
+                      << dendl;
+    return hdr;
   } /* catch */
 
   /* dump tags at debug level 16 */
   RGWObjTags::tag_map_t obj_tag_map = obj_tagset.get_tags();
   if (cct->_conf->subsys.should_gather(ceph_subsys_rgw, 16)) {
     for (const auto& elt : obj_tag_map) {
-      ldpp_dout(dpp, 16) << __func__
-		     <<  "() key=" << elt.first << " val=" << elt.second
-		     << dendl;
+      ldpp_dout(dpp, 16) << __func__ << "() key=" << elt.first
+                         << " val=" << elt.second << dendl;
     }
   }
 
-  boost::optional<ceph::real_time> expiration_date;
+  std::optional<ceph::real_time> expiration_date;
   boost::optional<std::string> rule_id;
 
   const auto& rule_map = config.get_rule_map();
@@ -3367,15 +3370,14 @@ std::string s3_expiration_header(
     const auto& rule = ri.second;
     auto& id = rule.get_id();
     auto& filter = rule.get_filter();
-    auto& prefix = filter.has_prefix() ? filter.get_prefix(): rule.get_prefix();
+    auto& prefix = filter.has_prefix() ? filter.get_prefix()
+                                       : rule.get_prefix();
     auto& expiration = rule.get_expiration();
 
-    ldpp_dout(dpp, 10) << "rule: " << ri.first
-		       << " prefix: " << prefix
-		       << " expiration: "
-		       << " date: " << expiration.get_date()
-		       << " days: " << expiration.get_days()
-		       << dendl;
+    ldpp_dout(dpp, 10) << "rule: " << ri.first << " prefix: " << prefix
+                       << " expiration: "
+                       << " date: " << expiration.get_date()
+                       << " days: " << expiration.get_days() << dendl;
 
     /* skip if rule !enabled
      * if rule has prefix, skip iff object !match prefix
@@ -3388,11 +3390,11 @@ std::string s3_expiration_header(
      * if the date accum has a value, format it into hdr
      */
 
-    if (! rule.is_enabled())
+    if (!rule.is_enabled())
       continue;
 
-    if(! prefix.empty()) {
-      if (! boost::starts_with(obj_key.name, prefix))
+    if (!prefix.empty()) {
+      if (!boost::starts_with(obj_key.name, prefix))
         continue;
     }
 
@@ -3400,45 +3402,42 @@ std::string s3_expiration_header(
       bool tag_match = false;
       const RGWObjTags& rule_tagset = filter.get_tags();
       for (auto& tag : rule_tagset.get_tags()) {
-	/* remember, S3 tags are {key,value} tuples */
+        /* remember, S3 tags are {key,value} tuples */
         tag_match = true;
         auto obj_tag = obj_tag_map.find(tag.first);
         if (obj_tag == obj_tag_map.end() || obj_tag->second != tag.second) {
-	        ldpp_dout(dpp, 10) << "tag does not match obj_key=" << obj_key
-			         << " rule_id=" << id
-			         << " tag=" << tag
-			         << dendl;
-	        tag_match = false;
-	        break;
-	      }
+          ldpp_dout(dpp, 10) << "tag does not match obj_key=" << obj_key
+                             << " rule_id=" << id << " tag=" << tag << dendl;
+          tag_match = false;
+          break;
+        }
       }
-      if (! tag_match)
-	      continue;
+      if (!tag_match)
+        continue;
     }
 
     // compute a uniform expiration date (current-version Expiration only)
-    boost::optional<ceph::real_time> rule_expiration_date;
+    std::optional<ceph::real_time> rule_expiration_date;
     const LCExpiration& rule_expiration = expiration;
 
     if (rule_expiration.has_date()) {
       rule_expiration_date =
-	boost::optional<ceph::real_time>(
-	  ceph::from_iso_8601(rule.get_expiration().get_date()));
+          ceph::from_iso_8601(rule.get_expiration().get_date());
     } else {
       if (rule_expiration.has_days()) {
-	rule_expiration_date =
-	  boost::optional<ceph::real_time>(
-	    mtime + make_timespan(double(rule_expiration.get_days()) * secs_in_a_day - ceph::real_clock::to_time_t(mtime)%(secs_in_a_day) + secs_in_a_day));
+        rule_expiration_date =
+            mtime +
+            make_timespan(double(rule_expiration.get_days()) * secs_in_a_day -
+                          ceph::real_clock::to_time_t(mtime) % (secs_in_a_day) +
+                          secs_in_a_day);
       }
     }
 
     // update earliest expiration
     if (rule_expiration_date) {
-      if ((! expiration_date) ||
-	  (*expiration_date > *rule_expiration_date)) {
-      expiration_date =
-	boost::optional<ceph::real_time>(rule_expiration_date);
-      rule_id = boost::optional<std::string>(id);
+      if ((!expiration_date) || (*expiration_date > *rule_expiration_date)) {
+        expiration_date = rule_expiration_date;
+        rule_id = boost::optional<std::string>(id);
       }
     }
   }
@@ -3448,8 +3447,7 @@ std::string s3_expiration_header(
     auto exp = ceph::real_clock::to_time_t(*expiration_date);
     // Fri, 21 Dec 2012 00:00:00 GMT
     auto exp_str = fmt::format("{:%a, %d %b %Y %T} GMT", fmt::gmtime(exp));
-    hdr = fmt::format("expiry-date=\"{0}\", rule-id=\"{1}\"", exp_str,
-		      *rule_id);
+    hdr = fmt::format("expiry-date=\"{0}\", rule-id=\"{1}\"", exp_str, *rule_id);
   }
 
   return hdr;

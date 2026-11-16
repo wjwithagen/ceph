@@ -40,6 +40,7 @@
 #include "messages/MMDSMap.h"
 #include "messages/MMDSTableRequest.h"
 #include "messages/MMDSMetrics.h"
+#include "msg/Messenger.h"
 
 #include "mgr/MgrClient.h"
 
@@ -513,6 +514,8 @@ MDSRank::MDSRank(
   purge_queue.update_op_limit(*mdsmap);
 
   objecter->unset_honor_pool_full();
+  // Clients must direct ops to the source of a pool migration
+  objecter->set_honor_pool_migration();
 
   finisher = new Finisher(cct, "MDSRank", "mds-rank-fin");
 
@@ -2054,6 +2057,9 @@ void MDSRank::reconnect_done()
 void MDSRank::rejoin_joint_start()
 {
   dout(1) << "rejoin_joint_start" << dendl;
+  // Refresh recovery_set so a creating->active rank picks up peers already
+  // in recovery, and a recovering rank picks up newly active survivors.
+  calc_recovery_set();
   mdcache->rejoin_send_rejoins();
 }
 void MDSRank::rejoin_start()
@@ -2527,14 +2533,21 @@ void MDSRankDispatcher::handle_mds_map(
       set<mds_rank_t> olddis, dis;
       oldmap.get_mds_set_lower_bound(olddis, MDSMap::STATE_REJOIN);
       mdsmap->get_mds_set_lower_bound(dis, MDSMap::STATE_REJOIN);
+      bool send_rejoins = false;
       for (const auto& r : dis) {
 	if (r == whoami)
 	  continue; // not me
 	if (!olddis.count(r) || restart.count(r)) {  // newly so?
 	  mdcache->kick_discovers(r);
 	  mdcache->kick_open_ino_peers(r);
+	  send_rejoins = true;
 	}
       }
+      // Retry OP_WEAK that was skipped while this peer was still below
+      // rejoin. Only from rejoin, and only if an OP_WEAK was deferred:
+      // an active rank can still be importing/exporting.
+      if (send_rejoins && is_rejoin())
+	mdcache->rejoin_send_rejoins_if_pending();
     }
   }
 
@@ -3338,8 +3351,9 @@ int MDSRank::_command_export_dir(
     std::string_view path,
     mds_rank_t target)
 {
+  auto fp = filepath(path, {.drop_trailing = true});
+
   std::lock_guard l(mds_lock);
-  filepath fp(path);
 
   if (target == whoami || !mdsmap->is_up(target) || !mdsmap->is_in(target)) {
     derr << "bad MDS target " << target << dendl;
@@ -3376,10 +3390,11 @@ void MDSRank::command_dump_tree(const cmdmap_t &cmdmap, std::ostream &ss, Format
   }
 
   auto dump = [&](Formatter *f) {
+    auto fp = filepath(root, {.drop_trailing = true});
     std::lock_guard l(mds_lock);
-    CInode *in = mdcache->cache_traverse(filepath(root.c_str()));
+    CInode *in = mdcache->cache_traverse(fp);
     if (!in) {
-      ss << "inode for path '" << filepath(root.c_str()) << "' is not in cache";
+      ss << "inode for path '" << fp << "' is not in cache";
       return;
     }
     f->open_array_section("inodes");
@@ -3415,7 +3430,8 @@ CDir *MDSRank::_command_dirfrag_get(
     return NULL;
   }
 
-  CInode *in = mdcache->cache_traverse(filepath(path.c_str()));
+  auto fp = filepath(path, {.drop_trailing = true});
+  CInode *in = mdcache->cache_traverse(fp);
   if (!in) {
     // TODO really we should load something in if it's not in cache,
     // but the infrastructure is harder, and we might still be unable
@@ -3491,7 +3507,8 @@ bool MDSRank::command_dirfrag_merge(
     return false;
   }
 
-  CInode *in = mdcache->cache_traverse(filepath(path.c_str()));
+  auto fp = filepath(path, {.drop_trailing = true});
+  CInode *in = mdcache->cache_traverse(fp);
   if (!in) {
     ss << "directory '" << path << "' inode not in cache";
     return false;
@@ -3521,7 +3538,8 @@ bool MDSRank::command_dirfrag_ls(
     return false;
   }
 
-  CInode *in = mdcache->cache_traverse(filepath(path.c_str()));
+  auto fp = filepath(path, {.drop_trailing = true});
+  CInode *in = mdcache->cache_traverse(fp);
   if (!in) {
     ss << "directory inode not in cache";
     return false;
@@ -3682,7 +3700,8 @@ void MDSRank::command_dump_dir(Formatter *f, const cmdmap_t &cmdmap, std::ostrea
   bool dentry_dump = false;
   cmd_getval(cmdmap, "dentry_dump", dentry_dump);
 
-  CInode *in = mdcache->cache_traverse(filepath(path.c_str()));
+  auto fp = filepath(path, {.drop_trailing = true});
+  CInode *in = mdcache->cache_traverse(fp);
   if (!in) {
     ss << "directory inode not in cache";
     return;

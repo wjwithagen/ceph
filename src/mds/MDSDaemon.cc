@@ -787,7 +787,8 @@ void MDSDaemon::handle_command(const cref_t<MCommand> &m)
     // already queued on the connection, so priv is gone by the time
     // we run. The connection is already marked down, so a reply could
     // not be delivered anyway: drop the command. Clients abort one-shot
-    // commands on the reset (-EPIPE); others have to time out.
+    // commands on the reset (-EPIPE) and resend the others on the new
+    // session.
     dout(1) << __func__ << " no session on "
             << m->get_connection()->get_peer_socket_addr()
             << ", dropping command tid " << m->get_tid()
@@ -1057,19 +1058,11 @@ void MDSDaemon::respawn()
   }
   new_argv[orig_argc] = NULL;
 
-  /* Determine the path to our executable, test if Linux /proc/self/exe exists.
-   * This allows us to exec the same executable even if it has since been
-   * unlinked.
+  /* Determine the path to exec. Re-executing the image we are running would
+   * pair it with libraries an upgrade has replaced.
    */
   char exe_path[PATH_MAX] = "";
-#ifdef PROCPREFIX
-  if (readlink(PROCPREFIX "/proc/self/exe", exe_path, PATH_MAX-1) != -1) {
-    dout(1) << "respawning with exe " << exe_path << dendl;
-    strcpy(exe_path, PROCPREFIX "/proc/self/exe");
-  } else {
-#else
-  {
-#endif
+  if (get_respawn_exe_path(exe_path, sizeof(exe_path)) < 0) {
     /* Print CWD for the user's interest */
     char buf[PATH_MAX];
     char *cwd = getcwd(buf, sizeof(buf));
@@ -1085,7 +1078,7 @@ void MDSDaemon::respawn()
   unblock_all_signals(NULL);
   execv(exe_path, new_argv);
 
-  dout(0) << "respawn execv " << orig_argv[0]
+  dout(0) << "respawn execv " << exe_path
 	  << " failed with " << cpp_strerror(errno) << dendl;
 
   // We have to assert out here, because suicide() returns, and callers

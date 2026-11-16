@@ -10,13 +10,17 @@ import { NfsDetailsComponent } from './nfs-details/nfs-details.component';
 import { NfsFormClientComponent } from './nfs-form-client/nfs-form-client.component';
 import { NfsFormComponent } from './nfs-form/nfs-form.component';
 import { NfsListComponent } from './nfs-list/nfs-list.component';
+import { NfsClusterFormComponent } from './nfs-cluster-form/nfs-cluster-form.component';
 import {
   ButtonModule,
   CheckboxModule,
+  ComboBoxModule,
   GridModule,
   IconModule,
   IconService,
   InputModule,
+  LinkModule,
+  NumberModule,
   RadioModule,
   SelectModule,
   TabsModule,
@@ -26,6 +30,8 @@ import {
 import Close from '@carbon/icons/es/close/32';
 import { NfsClusterComponent } from './nfs-cluster/nfs-cluster.component';
 import { ClusterModule } from '../cluster/cluster.module';
+import { NfsClusterResourcePageComponent } from './nfs-cluster-resource-page/nfs-cluster-resource-page.component';
+import { NfsClusterResourceSidebarComponent } from './nfs-cluster-resource-sidebar/nfs-cluster-resource-sidebar.component';
 
 @NgModule({
   imports: [
@@ -38,22 +44,36 @@ import { ClusterModule } from '../cluster/cluster.module';
     NgbTooltipModule,
     GridModule,
     TagModule,
+    ComboBoxModule,
     SelectModule,
     InputModule,
+    NumberModule,
     RadioModule,
     CheckboxModule,
     ButtonModule,
     IconModule,
+    LinkModule,
     TabsModule,
     ClusterModule
   ],
-  exports: [NfsListComponent, NfsFormComponent, NfsDetailsComponent, NfsClusterComponent],
+  exports: [
+    NfsListComponent,
+    NfsFormComponent,
+    NfsDetailsComponent,
+    NfsClusterComponent,
+    NfsClusterFormComponent,
+    NfsClusterResourcePageComponent,
+    NfsClusterResourceSidebarComponent
+  ],
   declarations: [
     NfsListComponent,
     NfsDetailsComponent,
     NfsFormComponent,
     NfsFormClientComponent,
-    NfsClusterComponent
+    NfsClusterComponent,
+    NfsClusterFormComponent,
+    NfsClusterResourcePageComponent,
+    NfsClusterResourceSidebarComponent
   ]
 })
 export class NfsModule {

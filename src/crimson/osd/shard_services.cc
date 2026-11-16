@@ -11,6 +11,7 @@
 #include "messages/MOSDPGTemp.h"
 #include "messages/MOSDPGReadyToMerge.h"
 #include "messages/MOSDPGStopMerge.h"
+#include "messages/MOSDPGMigratedPool.h"
 
 #include "osd/osd_perf_counters.h"
 #include "osd/PeeringState.h"
@@ -79,12 +80,21 @@ std::map<pg_t, pg_stat_t> PerShardState::get_pg_stats()
   assert_core();
   std::map<pg_t, pg_stat_t> ret;
   for (auto [pgid, pg] : pg_map.get_pgs()) {
-    if (pg->is_primary()) {
-      auto stats = pg->get_stats();
-      // todo: update reported_epoch,reported_seq,last_fresh
-      stats.reported_epoch = osdmap->get_epoch();
-      ret.emplace(pgid.pgid, std::move(stats));
+    if (!pg->is_primary()) {
+      continue;
     }
+    auto stats = pg->get_stats();
+    if (!stats) {
+      // Nothing published yet in this interval. Reporting a
+      // default-constructed pg_stat_t would make the mgr replace the
+      // PG's last known stats with zeroes: state 'unknown', no objects,
+      // and scrub stamps of 0, which raise PG_NOT_SCRUBBED and
+      // PG_NOT_DEEP_SCRUBBED. Skip the PG, as the classic OSD does.
+      continue;
+    }
+    // todo: update reported_epoch,reported_seq,last_fresh
+    stats->reported_epoch = osdmap->get_epoch();
+    ret.emplace(pgid.pgid, std::move(*stats));
   }
   return ret;
 }
@@ -712,6 +722,16 @@ void OSDSingletonState::prune_sent_ready_to_merge()
       ++source;
     }
   }
+}
+
+seastar::future<> OSDSingletonState::send_pg_migrated_pool(int64_t migration_target, pg_t pgid)
+{
+  LOG_PREFIX(OSDSingletonState::send_pg_to_migrated_pool);
+  DEBUG("{}", pgid);
+  return monc.send_message(
+    crimson::make_message<MOSDPGMigratedPool>(osdmap->get_epoch(),
+					      migration_target,
+					      pgid));
 }
 
 seastar::future<> OSDSingletonState::send_alive(const epoch_t want)

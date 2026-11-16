@@ -14,8 +14,8 @@
  */
 
 /**
- * What the Objecter does to in-flight EC direct reads and split sub-reads
- * when the OSDMap changes.
+ * What the Objecter does to in-flight EC direct reads, split sub-reads and
+ * order-reads-writes ops when the OSDMap changes.
  *
  * The Objecter is initialised with a session per OSD whose connection
  * records the MOSDOps sent on it.  Maps are delivered through
@@ -38,6 +38,7 @@
 #include <boost/asio/io_context.hpp>
 
 #include "common/Cond.h"
+#include "crush/CrushWrapper.h"
 #include "global/global_context.h"
 #include "include/rados.h"
 #include "messages/MOSDMap.h"
@@ -47,6 +48,7 @@
 #include "osd/OSDMap.h"
 #include "osd/osd_types.h"
 #include "osdc/Objecter.h"
+#include "osdc/SplitOp.h"
 #include "test/osd/MockConnection.h"
 #include "test/osd/OSDMapTestHelpers.h"
 
@@ -146,6 +148,10 @@ protected:
                                          CEPH_FEATURES_SUPPORTED_DEFAULT);
     inc.encode(m->incremental_maps[inc.epoch],
                CEPH_FEATURES_SUPPORTED_DEFAULT | CEPH_FEATURE_RESERVED);
+    // A paused op, or one left without an OSD, makes the Objecter ask for
+    // the next map; wanting it already, as _maybe_request_map() does, stops
+    // the unconnected MonClient opening a session.
+    monc.sub_want("osdmap", inc.epoch + 1, CEPH_SUBSCRIBE_ONETIME);
     objecter->handle_osd_map(m.get());
     poll();
   }
@@ -158,14 +164,30 @@ protected:
     });
   }
 
-  void raise_min_size()
+  void modify_pool(const std::function<void(pg_pool_t&)>& change)
   {
     auto pool = objecter->with_osdmap([](const OSDMap& o) {
       return *o.get_pg_pool(ec_pool_id);
     });
-    pool.min_size++;
+    change(pool);
     advance_map([&pool](OSDMap::Incremental& inc) {
       inc.new_pools[ec_pool_id] = pool;
+    });
+  }
+
+  void raise_min_size()
+  {
+    modify_pool([](pg_pool_t& pool) { pool.min_size++; });
+  }
+
+  void set_pool_full(bool full)
+  {
+    modify_pool([full](pg_pool_t& pool) {
+      if (full) {
+        pool.set_flag(pg_pool_t::FLAG_FULL);
+      } else {
+        pool.unset_flag(pg_pool_t::FLAG_FULL);
+      }
     });
   }
 
@@ -184,6 +206,22 @@ protected:
   {
     ceph_tid_t tid = 0;
     objecter->op_submit(new_read_op(off, len, flags), &tid);
+    poll();
+    return tid;
+  }
+
+  ceph_tid_t submit_write()
+  {
+    osdc_opvec ops(1);
+    ops[0].op.op = CEPH_OSD_OP_WRITEFULL;
+    ops[0].indata.append("data");
+    ops[0].op.extent.length = ops[0].indata.length();
+    ceph_tid_t tid = 0;
+    objecter->op_submit(new Objecter::Op(object_t("obj"),
+                                         object_locator_t(ec_pool_id),
+                                         std::move(ops), CEPH_OSD_FLAG_WRITE,
+                                         (Context*)nullptr, nullptr),
+                        &tid);
     poll();
     return tid;
   }
@@ -287,4 +325,207 @@ TEST_F(TestSplitOpMapChange, ECDirectReadRedrivesWhenPrimaryMoves)
 TEST_F(TestSplitOpMapChange, ECDirectReadRedrivesWhenMinSizeChanges)
 {
   direct_read_redriven_on_new_interval([this] { raise_min_size(); }, primary);
+}
+
+// A map can land while _op_submit() has the rwlock dropped to relock for the
+// first sub-read of a split read, so the sub-read to osd.1 has a target from
+// the older map.  Neither sub-read is sent, and the next change to the PG
+// redrives the whole read to the primary.
+TEST_F(TestSplitOpMapChange, ECSplitReadNewIntervalDuringSubmit)
+{
+  g_ceph_context->_conf.set_val_or_die("objecter_debug_inject_relock_delay",
+                                       "true");
+  objecter->relock_delay = [this] {
+    // Only the first sub-read relocks.
+    g_ceph_context->_conf.set_val_or_die("objecter_debug_inject_relock_delay",
+                                         "false");
+    raise_min_size();
+  };
+  ceph_tid_t parent = submit_read(0, 2 * chunk_size,
+                                  CEPH_OSD_FLAG_BALANCE_READS);
+  EXPECT_TRUE(sent_to(primary).empty());
+  EXPECT_TRUE(sent_to(shard1_osd).empty());
+
+  mark_down(parity_osd);
+  EXPECT_TRUE(sent_to(shard1_osd).empty());
+  ASSERT_EQ(1u, sent_to(primary).size());
+  EXPECT_EQ(parent, sent_to(primary).back().first);
+  reply(primary, cons[primary]->sent.back());
+  EXPECT_EQ(0, done.wait_for(0));
+}
+
+// An ORDER_READS_WRITES read must not overtake a write that a full pool
+// pauses.
+TEST_F(TestSplitOpMapChange, RWOrderedReadWaitsForWriteOnFullPool)
+{
+  set_pool_full(true);
+  ceph_tid_t write = submit_write();
+  ceph_tid_t read = submit_read(0, 1, CEPH_OSD_FLAG_RWORDERED);
+  EXPECT_TRUE(sent_to(primary).empty());
+
+  set_pool_full(false);
+  ASSERT_EQ(2u, sent_to(primary).size());
+  EXPECT_EQ(write, sent_to(primary)[0].first);
+  EXPECT_EQ(read, sent_to(primary)[1].first);
+}
+
+TEST_F(TestSplitOpMapChange, RWOrderedReadResentAfterWriteWhenPoolFull)
+{
+  ceph_tid_t write = submit_write();
+  ceph_tid_t read = submit_read(0, 1, CEPH_OSD_FLAG_RWORDERED);
+  ASSERT_EQ(2u, sent_to(primary).size());
+
+  set_pool_full(true);
+  EXPECT_EQ(2u, sent_to(primary).size());
+
+  set_pool_full(false);
+  ASSERT_EQ(4u, sent_to(primary).size());
+  EXPECT_EQ(write, sent_to(primary)[2].first);
+  EXPECT_EQ(read, sent_to(primary)[3].first);
+}
+
+// FULL_TRY ops do not respect the full flag, so are not held back.
+TEST_F(TestSplitOpMapChange, RWOrderedFullTryReadSentOnFullPool)
+{
+  set_pool_full(true);
+  submit_read(0, 1, CEPH_OSD_FLAG_RWORDERED | CEPH_OSD_FLAG_FULL_TRY);
+  EXPECT_EQ(1u, sent_to(primary).size());
+}
+
+// A balanced read of a pool over two zones whose acting set holds only one
+// zone, as when CRUSH finds one zone, reads from that zone
+TEST_F(TestSplitOpMapChange, ECBalancedShardWithOneZoneInActingSet)
+{
+  constexpr int64_t two_zone_pool_id = 2;
+  auto pool = objecter->with_osdmap([](const OSDMap& o) {
+    return *o.get_pg_pool(ec_pool_id);
+  });
+  pool.num_zones = 2;
+  pool.size = 6;
+  advance_map([&](OSDMap::Incremental& inc) {
+    inc.new_pool_max = two_zone_pool_id;
+    inc.new_pools[two_zone_pool_id] = pool;
+  });
+
+  Objecter::op_target_t target(object_t("obj"),
+                               object_locator_t(two_zone_pool_id), 0);
+  target.acting = acting;
+  std::optional<int> local_zone;
+  for (int i = 0; i < 20; i++) {
+    EXPECT_EQ(shard_id_t(1), ECSplitOp::choose_read_shard(
+      *objecter, g_ceph_context, target, false, shard_id_t(1), local_zone));
+  }
+}
+
+// A localized read of a replicated pool over two zones is split between the
+// replicas in the client's zone. A replicated acting set is not ordered by
+// zone, so the zone of each replica must come from CRUSH, not its position.
+class TestReplicaLocalizedSplitRead : public ::testing::Test {
+protected:
+  static constexpr int num_osds = 4;
+  static constexpr int64_t pool_id = 1;
+  // primary osd.2 in dc1, then the zones interleaved
+  const std::vector<int> acting = {2, 0, 3, 1};
+  boost::asio::io_context ioc;
+  MonClient monc{g_ceph_context, ioc};
+  std::unique_ptr<Messenger> msgr{
+    Messenger::create_client_messenger(g_ceph_context, "client")};
+  std::unique_ptr<Objecter> objecter;
+  std::map<int, ceph::ref_t<RecordingConnection>> cons;
+  C_SaferCond done;
+
+  void SetUp() override
+  {
+    g_ceph_context->_conf.set_val_or_die("osd_min_split_replica_read_size",
+                                         "4096");
+    objecter = std::make_unique<Objecter>(g_ceph_context, msgr.get(), &monc, ioc);
+    objecter->init();
+
+    OSDMap map;
+    uuid_d fsid;
+    fsid.generate_random();
+    ceph_assert(map.build_simple(g_ceph_context, 1, fsid, num_osds) == 0);
+    for (int i = 0; i < num_osds; i++) {
+      map.set_state(i, CEPH_OSD_EXISTS | CEPH_OSD_UP);
+    }
+
+    // datacenter dc0 holds osd.0 and osd.1, dc1 osd.2 and osd.3
+    CrushWrapper crush;
+    crush.create();
+    OSDMap::_build_crush_types(crush);
+    int rootid = 0;
+    ceph_assert(crush.add_bucket(0, CRUSH_BUCKET_STRAW2, CRUSH_HASH_DEFAULT,
+                                 crush.get_type_id("root"), 0, nullptr,
+                                 nullptr, &rootid) == 0);
+    crush.set_item_name(rootid, "default");
+    for (int osd = 0; osd < num_osds; osd++) {
+      std::map<std::string, std::string> loc = {
+        {"root", "default"},
+        {"datacenter", "dc" + std::to_string(osd / 2)},
+        {"host", "host" + std::to_string(osd)}};
+      crush.insert_item(g_ceph_context, osd, 1.0, "osd." + std::to_string(osd),
+                        loc);
+    }
+    crush.finalize();
+    OSDMap::Incremental crush_inc(map.get_epoch() + 1);
+    crush_inc.fsid = map.get_fsid();
+    crush.encode(crush_inc.crush, CEPH_FEATURES_SUPPORTED_DEFAULT);
+    map.apply_incremental(crush_inc);
+
+    pg_pool_t rep;
+    rep.type = pg_pool_t::TYPE_REPLICATED;
+    rep.size = 4;
+    rep.min_size = 1;
+    rep.num_zones = 2;
+    rep.replica = 2;
+    rep.peering_crush_bucket_count = 2;
+    rep.peering_crush_bucket_target = 2;
+    rep.peering_crush_bucket_barrier = crush.get_type_id("datacenter");
+    rep.set_flag(pg_pool_t::FLAG_CLIENT_SPLIT_READS);
+    rep.set_pg_num(1);
+    rep.set_pgp_num(1);
+    OSDMapTestHelpers::add_pool(map, pool_id, rep);
+    OSDMapTestHelpers::set_pg_acting(map, pg_t(0, pool_id), acting);
+
+    objecter->start(&map);
+    objecter->crush_location = {{"datacenter", "dc0"}};
+
+    for (int osd = 0; osd < num_osds; osd++) {
+      auto s = new Objecter::OSDSession(g_ceph_context, osd, ioc.get_executor());
+      cons[osd] = ceph::make_ref<RecordingConnection>(osd);
+      s->con = cons[osd];
+      s->con->set_priv(RefCountedPtr{s});
+      objecter->osd_sessions[osd] = s;
+    }
+  }
+
+  void TearDown() override
+  {
+    objecter->shutdown();
+    objecter.reset();
+    g_ceph_context->_conf.set_val_or_die("osd_min_split_replica_read_size",
+                                         "0");
+  }
+};
+
+TEST_F(TestReplicaLocalizedSplitRead, ReadsOnlyLocalZoneReplicas)
+{
+  osdc_opvec ops(1);
+  ops[0].op.op = CEPH_OSD_OP_READ;
+  ops[0].op.extent.offset = 0;
+  ops[0].op.extent.length = 1 << 20;
+  ceph_tid_t tid = 0;
+  objecter->op_submit(
+    new Objecter::Op(object_t("obj"), object_locator_t(pool_id),
+                     std::move(ops),
+                     CEPH_OSD_FLAG_READ | CEPH_OSD_FLAG_LOCALIZE_READS,
+                     &done, nullptr),
+    &tid);
+  ioc.restart();
+  ioc.poll();
+
+  EXPECT_FALSE(cons[0]->sent.empty());
+  EXPECT_FALSE(cons[1]->sent.empty());
+  EXPECT_TRUE(cons[2]->sent.empty()) << "osd.2 is in dc1";
+  EXPECT_TRUE(cons[3]->sent.empty()) << "osd.3 is in dc1";
 }

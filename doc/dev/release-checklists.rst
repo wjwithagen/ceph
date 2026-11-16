@@ -84,6 +84,7 @@ Mon
 - [x] common/options/global.yaml.in remove `mon_debug_no_require_X-2`
 - [x] mon/OSDMonitor.cc `create_initial`: adjust new `require_osd_release`, and add associated `mon_debug_no_require_X`
 - [x] mon/OSDMonitor.cc `preprocess_boot`: adjust "disallow boot of " condition to disallow X if `require_osd_release` < X-2.
+- [x] common/ceph_releases.cc `ceph_release_server_feature`: return `SERVER_X` for X, so that `preprocess_boot` refuses OSDs of earlier releases once `require_osd_release` is X (`unittest_features` fails until it does)
 - [x] mon/OSDMonitor.cc: adjust "osd require-osd-release" to (1) allow setting X, and (2) check that all mons *and* OSDs have X
 - [x] mon/MonCommands.h: adjust "osd require-osd-release" allows options to include X
 - [x] qa/workunits/cephtool/test.sh: adjust `require-osd-release` test
@@ -112,10 +113,11 @@ QA suite
 - [x] create qa/suites/upgrade/(X-1)-x
 - [x] remove qa/suites/upgrade/(X-3)-x-*
 - [x] update qa/fs/upgrade/ to remove (X-3) and add (X-1); check with fs team to confirm / help
-- [x] update qa/ upgrade suites require-osd-release calls to tentacle
+- [x] update qa/ upgrade suites require-osd-release calls to X
 - [x] create qa/releases/X.yaml
 - [x] create qa/suites/rados/thrash-old-clients/1-install/(X-1).yaml
 - [x] update qa/suites/rados/encoder/1-task.yaml to remove (X-3) and add X
+- [x] update qa/suites/rados/upgrade/require-osd-release/tasks.yaml to install (X-1) and set require-osd-release X
 - [x] update upgrade:telemetry-upgrade
 
 
@@ -166,6 +168,9 @@ First stable release
 - [ ] src/ceph_release: change type `stable`
 - [ ] generate new object corpus for encoding/decoding tests - see :doc:`corpus`
 - [ ] src/cephadm/cephadmlib/constants.py: update `LATEST_STABLE_RELEASE`
+- [ ] src/cephadm/cephadmlib/constants.py: set DEFAULT_IMAGE 'quay.io/ceph/ceph:vX' (e.g. v21 for Umbrella)
+- [ ] src/cephadm/cephadmlib/constants.py: set DEFAULT_IMAGE_IS_MAIN to False
+- [ ] src/cephadm/cephadmlib/constants.py: set DEFAULT_IMAGE_RELEASE to 'release' (e.g. 'umbrella')
 - [ ] add release to doc/releases/releases.yml
 - [ ] add release to doc/releases/index.rst
 - [ ] activate latest release in readthedocs, as described in `the readthedocs

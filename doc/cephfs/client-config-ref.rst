@@ -33,11 +33,13 @@ Client Config Reference
 ------------------------
 
 .. confval:: client_acl_type
+.. confval:: client_alternate_name_visible
 .. confval:: client_cache_mid
 .. confval:: client_cache_size
 .. confval:: client_caps_release_delay
 .. confval:: client_debug_force_sync_read
 .. confval:: client_dirsize_rbytes
+.. confval:: client_force_lazyio
 .. confval:: client_fscrypt_as
 .. confval:: client_fscrypt_dummy_encryption
 .. confval:: client_max_inline_size

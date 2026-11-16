@@ -588,6 +588,7 @@ class RadosObject : public StoreObject {
                const ceph::real_time* mod_ptr, const ceph::real_time* unmod_ptr,
                bool high_precision_time,
                const char* if_match, const char* if_nomatch,
+               const char* dest_if_match, const char* dest_if_nomatch,
                AttrsMod attrs_mod, bool copy_if_newer, Attrs& attrs,
                RGWObjCategory category, uint64_t olh_epoch,
 	       boost::optional<ceph::real_time> delete_at,
@@ -1313,6 +1314,7 @@ class RadosLuaManager : public StoreLuaManager {
   uint64_t watch_handle = 0;
   std::map<std::string, uint64_t> script_watches;
   std::map<uint64_t, std::string> reverse_script_watches;
+  std::shared_mutex watch_mutex;
 
 public:
   RadosLuaManager(RadosStore* _s, const std::string& _luarocks_path);

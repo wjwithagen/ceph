@@ -4,6 +4,7 @@
 #include "ConfigMap.h"
 #include "crush/CrushWrapper.h"
 #include "common/entity_name.h"
+#include "common/Formatter.h"
 
 #include <boost/algorithm/string/split.hpp>
 #include <boost/algorithm/string/trim.hpp>
@@ -191,7 +192,7 @@ ConfigMap::generate_entity_map(
       }
       out[i.first] = o.raw_value;
       if (src) {
-	(*src).emplace(i.first, ConfigMap::ValueSource(s.first, &o));
+        (*src).insert_or_assign(i.first, ConfigMap::ValueSource(s.first, &o));
       }
       prev = &o;
     }

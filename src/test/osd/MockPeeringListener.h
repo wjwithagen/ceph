@@ -52,6 +52,7 @@ class MockPeeringListener : public PeeringState::PeeringListener {
   std::unique_ptr<MockPGBackendListener> backend_listener;
   coll_t coll;
   ObjectStore::CollectionHandle ch;
+  // Stub used by the pg log entry handler when there is no pg_backend.
   std::unique_ptr<MockPGBackend> backend;
   // Non-owning; set by ECPeeringTestFixture when a real IO backend exists.
   PGBackend *pg_backend = nullptr;
@@ -299,11 +300,9 @@ class MockPeeringListener : public PeeringState::PeeringListener {
     pg_temp_cleared = true;
   }
 
-#if POOL_MIGRATION
   void send_pg_migrated_pool() override {
     pg_migrated_pool_sent = true;
   }
-#endif
 
   void publish_stats_to_osd() override {
     stats_published = true;
@@ -404,21 +403,35 @@ class MockPeeringListener : public PeeringState::PeeringListener {
     recovery_cancelled = true;
   }
 
-#if POOL_MIGRATION
-  void on_pool_migration_reserved() override {
-    pool_migration_reserved = true;
+  void on_pool_migration_source_suspended() override {
+    pool_migration_source_suspended = true;
   }
-#endif
 
-#if POOL_MIGRATION
-  void on_pool_migration_suspended() override {
-    pool_migration_suspended = true;
+  void on_pool_migration_source_reserved() override {
+    pool_migration_source_reserved = true;
   }
-#endif
+
+  void on_pool_migration_target_reserved(HBHandle *handle) override {
+    pool_migration_target_reserved = true;
+  }
+
+  void on_pool_migration_target_suspended(bool toofull) override {
+    pool_migration_target_suspended = true;
+    pool_migration_target_suspended_toofull = toofull;
+  }
+
+  void pool_migration_request_target_reservation() override {
+    pool_migraiton_target_reservation = true;
+  }
+
+  void pool_migration_release_target_reservation() override {
+    pool_migration_target_release_reservation = true;
+  }
 
   bool try_reserve_recovery_space(
     int64_t primary_num_bytes,
-    int64_t local_num_bytes) override {
+    int64_t local_num_bytes,
+    int64_t num_objects = 0) override {
     recovery_space_reserved = true;
     if (inject_fail_reserve_recovery_space) {
       return false;
@@ -432,7 +445,8 @@ class MockPeeringListener : public PeeringState::PeeringListener {
 
   PGLog::LogEntryHandlerRef get_log_handler(
     ObjectStore::Transaction &t) override {
-    return std::make_unique<MockPGLogEntryHandler>(backend.get(), &t);
+    return std::make_unique<MockPGLogEntryHandler>(
+      pg_backend ? pg_backend : backend.get(), &t);
   }
 
   void rebuild_missing_set_with_deletes(PGLog &pglog) override {
@@ -475,9 +489,9 @@ class MockPeeringListener : public PeeringState::PeeringListener {
     return OstreamTemp(CLOG_DEBUG, nullptr);
   }
 
-  void on_activate_complete() override;
+  void on_activate_complete(HBHandle *handle) override;
 
-  void on_activate_committed() override {
+  void on_activate_committed(HBHandle *handle) override {
     activate_committed_called = true;
   }
 
@@ -522,8 +536,13 @@ class MockPeeringListener : public PeeringState::PeeringListener {
   bool ready_to_merge_source_set = false;
   bool backfill_suspended = false;
   bool recovery_cancelled = false;
-  bool pool_migration_reserved = false;
-  bool pool_migration_suspended = false;
+  bool pool_migration_source_suspended = false;
+  bool pool_migration_source_reserved = false;
+  bool pool_migration_target_release_reservation = false;
+  bool pool_migration_target_reserved = false;
+  bool pool_migration_target_suspended = false;
+  bool pool_migration_target_suspended_toofull = false;
+  bool pool_migraiton_target_reservation = false;
   bool recovery_space_reserved = false;
   bool recovery_space_unreserved = false;
   bool missing_set_rebuilt = false;

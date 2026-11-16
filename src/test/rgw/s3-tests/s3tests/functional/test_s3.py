@@ -8,6 +8,7 @@ import isodate
 import email.utils
 import datetime
 import threading
+import concurrent.futures
 import re
 import pytz
 from collections import OrderedDict
@@ -94,6 +95,7 @@ from . import (
     configured_storage_classes,
     configure,
     get_lc_debug_interval,
+    get_lc_list_cnt,
     get_restore_debug_interval,
     get_restore_processor_period,
     get_read_through_days,
@@ -8391,6 +8393,32 @@ def test_versioning_obj_list_marker():
 
 @pytest.mark.fails_on_dbstore
 @pytest.mark.versioning
+def test_versioning_obj_list_marker_null_delete_marker():
+    bucket_name = get_new_bucket()
+    client = get_client()
+
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+    key = 'testobj'
+    response = client.put_object(Bucket=bucket_name, Key=key, Body='data')
+    version_id = response['VersionId']
+    # a null delete marker in front of the version
+    check_configure_versioning_retry(bucket_name, "Suspended", "Suspended")
+    client.delete_object(Bucket=bucket_name, Key=key)
+
+    # one entry per page: the first page ends on the null delete marker
+    response = client.list_object_versions(Bucket=bucket_name, MaxKeys=1)
+    assert [m['VersionId'] for m in response['DeleteMarkers']] == ['null']
+    assert response['IsTruncated']
+    assert response['NextVersionIdMarker'] == 'null'
+
+    response = client.list_object_versions(
+        Bucket=bucket_name, MaxKeys=1, KeyMarker=response['NextKeyMarker'],
+        VersionIdMarker=response['NextVersionIdMarker'])
+    versions = response.get('Versions', [])
+    assert [v['VersionId'] for v in versions] == [version_id]
+
+@pytest.mark.fails_on_dbstore
+@pytest.mark.versioning
 def test_versioning_copy_obj_version():
     bucket_name = get_new_bucket()
     client = get_client()
@@ -9243,6 +9271,109 @@ def test_lifecycle_expiration_newer_noncurrent():
 
     # at T+20, 6 objects should exist (1 current and (9 - 5) noncurrent)
     assert num_objs == 6
+
+def _lc_page_boundary_wait(client, bucket_name, key, gone, lc_interval):
+    # wait for lifecycle to expire the version(s) it must expire
+    for _ in range(10):
+        time.sleep(lc_interval)
+        response = client.list_object_versions(Bucket=bucket_name, Prefix=key)
+        remaining = {v['VersionId'] for v in response.get('Versions', [])}
+        if not (gone & remaining):
+            break
+    assert not (gone & remaining), 'lifecycle did not expire %s' % gone
+    # the expected versions are gone; wait one more cycle before checking what survived
+    time.sleep(lc_interval)
+    response = client.list_object_versions(Bucket=bucket_name, Prefix=key)
+    return {v['VersionId'] for v in response.get('Versions', [])}
+
+def _lc_page_boundary_fill(client, bucket_name, count):
+    def put(ix):
+        client.put_object(Bucket=bucket_name, Key='a%05d' % ix, Body='x')
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
+        list(pool.map(put, range(count)))
+
+def _lc_put_newer_noncurrent_rule(client, bucket_name, newer):
+    lifecycle_config = {
+        'Rules': [{
+            'NoncurrentVersionExpiration': {
+                'NoncurrentDays': 1,
+                'NewerNoncurrentVersions': newer,
+            },
+            'ID': 'newer_noncurrent_page_boundary',
+            'Filter': {'Prefix': ''},
+            'Status': 'Enabled',
+        }]
+    }
+    response = client.put_bucket_lifecycle_configuration(
+        Bucket=bucket_name, LifecycleConfiguration=lifecycle_config)
+    assert response['ResponseMetadata']['HTTPStatusCode'] == 200
+
+# LC resumes each listing page after the last entry of the previous one
+# a null version that ends a page must not be listed again
+# lc_list_cnt should match to rgw_lc_list_cnt
+@pytest.mark.lifecycle
+@pytest.mark.lifecycle_expiration
+@pytest.mark.fails_on_aws
+@pytest.mark.fails_on_dbstore
+@pytest.mark.versioning
+def test_lifecycle_expiration_newer_noncurrent_page_boundary_null_current():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    lc_interval = get_lc_debug_interval()
+    page = get_lc_list_cnt()
+
+    # fill with plain objects to reach the page boundary
+    _lc_page_boundary_fill(client, bucket_name, page - 1)
+
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+    client.put_object(Bucket=bucket_name, Key='k', Body='v1')
+    client.put_object(Bucket=bucket_name, Key='k', Body='v2')
+    check_configure_versioning_retry(bucket_name, "Suspended", "Suspended")
+    client.put_object(Bucket=bucket_name, Key='k', Body='null')
+
+    # newest first: the null version, v2, v1
+    response = client.list_object_versions(Bucket=bucket_name, Prefix='k')
+    ids = [v['VersionId'] for v in response['Versions']]
+    assert len(ids) == 3 and ids[0] == 'null'
+    null_id, v2_id, v1_id = ids
+
+    # keep one noncurrent version: v1 is expired, v2 must stay
+    _lc_put_newer_noncurrent_rule(client, bucket_name, 1)
+    # wait for LC to remove the noncurrent version v1
+    remaining = _lc_page_boundary_wait(client, bucket_name, 'k', {v1_id}, lc_interval)
+    assert remaining == {null_id, v2_id}
+
+@pytest.mark.lifecycle
+@pytest.mark.lifecycle_expiration
+@pytest.mark.fails_on_aws
+@pytest.mark.fails_on_dbstore
+@pytest.mark.versioning
+def test_lifecycle_expiration_newer_noncurrent_page_boundary_null_noncurrent():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    lc_interval = get_lc_debug_interval()
+    page = get_lc_list_cnt()
+
+    # the 5 versions of "k" end the first page; "z" keeps it truncated
+    _lc_page_boundary_fill(client, bucket_name, page - 5)
+
+    # an object from before versioning becomes the oldest, null, version
+    client.put_object(Bucket=bucket_name, Key='k', Body='before versioning')
+    client.put_object(Bucket=bucket_name, Key='z', Body='x')
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+    for ix in range(1, 5):
+        client.put_object(Bucket=bucket_name, Key='k', Body='v%d' % ix)
+
+    # newest first: v4, v3, v2, v1, the null version
+    response = client.list_object_versions(Bucket=bucket_name, Prefix='k')
+    ids = [v['VersionId'] for v in response['Versions']]
+    assert len(ids) == 5 and ids[4] == 'null'
+
+    # keep three noncurrent versions: only the null version is expired
+    _lc_put_newer_noncurrent_rule(client, bucket_name, 3)
+    remaining = _lc_page_boundary_wait(client, bucket_name, 'k',
+                                       {'null'}, lc_interval)
+    assert remaining == set(ids[:4])
 
 def get_byte_buffer(nbytes):
     buf = BytesIO(b"")
@@ -10216,6 +10347,77 @@ def test_lifecycle_cloud_transition():
         assert status == 404
         assert error_code == 'NoSuchKey'
 
+@pytest.mark.lifecycle
+@pytest.mark.lifecycle_transition
+@pytest.mark.cloud_transition
+@pytest.mark.fails_on_dbstore
+def test_lifecycle_cloud_transition_object_lock():
+    cloud_sc = get_cloud_storage_class()
+    if cloud_sc == None:
+        pytest.skip('no cloud_storage_class configured')
+
+    target_by_bucket = get_cloud_target_by_bucket()
+    if target_by_bucket != None and target_by_bucket == "true":
+        pytest.skip('test expects the shared cloud target bucket (target_by_bucket = false)')
+    target_path = get_cloud_target_path()
+    if target_path == None:
+        target_path = "rgwx-default-" + cloud_sc.lower() + "-cloud-bucket"
+    target_sc = get_cloud_target_storage_class()
+    retain_current = get_cloud_retain_current_version()
+
+    bucket_name = get_new_bucket_name()
+    client = get_client()
+    client.create_bucket(Bucket=bucket_name, ObjectLockEnabledForBucket=True)
+
+    # current versions under retention or legal hold must stay on the cluster;
+    # the unlocked one shows that the rule did run
+    retention = {'Mode':'GOVERNANCE', 'RetainUntilDate':datetime.datetime(2140,1,1,tzinfo=pytz.UTC)}
+    locked = client.put_object(Bucket=bucket_name, Key='locked', Body='locked',
+                               ObjectLockMode=retention['Mode'],
+                               ObjectLockRetainUntilDate=retention['RetainUntilDate'])
+    held = client.put_object(Bucket=bucket_name, Key='held', Body='held',
+                             ObjectLockLegalHoldStatus='ON')
+    free = client.put_object(Bucket=bucket_name, Key='free', Body='free')
+
+    rules=[{'ID': 'rule1', 'Transitions': [{'Days': 1, 'StorageClass': cloud_sc}], 'Prefix': '', 'Status': 'Enabled'}]
+    lifecycle = {'Rules': rules}
+    client.put_bucket_lifecycle_configuration(Bucket=bucket_name, LifecycleConfiguration=lifecycle)
+
+    lc_interval = get_lc_debug_interval()
+    time.sleep(10*lc_interval)
+
+    cloud_client = get_cloud_client()
+    prefix = bucket_name + "/"
+
+    # the unlocked object was transitioned. the cloud object key is
+    # "<bucket>/<key>", with "-<version id>" appended for current versions
+    # when retain_current_version is enabled
+    free_key = prefix + 'free'
+    if retain_current != None and retain_current == "true":
+        free_key += '-' + free['VersionId']
+    verify_object(cloud_client, target_path, free_key, 'free', target_sc)
+
+    # the locked objects were not copied to the cloud endpoint, under any key
+    response = cloud_client.list_objects_v2(Bucket=target_path, Prefix=prefix)
+    cloud_keys = [o['Key'] for o in response.get('Contents', [])]
+    assert free_key in cloud_keys
+    for key in ['locked', 'held']:
+        assert not [k for k in cloud_keys if k == prefix + key or k.startswith(prefix + key + '-')]
+
+    # and are still current, local and readable
+    for key, response, body in [('locked', locked, 'locked'), ('held', held, 'held')]:
+        version_id = response['VersionId']
+        head = client.head_object(Bucket=bucket_name, Key=key)
+        assert head['VersionId'] == version_id
+        assert head.get('StorageClass', 'STANDARD') == 'STANDARD'
+        verify_object(client, bucket_name, key, body)
+
+    client.put_object_legal_hold(Bucket=bucket_name, Key='held', VersionId=held['VersionId'],
+                                 LegalHold={'Status': 'OFF'})
+    client.delete_object(Bucket=bucket_name, Key='held', VersionId=held['VersionId'])
+    client.delete_object(Bucket=bucket_name, Key='locked', VersionId=locked['VersionId'],
+                         BypassGovernanceRetention=True)
+
 # Similar to 'test_lifecycle_transition' but for cloud transition
 @pytest.mark.lifecycle
 @pytest.mark.lifecycle_transition
@@ -10243,7 +10445,7 @@ def test_lifecycle_cloud_multiple_transition():
     client = get_client()
     rules=[{'ID': 'rule1', 'Transitions': [{'Days': 1, 'StorageClass': sc1}], 'Prefix': 'expire1/', 'Status': 'Enabled'},
            {'ID': 'rule2', 'Transitions': [{'Days': 5, 'StorageClass': cloud_sc}], 'Prefix': 'expire1/', 'Status': 'Enabled'},
-           {'ID': 'rule3', 'Expiration': {'Days': 9}, 'Prefix': 'expire1/', 'Status': 'Enabled'}]
+           {'ID': 'rule3', 'Expiration': {'Days': 12}, 'Prefix': 'expire1/', 'Status': 'Enabled'}]
     lifecycle = {'Rules': rules}
     client.put_bucket_lifecycle_configuration(Bucket=bucket_name, LifecycleConfiguration=lifecycle)
 
@@ -10273,7 +10475,7 @@ def test_lifecycle_cloud_multiple_transition():
         assert len(expire1_keys[sc[2]]) == 0
 
     # Wait for final expiration cycle
-    time.sleep(6*lc_interval)
+    time.sleep(9*lc_interval)
     expire3_keys = list_bucket_storage_class(client, bucket_name)
     assert len(expire3_keys['STANDARD']) == 2
     assert len(expire3_keys[sc[1]]) == 0
@@ -13260,6 +13462,106 @@ def test_versioning_bucket_multipart_upload_return_version_id():
     response = client.complete_multipart_upload(Bucket=bucket_name, Key=key, UploadId=upload_id, MultipartUpload={'Parts': parts})
     assert not 'VersionId' in response
 
+def _check_time_condition(key, greater_than, less_than, past, future):
+    """
+    Check that a request-time condition key works with the operators
+    it is specified for: 'past' and 'future' are values of the key, in
+    the operators' syntax, that the request time must fall between.
+
+    Every comparison is made from both sides, so a key that is
+    silently never satisfied (for example, because the server
+    populates it in a format the operator can't parse) fails here
+    instead of looking like a correct denial.
+    """
+    bucket_name = _create_objects(keys=['foo'])
+    client = get_client()
+    alt_client = get_alt_client()
+    resource = _make_arn_resource("{}/{}".format(bucket_name, "*"))
+
+    def put_policy(effect, conditions):
+        policy_document = make_json_policy("s3:GetObject", resource,
+                                           effect=effect,
+                                           conditions=conditions)
+        client.put_bucket_policy(Bucket=bucket_name, Policy=policy_document)
+
+    def expect_allowed():
+        response = alt_client.get_object(Bucket=bucket_name, Key='foo')
+        assert response['ResponseMetadata']['HTTPStatusCode'] == 200
+
+    def expect_denied():
+        e = assert_raises(ClientError, alt_client.get_object, Bucket=bucket_name, Key='foo')
+        status, error_code = _get_status_and_error_code(e.response)
+        assert status == 403
+        assert error_code == 'AccessDenied'
+
+    # Allow when the condition holds
+    put_policy("Allow", {greater_than: {key: past}})
+    expect_allowed()
+    put_policy("Allow", {less_than: {key: future}})
+    expect_allowed()
+
+    # Allow when the condition doesn't hold
+    put_policy("Allow", {less_than: {key: past}})
+    expect_denied()
+    put_policy("Allow", {greater_than: {key: future}})
+    expect_denied()
+
+    # Deny when the condition holds, with an unconditional Allow that
+    # the Deny must beat. A condition that is never satisfied would
+    # pass the Allow cases above by accident, but it can't fire this
+    # Deny.
+    policy = Policy()
+    policy.add_statement(Statement("s3:GetObject", resource))
+    policy.add_statement(Statement("s3:GetObject", resource, effect="Deny",
+                                   condition={greater_than: {key: past}}))
+    client.put_bucket_policy(Bucket=bucket_name, Policy=policy.to_json())
+    expect_denied()
+
+    # Deny when the condition doesn't hold: the Allow stands
+    policy = Policy()
+    policy.add_statement(Statement("s3:GetObject", resource))
+    policy.add_statement(Statement("s3:GetObject", resource, effect="Deny",
+                                   condition={less_than: {key: past}}))
+    client.put_bucket_policy(Bucket=bucket_name, Policy=policy.to_json())
+    expect_allowed()
+
+@pytest.mark.bucket_policy
+def test_bucket_policy_condition_current_time():
+    # aws:CurrentTime holds the request time as an ISO 8601 date, for
+    # use with the Date* condition operators.
+    # https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_condition-keys.html#condition-keys-currenttime
+    #
+    # Give an hour of slack either way so clock skew between the test
+    # host and the server can't flip a result.
+    now = datetime.datetime.now(datetime.timezone.utc)
+    past = (now - datetime.timedelta(hours=1)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    future = (now + datetime.timedelta(hours=1)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    _check_time_condition('aws:CurrentTime', 'DateGreaterThan', 'DateLessThan',
+                          past, future)
+
+@pytest.mark.bucket_policy
+def test_bucket_policy_condition_epoch_time_numeric():
+    # aws:EpochTime holds the request time as an integer number of
+    # seconds since the Unix epoch, for use with the Numeric* condition
+    # operators.
+    # https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_condition-keys.html#condition-keys-epochtime
+    now = int(time.time())
+    past = str(now - 3600)
+    future = str(now + 3600)
+    _check_time_condition('aws:EpochTime', 'NumericGreaterThan', 'NumericLessThan',
+                          past, future)
+
+@pytest.mark.bucket_policy
+def test_bucket_policy_condition_epoch_time_date():
+    # aws:EpochTime is also specified to work with the Date* operators,
+    # which accept an epoch value as well as an ISO 8601 one.
+    # https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_condition-keys.html#condition-keys-epochtime
+    now = int(time.time())
+    past = str(now - 3600)
+    future = str(now + 3600)
+    _check_time_condition('aws:EpochTime', 'DateGreaterThan', 'DateLessThan',
+                          past, future)
+
 @pytest.mark.tagging
 @pytest.mark.bucket_policy
 @pytest.mark.fails_on_dbstore
@@ -14878,6 +15180,90 @@ def test_copy_object_ifnonematch_failed():
     body = _get_body(response)
     assert body == 'bar'
 
+@pytest.mark.conditional_write
+@pytest.mark.fails_on_dbstore
+@pytest.mark.parametrize('versioning', [None,
+    pytest.param('Enabled', marks=pytest.mark.versioning)])
+@pytest.mark.parametrize('size', [1, 5*1024*1024])
+def test_copy_object_dest_if_match(versioning, size):
+    client = get_client()
+    bucket = get_new_bucket(client)
+    if versioning:
+        check_configure_versioning_retry(bucket, versioning, versioning)
+    body = 'a' * size
+    src_etag = client.put_object(Bucket=bucket, Key='src', Body=body)['ETag']
+    copy_source = bucket + '/src'
+
+    e = assert_raises(ClientError, client.copy_object, Bucket=bucket, Key='dst', CopySource=copy_source, CopySourceIfMatch=src_etag, IfMatch='*')
+    assert (404, 'NoSuchKey') == _get_status_and_error_code(e.response)
+    e = assert_raises(ClientError, client.copy_object, Bucket=bucket, Key='dst', CopySource=copy_source, CopySourceIfMatch=src_etag, IfMatch='badetag')
+    assert (404, 'NoSuchKey') == _get_status_and_error_code(e.response)
+
+    dst_etag = client.put_object(Bucket=bucket, Key='dst', Body='old')['ETag']
+
+    e = assert_raises(ClientError, client.copy_object, Bucket=bucket, Key='dst', CopySource=copy_source, CopySourceIfMatch=src_etag, IfMatch='badetag')
+    assert (412, 'PreconditionFailed') == _get_status_and_error_code(e.response)
+    e = assert_raises(ClientError, client.copy_object, Bucket=bucket, Key='dst', CopySource=copy_source, CopySourceIfMatch=src_etag, IfMatch=src_etag)
+    assert (412, 'PreconditionFailed') == _get_status_and_error_code(e.response)
+    assert 'old' == _get_body(client.get_object(Bucket=bucket, Key='dst'))
+    if versioning == 'Enabled':
+        assert 1 == len(client.list_object_versions(Bucket=bucket, Prefix='dst')['Versions'])
+
+    response = client.copy_object(Bucket=bucket, Key='dst', CopySource=copy_source, CopySourceIfMatch=src_etag, IfMatch=dst_etag)
+    assert 200 == response['ResponseMetadata']['HTTPStatusCode']
+    assert body == _get_body(client.get_object(Bucket=bucket, Key='dst'))
+    response = client.copy_object(Bucket=bucket, Key='dst', CopySource=copy_source, CopySourceIfMatch=src_etag, IfMatch='*')
+    assert 200 == response['ResponseMetadata']['HTTPStatusCode']
+
+    response = client.delete_object(Bucket=bucket, Key='dst')
+    if versioning:
+        assert response['DeleteMarker']
+    e = assert_raises(ClientError, client.copy_object, Bucket=bucket, Key='dst', CopySource=copy_source, CopySourceIfMatch=src_etag, IfMatch='*')
+    assert (404, 'NoSuchKey') == _get_status_and_error_code(e.response)
+    e = assert_raises(ClientError, client.copy_object, Bucket=bucket, Key='dst', CopySource=copy_source, CopySourceIfMatch=src_etag, IfMatch=src_etag)
+    assert (404, 'NoSuchKey') == _get_status_and_error_code(e.response)
+
+@pytest.mark.conditional_write
+@pytest.mark.fails_on_dbstore
+@pytest.mark.parametrize('versioning', [None,
+    pytest.param('Enabled', marks=pytest.mark.versioning)])
+@pytest.mark.parametrize('size', [1, 5*1024*1024])
+def test_copy_object_dest_if_none_match(versioning, size):
+    client = get_client()
+    bucket = get_new_bucket(client)
+    if versioning:
+        check_configure_versioning_retry(bucket, versioning, versioning)
+    body = 'a' * size
+    src_etag = client.put_object(Bucket=bucket, Key='src', Body=body)['ETag']
+    copy_source = bucket + '/src'
+
+    response = client.copy_object(Bucket=bucket, Key='dst', CopySource=copy_source, CopySourceIfNoneMatch='badetag', IfNoneMatch='*')
+    assert 200 == response['ResponseMetadata']['HTTPStatusCode']
+    assert body == _get_body(client.get_object(Bucket=bucket, Key='dst'))
+
+    e = assert_raises(ClientError, client.copy_object, Bucket=bucket, Key='dst', CopySource=copy_source, CopySourceIfNoneMatch='badetag', IfNoneMatch='*')
+    assert (412, 'PreconditionFailed') == _get_status_and_error_code(e.response)
+    e = assert_raises(ClientError, client.copy_object, Bucket=bucket, Key='dst', CopySource=copy_source, CopySourceIfNoneMatch='badetag', IfNoneMatch=src_etag)
+    assert (412, 'PreconditionFailed') == _get_status_and_error_code(e.response)
+
+    dst_etag = client.put_object(Bucket=bucket, Key='dst', Body='old')['ETag']
+
+    e = assert_raises(ClientError, client.copy_object, Bucket=bucket, Key='dst', CopySource=copy_source, CopySourceIfNoneMatch='badetag', IfNoneMatch=dst_etag)
+    assert (412, 'PreconditionFailed') == _get_status_and_error_code(e.response)
+    assert 'old' == _get_body(client.get_object(Bucket=bucket, Key='dst'))
+    if versioning == 'Enabled':
+        assert 2 == len(client.list_object_versions(Bucket=bucket, Prefix='dst')['Versions'])
+
+    response = client.copy_object(Bucket=bucket, Key='dst', CopySource=copy_source, CopySourceIfNoneMatch='badetag', IfNoneMatch=src_etag)
+    assert 200 == response['ResponseMetadata']['HTTPStatusCode']
+    assert body == _get_body(client.get_object(Bucket=bucket, Key='dst'))
+
+    response = client.delete_object(Bucket=bucket, Key='dst')
+    if versioning:
+        assert response['DeleteMarker']
+    response = client.copy_object(Bucket=bucket, Key='dst', CopySource=copy_source, CopySourceIfNoneMatch='badetag', IfNoneMatch='*')
+    assert 200 == response['ResponseMetadata']['HTTPStatusCode']
+
 # TODO: results in a 404 instead of 400 on the RGW
 @pytest.mark.fails_on_rgw
 def test_object_read_unreadable():
@@ -15344,6 +15730,61 @@ def test_put_bucket_encryption_kms():
     bucket_name = get_new_bucket()
     client = get_client()
     _put_bucket_encryption_kms(client, bucket_name)
+
+def _test_put_bucket_encryption_malformed(rules):
+    bucket_name = get_new_bucket()
+    client = get_client()
+
+    # boto3 won't serialize elements outside its model, so swap in the raw body
+    body = ('<ServerSideEncryptionConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+            + rules + '</ServerSideEncryptionConfiguration>').encode()
+    lf = (lambda **kwargs: kwargs['params'].update(body=body))
+    client.meta.events.register_first('before-call.s3.PutBucketEncryption', lf)
+    e = assert_raises(ClientError, client.put_bucket_encryption, Bucket=bucket_name,
+                      ServerSideEncryptionConfiguration={'Rules': [{}]})
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 400
+    assert error_code == 'MalformedXML'
+
+    # nothing was stored
+    e = assert_raises(ClientError, client.get_bucket_encryption, Bucket=bucket_name)
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 404
+    assert error_code == 'ServerSideEncryptionConfigurationNotFoundError'
+
+_sse_s3_by_default = '<ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault>'
+
+@pytest.mark.bucket_encryption
+def test_put_bucket_encryption_missing_rule():
+    _test_put_bucket_encryption_malformed('')
+
+@pytest.mark.bucket_encryption
+def test_put_bucket_encryption_missing_sse_algorithm():
+    _test_put_bucket_encryption_malformed('<Rule><ApplyServerSideEncryptionByDefault><KMSMasterKeyID>testkey-1</KMSMasterKeyID></ApplyServerSideEncryptionByDefault></Rule>')
+
+@pytest.mark.bucket_encryption
+def test_put_bucket_encryption_misspelled_sse_algorithm():
+    _test_put_bucket_encryption_malformed('<Rule><ApplyServerSideEncryptionByDefault><SseAlgorithm>AES256</SseAlgorithm></ApplyServerSideEncryptionByDefault></Rule>')
+
+@pytest.mark.bucket_encryption
+def test_put_bucket_encryption_misplaced_sse_algorithm():
+    _test_put_bucket_encryption_malformed('<Rule><SSEAlgorithm>AES256</SSEAlgorithm></Rule>')
+
+@pytest.mark.bucket_encryption
+def test_put_bucket_encryption_misspelled_rule():
+    _test_put_bucket_encryption_malformed('<Rules>' + _sse_s3_by_default + '</Rules>')
+
+@pytest.mark.bucket_encryption
+def test_put_bucket_encryption_misspelled_blocked_encryption_types():
+    _test_put_bucket_encryption_malformed('<Rule>' + _sse_s3_by_default + '<BlockedEncryptionType><EncryptionType>SSE-C</EncryptionType></BlockedEncryptionType></Rule>')
+
+@pytest.mark.bucket_encryption
+def test_put_bucket_encryption_misspelled_encryption_type():
+    _test_put_bucket_encryption_malformed('<Rule><BlockedEncryptionTypes><EncryptionTypes>SSE-C</EncryptionTypes></BlockedEncryptionTypes></Rule>')
+
+@pytest.mark.bucket_encryption
+def test_put_bucket_encryption_two_rules():
+    _test_put_bucket_encryption_malformed('<Rule>' + _sse_s3_by_default + '</Rule><Rule><BlockedEncryptionTypes><EncryptionType>SSE-C</EncryptionType></BlockedEncryptionTypes></Rule>')
 
 
 @pytest.mark.sse_s3
@@ -19484,6 +19925,7 @@ def _bucket_logging_cleanup(cleanup_type, logging_type, single_prefix, concurren
         # make sure that only the new objects are logged
         exact_match = True
 
+    time.sleep(20)
     response = client.list_objects_v2(Bucket=log_bucket_name)
     keys = _get_keys(response)
 
@@ -19496,15 +19938,21 @@ def _bucket_logging_cleanup(cleanup_type, logging_type, single_prefix, concurren
         return
 
     if concurrency:
-        assert len(keys) >= 1 and len(keys) <= num_buckets
-    else:
-        if single_prefix and logging_type == 'Journal' and cleanup_type not in ['target', 'updating']:
-            assert len(keys) == 1
-        elif single_prefix and logging_type == 'Standard' and cleanup_type == 'disabling':
-            # A single shared log record is committed but the PutLogging op is not logged
-            assert len(keys) == 1
+        if cleanup_type != 'deletion':
+          assert len(keys) >= 1 and len(keys) <= num_buckets
         else:
-            assert len(keys) == num_buckets
+          assert len(keys) >= 1 and len(keys) <= 2*num_buckets
+    elif single_prefix and logging_type == 'Journal' and cleanup_type not in ['target', 'updating']:
+         assert len(keys) == 1
+    elif single_prefix and logging_type == 'Standard' and cleanup_type == 'disabling':
+          # A single shared log record is committed but the PutLogging op is not logged
+          assert len(keys) == 1
+    elif logging_type == 'Standard' and cleanup_type == 'deletion':
+          #the log object is rolled over in source_bucket_cleanup() and in the log_record for a DeleteBucket op
+         assert len(keys) == 2*num_buckets
+    else:
+        assert len(keys) == num_buckets
+
 
     prefixes = []
     for src_bucket_name in buckets:
@@ -19528,6 +19976,8 @@ def _bucket_logging_cleanup(cleanup_type, logging_type, single_prefix, concurren
     for src_bucket_name in buckets:
         assert _verify_records(body, src_bucket_name, 'REST.PUT.OBJECT', src_names, logging_type, num_keys, exact_match)
         assert _verify_records(body, src_bucket_name, 'REST.DELETE.OBJECT', src_names, logging_type, num_keys, exact_match)
+        if cleanup_type == 'deletion' and logging_type == 'Standard':
+          assert _verify_records(body, src_bucket_name, 'REST.DELETE.BUCKET', buckets, logging_type, 1, exact_match)
 
 
 @pytest.mark.bucket_logging
@@ -19855,11 +20305,14 @@ def _bucket_logging_partial_cleanup(cleanup_type, logging_type, concurrency):
         assert flushed_obj in keys
 
     if concurrency:
-        assert len(keys) >= 1 and len(keys) <= num_buckets
+        if cleanup_type != 'deletion':
+          assert len(keys) >= 1 and len(keys) <= num_buckets
+        else:
+          assert len(keys) >= 1 and len(keys) <= 2*num_buckets
     elif cleanup_type == 'updating':
         assert len(keys) == num_buckets
     elif logging_type == 'Standard' and cleanup_type == 'deletion':
-        assert len(keys) == num_buckets
+        assert len(keys) >=  (2* (num_buckets - 1)) + 1 and len(keys) <= 2 * num_buckets
     else:
         assert len(keys) == 2
 

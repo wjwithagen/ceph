@@ -182,6 +182,11 @@ public:
   /// @return the seq id of the pg stats being sent
   seastar::future<uint64_t> send_pg_stats();
 
+  /// fetch the newest osdmap from the mon, and wait until it is
+  /// applied by all PGs
+  /// @return the epoch of that map
+  seastar::future<epoch_t> wait_for_latest_osdmap();
+
   auto &get_shard_services() {
     return shard_services.local();
   }
@@ -261,10 +266,11 @@ private:
 
   ceph_release_t last_require_osd_release{ceph_release_t::unknown};
 
-  seastar::promise<> stop_acked;
-  void got_stop_ack() {
-    stop_acked.set_value();
-  }
+  // shared_promise so got_stop_ack() can check available() and stay
+  // idempotent: both handle_mark_me_down and committed_osd_maps may
+  // fire in the PRESTOP window.
+  seastar::shared_promise<> stop_acked;
+  void got_stop_ack(const char* from);
   seastar::future<> prepare_to_stop();
   bool should_restart() const;
   seastar::future<> restart();

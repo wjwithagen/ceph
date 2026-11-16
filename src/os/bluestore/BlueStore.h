@@ -1397,8 +1397,11 @@ private:
   * opens both DB and dependant super_meta, FreelistManager and allocator
   * in the proper order
   */
-  int _open_db_and_around(bool read_only, bool to_repair = false,
-            alloc_recovery_policy_t policy = alloc_recovery_policy_t::strict);
+  int _open_db_and_around(
+    bool read_only,
+    bool to_repair = false,
+    alloc_recovery_policy_t policy = alloc_recovery_policy_t::strict,
+    bool replay_deferred = false);
   void _close_db_and_around();
   void _close_around_db();
 
@@ -1517,7 +1520,7 @@ public:
 private:
   void _deferred_submit_unlock(OpSequencer *osr);
   void _deferred_aio_finish(OpSequencer *osr);
-  int _deferred_replay();
+  int _deferred_replay(std::vector<std::string>* keys_to_remove);
   bool _eliminate_outdated_deferred(bluestore_deferred_transaction_t* deferred_txn,
 				    interval_set<uint64_t>& bluefs_extents);
 
@@ -2075,10 +2078,16 @@ public:
   // resets per_pool_omap | pgmeta_omap for onode
   void inject_legacy_omap(coll_t cid, ghobject_t oid);
   void inject_stray_omap(uint64_t head, const std::string& name);
-
   void inject_bluefs_file(std::string_view dir,
-			  std::string_view name,
-			  size_t new_size);
+                          std::string_view name,
+                          size_t new_size);
+  void debug_force_reshard(
+    coll_t cid, ghobject_t oid,
+    const std::vector<bluestore_onode_t::shard_info>& new_shard_info,
+    unsigned shard_index_begin,
+    unsigned shard_index_end,
+    uint32_t spanning_scan_begin,
+    uint32_t spanning_scan_end);
 
   int compact() override;
   bool has_builtin_csum() const override {
@@ -2164,6 +2173,12 @@ public:
     double lat_threshold,
     std::function<std::string (const ceph::timespan& lat)> fn,
     int idx2 = l_bluestore_first);
+
+  debug_point_t<std::function<void()>> dtr_deferred_replay_start;
+  debug_point_t<std::function<void()>> dtr_deferred_replay_end;
+  debug_point_t<std::function<void()>> dtr_init_alloc_done;
+  debug_point_t<std::function<void(const bluestore_deferred_transaction_t&)>>
+    dtr_deferred_replay_track;
 
 private:
   bool _debug_data_eio(const ghobject_t& o) {

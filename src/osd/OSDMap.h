@@ -518,7 +518,8 @@ private:
     CEPH_FEATUREMASK_SERVER_REEF |
     CEPH_FEATUREMASK_SERVER_TENTACLE |
     CEPH_FEATUREMASK_SERVER_UMBRELLA |
-    CEPH_FEATUREMASK_SERVER_VAMPIRE;
+    CEPH_FEATUREMASK_SERVER_VAMPIRE |
+    CEPH_FEATUREMASK_OSD_STRETCH_ZONES;
 
   struct addrs_s {
     mempool::osdmap::vector<std::shared_ptr<entity_addrvec_t> > client_addrs;
@@ -723,6 +724,9 @@ public:
 
   int get_flags() const { return flags; }
   bool test_flag(int f) const { return flags & f; }
+  /// the upgrade to pools over zones is committed: stretch pools follow
+  /// this release's peering rules, and every OSD has OSD_STRETCH_ZONES
+  bool stretch_zones() const { return test_flag(CEPH_OSDMAP_STRETCH_ZONES); }
   void set_flag(int f) { flags |= f; }
   void clear_flag(int f) { flags &= ~f; }
 
@@ -876,6 +880,23 @@ public:
    */
   bool subtree_is_down(int id, std::set<int> *down_cache) const;
   bool containing_subtree_is_down(CephContext *cct, int osd, int subtree_type, std::set<int> *down_cache) const;
+
+  void get_stretch_zones(const pg_pool_t& pool,
+                         std::map<int, std::set<int>>* zone_osds) const;
+  /// How many OSDs acting lacks to reach min_size: in each zone of a
+  /// stretch pool, or else in the whole set.
+  unsigned num_acting_below_min_size(const pg_pool_t& pool, const std::vector<int>& acting) const;
+
+  /// Whether a PG of pool with this acting set can go active and serve
+  /// writes: it lacks no OSD to min_size, and a stretch pool's set can peer.
+  bool acting_set_writeable(const pg_pool_t& pool,
+                            const std::vector<int>& acting,
+                            std::ostream *out = nullptr) const;
+
+  /// Whether up keeps each zone block of an erasure coded pool over zones in
+  /// one zone of its own, as peering needs.
+  bool keeps_zone_blocks(const pg_pool_t& pool, int crush_rule,
+                         const std::vector<int>& up) const;
 
   bool subtree_type_is_down(CephContext *cct, int id, int subtree_type, std::set<int> *down_in_osds, std::set<int> *up_in_osds,
                             std::set<int> *subtree_up, std::unordered_map<int, std::set<int> > *subtree_type_down) const;
@@ -1199,12 +1220,19 @@ public:
   const std::vector<int> pgtemp_undo_primaryfirst(const pg_pool_t& pool,
 			   const pg_t pg,
 			   const std::vector<int>& acting) const;
-  const shard_id_t pgtemp_primaryfirst(const pg_pool_t& pool,
-				       const pg_t pg,
-				       const shard_id_t shard) const;
   shard_id_t pgtemp_undo_primaryfirst(const pg_pool_t& pool,
 					    const pg_t pg,
 					    const shard_id_t shard) const;
+  /// Correct the shard that a pre-Tentacle client gives an op to an
+  /// optimized EC pool with pg_temp: its position in primary-first order.
+  /// The client's map can be older than this one: false if the pool or
+  /// the shard is not in this map.
+  bool undo_pre_tentacle_primaryfirst(spg_t *pgid) const;
+  /// Correct the shard that a client without OSD_STRETCH_ZONES gives an op
+  /// to an optimized EC pool over zones with pg_temp: it computes it from the
+  /// position in primary-first order as if the pool had one zone. False as
+  /// undo_pre_tentacle_primaryfirst().
+  bool undo_pre_stretch_zones_primaryfirst(spg_t *pgid) const;
 
   bool in_removed_snaps_queue(int64_t pool, snapid_t snap) const {
     auto p = removed_snaps_queue.find(pool);
@@ -1253,6 +1281,31 @@ public:
   bool have_pg_pool(int64_t p) const {
     return pools.count(p);
   }
+  /// true if pool is current target, covering in-progress and complete migration
+  bool is_pool_migration_target(int64_t pid) const {
+    const pg_pool_t *p = get_pg_pool(pid);
+    return p && p->migration_root.has_value();
+  }
+  /// gets original root source pool from the current target
+  int64_t get_pool_migration_root_from_target(int64_t pid) const {
+    const pg_pool_t *p = get_pg_pool(pid);
+    return (p && p->migration_root) ? *p->migration_root : -1;
+  }
+  /// gets original root source pool from any pool in the chain
+  int64_t get_pool_migration_root(int64_t pid) const {
+    const pg_pool_t *p = get_pg_pool(pid);
+    if (!p)
+      return -1;
+    if (p->migration_root) // this is current target, get root
+      return *p->migration_root;
+    if (p->migration_target) { // this is a source stub, get root from our target
+      const pg_pool_t *tip = get_pg_pool(*p->migration_target);
+      if (tip && tip->migration_root)
+        return *tip->migration_root;
+    }
+    return -1;
+  }
+
   const pg_pool_t* get_pg_pool(int64_t p) const {
     auto i = pools.find(p);
     if (i != pools.end())
@@ -1632,7 +1685,7 @@ public:
   void print_osd(int id, std::ostream& out) const;
   void print_osds(std::ostream& out) const;
   void print_pools(CephContext *cct, std::ostream& out,
-                   bool show_rule_names = false) const;
+                   bool show_rule_names = false, bool show_all = false) const;
   void print_summary(ceph::Formatter *f, std::ostream& out,
 		     const std::string& prefix, bool extra=false) const;
   void print_oneline_summary(std::ostream& out) const;
@@ -1658,10 +1711,12 @@ public:
   static void dump_erasure_code_profiles(
     const mempool::osdmap::map<std::string,std::map<std::string,std::string> > &profiles,
     ceph::Formatter *f);
-  void dump(ceph::Formatter *f, CephContext *cct = nullptr) const;
+  void dump(ceph::Formatter *f, CephContext *cct = nullptr,
+	    bool with_read_balance = true) const;
   void dump_osd(int id, ceph::Formatter *f) const;
   void dump_osds(ceph::Formatter *f) const;
-  void dump_pool(CephContext *cct, int64_t pid, const pg_pool_t &pdata, ceph::Formatter *f) const;
+  void dump_pool(CephContext *cct, int64_t pid, const pg_pool_t &pdata, ceph::Formatter *f,
+		 bool with_read_balance) const;
   void dump_read_balance_score(CephContext *cct, int64_t pid, const pg_pool_t &pdata, ceph::Formatter *f) const;
   static std::list<OSDMap> generate_test_instances();
   bool check_new_blocklist_entries() const { return new_blocklist_entries; }

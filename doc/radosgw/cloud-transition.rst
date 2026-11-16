@@ -129,6 +129,12 @@ Cloud Transition Specific Configurables
   bucket rather than sharing a common target. Defaults to ``false`` to
   preserve the legacy behavior.
 
+  When RGW creates a destination bucket, the CreateBucket request carries
+  the tags of the source bucket. On AWS this requires ``s3:TagResource``
+  in addition to ``s3:CreateBucket``. If the request with tags fails,
+  RGW retries without tags. A destination bucket that already exists
+  keeps its tags.
+
 * ``target_by_bucket_prefix`` (string)
 
   Optional template used when ``target_by_bucket`` is true to derive the
@@ -493,7 +499,10 @@ For versioned objects:
 
 * For non-current versions, the ``retain_head_object`` setting applies.
 
-* If a non-current version is locked, its transition is skipped.
+* If a version, current or non-current, is locked (it has an unexpired
+  object lock retention period or a legal hold), its transition is skipped,
+  so its data stays in the cluster. It is transitioned by a later
+  lifecycle run once the lock no longer applies.
 
 
 Restoring Objects

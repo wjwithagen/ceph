@@ -488,6 +488,8 @@ void usage(const char *prog)
   cout << "        [--pool-snaps]" << std::endl;
   cout << "        [--balance-reads]" << std::endl;
   cout << "        [--localize-reads]" << std::endl;
+  cout << "        [--crush-location <loc>]   set client crush_location for zone-aware reads," << std::endl;
+  cout << "                                   e.g. --crush-location datacenter=zone-0" << std::endl;
   cout << "        [--offlen_randomization_ratio <0-100>]" << std::endl;
   cout << "        [--write-fadvise-dontneed]" << std::endl;
   cout << "        [--max-attr-len <bytes>]" << std::endl;
@@ -498,6 +500,11 @@ void usage(const char *prog)
   cout << "        [--dedup_chunk_algo <fastcdc|fixcdc>]" << std::endl;
   cout << "        [--dedup_chunk_size <bytes>]" << std::endl;
   cout << "        [--timestamps]" << std::endl;
+  cout << "        [--migrate-pool]" << std::endl;
+  cout << "        [--migration-enable-ec-optimizations]" << std::endl;
+  cout << "        [--initial-migration-delay <int>]" << std::endl;
+  cout << "        [--migration-interval <int>]" << std::endl;
+  cout << "        [--migration-pg-count <int>]" << std::endl;
   cout << std::endl;
   cout << "Model-based RADOS integration stress test. Verifies data correctness by" << std::endl;
   cout << "comparing object data and metadata returned by RADOS against an in-memory model." << std::endl;
@@ -568,6 +575,7 @@ int main(int argc, char **argv)
   bool balance_reads = false;
   bool localize_reads = false;
   uint64_t min_split_size = UINT64_MAX;
+  string crush_location;  // --crush-location value; sets crush_location config key
   uint8_t offlen_randomization_ratio = 50;
   bool set_redirect = false;
   bool set_chunk = false;
@@ -576,7 +584,11 @@ int main(int argc, char **argv)
   string chunk_algo = "";
   string chunk_size = "";
   size_t max_attr_len = 20000;
-
+  bool migrate_pool = false;
+  bool migration_ec_opts = false;
+  int migration_interval = 60;
+  std::optional<int> migration_pg_num;
+  int initial_migration_delay = 0;
 
   for (int i = 1; i < argc; ++i) {
     if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
@@ -608,7 +620,14 @@ int main(int argc, char **argv)
       min_split_size = atoi(argv[++i]);
     else if (strcmp(argv[i], "--localize-reads") == 0)
       localize_reads = true;
-    else if (strcmp(argv[i], "--offlen_randomization_ratio") == 0)
+    else if (strcmp(argv[i], "--crush-location") == 0) {
+      if (i + 1 >= argc) {
+        cerr << "Missing argument after --crush-location" << std::endl;
+        usage(argv[0]);
+        exit(1);
+      }
+      crush_location = argv[++i];
+    } else if (strcmp(argv[i], "--offlen_randomization_ratio") == 0)
       offlen_randomization_ratio = atoi(argv[++i]);
     else if (strcmp(argv[i], "--pool-snaps") == 0)
       pool_snaps = true;
@@ -690,6 +709,16 @@ int main(int argc, char **argv)
       chunk_size = argv[++i];
     } else if (strcmp(argv[i], "--timestamps") == 0) {
       timestamp = true;
+    } else if (strcmp(argv[i], "--migrate-pool") == 0) {
+      migrate_pool = true;
+    } else if (strcmp(argv[i], "--migration-enable-ec-optimizations") == 0) {
+      migration_ec_opts = true;
+    } else if (strcmp(argv[i], "--initial-migration-delay") == 0) {
+      initial_migration_delay = atoi(argv[++i]);
+    } else if (strcmp(argv[i], "--migration-interval") == 0) {
+      migration_interval = atoi(argv[++i]);
+    } else if (strcmp(argv[i], "--migration-pg-count") == 0) {
+      migration_pg_num = atoi(argv[++i]);
     } else {
       cerr << "unknown arg " << argv[i] << std::endl;
       usage(argv[0]);
@@ -766,7 +795,13 @@ int main(int argc, char **argv)
     chunk_algo,
     chunk_size,
     max_attr_len,
+    migrate_pool,
+    migration_ec_opts,
+    migration_interval,
+    migration_pg_num,
+    initial_migration_delay,
     min_split_size,
+    crush_location,
     id);
 
   TestOpStat stats;

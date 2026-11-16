@@ -73,7 +73,7 @@ cluster nodes:
    # echo validate the placement then run
    # ceph orch apply -i /tmp/mds.zac.spec
 
-See also :ref:`orchestrator-cli-cephfs` for more information information
+See also :ref:`orchestrator-cli-cephfs` for more information
 regarding placement.
 
 When the cluster is running Ceph Tentacle (20.2.0) or later, one may condense these
@@ -527,6 +527,42 @@ involve the retained snapshots.
 
 .. note:: Retained snapshots can be used as clone sources for recreating the
    subvolume or for cloning to a newer subvolume.
+
+Pinning the Trash Folder
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+The trash folder is ``/volumes/_deleting``. When a subvolume is removed and no
+snapshots are retained, the whole subvolume is moved into this folder, and the
+``volumes`` Manager module deletes its files and directories from there.
+Removing a large subvolume therefore sends many unlink requests to the MDS rank
+that holds ``/volumes/_deleting``, which is the rank that holds ``/volumes``,
+usually rank 0. If the file system has more than one active MDS, you can pin
+the trash folder to another rank to keep this load off rank 0. To do so, mount
+the file system and run a command of the following form (see
+:ref:`cephfs-pinning`):
+
+.. prompt:: bash #
+
+   setfattr -n ceph.dir.pin -v <rank> <mount_point>/volumes/_deleting
+
+This pin does not move every purge to that rank:
+
+* A subvolume that has its own pin, set with ``ceph fs subvolume pin``, keeps
+  that pin in the trash folder. Its contents are deleted by the rank it is
+  pinned to.
+* A subvolume's data directory is never moved into ``/volumes/_deleting`` on
+  its own. The subvolume's directory is marked with the ``ceph.dir.subvolume``
+  attribute, and the MDS does not allow renames across subvolume boundaries.
+  When the data directory is removed but the subvolume remains, for example
+  when its snapshots are retained with ``--retain-snapshots``, the data
+  directory is moved to a trash folder inside the subvolume, and
+  ``/volumes/_deleting`` gets only a symbolic link to it. The purge follows
+  the link, so the data is deleted by the rank that holds the subvolume.
+
+The MDS migrates a pinned directory to its rank only when the directory is not
+empty. If ``/volumes/_deleting`` is empty when you set the pin, it moves to
+the pinned rank when the next subvolume is moved into it, and it stays there
+after it is empty again.
 
 Resizing a Subvolume
 ~~~~~~~~~~~~~~~~~~~~
@@ -2108,10 +2144,11 @@ instead of getting served. Which eventually causes policy throttles to kick in
 and the Manager becomes unresponsive.
 
 In this event, the volumes plugin can be disabled even though it is an
-``always on`` module in the Manager. To do so, run ``ceph mgr module disable volumes
---yes-i-really-mean-it``. Do note that this command will disable operations
-and remove commands of the volumes plugin since it will disable all CephFS
-services on the Ceph cluster accessed through this plugin.
+``always on`` module in the Manager. To do so, run
+``ceph mgr module force disable volumes --yes-i-really-mean-it`` (Squid 19.2.3
+and later releases). Do note that this command will disable operations and
+remove commands of the volumes plugin since it will disable all CephFS services
+on the cluster accessed through this plugin.
 
 Before resorting to a measure as drastic as this, it is a good idea to try less
 drastic measures and then assess if the file system experience has improved due

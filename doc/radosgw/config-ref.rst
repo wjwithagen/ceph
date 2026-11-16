@@ -72,6 +72,14 @@ instances or all radosgw-admin options can be put into the ``[global]`` or the
 .. confval:: rgw_smb_run_lc_threads
 .. confval:: rgw_smb_run_sync_thread
 
+S3 RDMA Settings
+================
+
+For dependencies, build instructions, deployment examples, and the S3 RDMA
+request protocol, see :ref:`radosgw-s3rdma`. The guide includes the complete
+:ref:`S3 RDMA configuration reference <radosgw-cuobj-config-ref>` and
+:ref:`memory sizing and transfer limits <radosgw-cuobj-buffer-limits>`.
+
 Lifecycle Settings
 ==================
 
@@ -103,6 +111,20 @@ The lifecycle maintenance thread must also be enabled on at least one RGW
 daemon for each zone. 
 
 .. confval:: rgw_enable_lc_threads
+
+Each Ceph Object Gateway that runs lifecycle threads starts a lifecycle run
+once a day, at the start of the window set by
+:confval:`rgw_lifecycle_work_time`, in the host's local time. A run that is
+still going at the end of that window continues until it has processed every
+bucket.
+
+.. confval:: rgw_lifecycle_work_time
+
+In multisite deployments, beginning with the Quincy 17.2.8 and Reef releases,
+every zone processes lifecycle for the buckets that it holds. A zone adds a
+bucket to its lifecycle list when the bucket's lifecycle configuration syncs to
+it, so a zone that is promoted to master keeps processing. To check, run
+``radosgw-admin lc list`` in each zone.
 
 Garbage Collection Settings
 ===========================
@@ -399,7 +421,7 @@ For more information, see `Bucket Notifications`_.
 
 The default behavior is to push indefinitely and as frequently as possible.
 With these settings you can control how long and how often to retry an
-unsuccessful notification by configuring the maximum retention time and/or or
+unsuccessful notification by configuring the maximum retention time and/or
 maximum number of retries.
 The interval between push retries can be configured via the sleep duration
 parameter.

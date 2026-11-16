@@ -2,18 +2,13 @@
 Handling a full Ceph file system
 ================================
 
-When a RADOS cluster reaches its ``mon_osd_full_ratio`` (default
-95%) capacity, it is marked with the OSD full flag.  This flag causes
-most normal RADOS clients to pause all operations until it is resolved
-(for example by adding more capacity to the cluster).
+When a Ceph cluster reaches :confval:`mon_osd_full_ratio`, pools with PGs on
+full OSDs are marked with the ``full`` flag.  Most clients then pause writes
+to those pools until the flag clears.  Reads are not blocked by the full ratio.
 
-The file system has some special handling of the full flag, explained below.
+Kernel CephFS clients experience additional fullness behavior.
 
-Hammer and later
-----------------
-
-Since the Hammer release, a full file system will lead to ENOSPC
-results from:
+A full file system leads to ENOSPC results from:
 
  * Data writes on the client
  * Metadata operations other than deletes and truncates
@@ -41,20 +36,3 @@ when releasing capabilities on files affected by cancelled operations, in
 order to ensure that these cancelled operations do not interfere with
 subsequent access to the data objects by the MDS or other clients.  For
 more on the epoch barrier mechanism, see :ref:`background_blocklisting_and_osd_epoch_barrier`.
-
-Legacy (pre-Hammer) behavior
-----------------------------
-
-In versions of Ceph earlier than Hammer, the MDS would ignore
-the full status of the RADOS cluster, and any data writes from
-clients would stall until the cluster ceased to be full.
-
-There are two dangerous conditions to watch for with this behavior:
-
-* If a client had pending writes to a file, then it was not possible
-  for the client to release the file to the MDS for deletion: this could
-  lead to difficulty clearing space on a full file system
-* If clients continued to create a large number of empty files, the
-  resulting metadata writes from the MDS could lead to total exhaustion
-  of space on the OSDs such that no further deletions could be performed.
-

@@ -210,7 +210,7 @@ class OSDThrasher(Thrasher):
 
         self.ceph_manager = manager
         self.cluster = manager.cluster
-        self.ceph_manager.wait_for_clean()
+        self.ceph_manager.wait_for_clean(wait_for_migration=False)
         osd_status = self.ceph_manager.get_osd_status()
         self.in_osds = osd_status['in']
         self.live_osds = osd_status['live']
@@ -692,6 +692,45 @@ class OSDThrasher(Thrasher):
         self.log('Setting full ratio back to .95')
         self.ceph_manager.raw_cluster_cmd('osd', 'set-full-ratio', '.95')
 
+    def _zones_of_blocks(self, pool, up):
+        """
+        For a pool over zones, the OSDs of each zone the PG uses, each
+        holding size / num_zones of its OSDs. For an erasure coded pool
+        they are in block order: the monitors cancel an upmap that puts a
+        zone block in more than one zone, or two blocks in one zone. They
+        keep an upmap that leaves a replicated PG in fewer zones, and the
+        PG then cannot peer. None when up does not show every zone: a
+        zone is that of any of its OSDs in up.
+        """
+        out = self.ceph_manager.raw_cluster_cmd('osd', 'tree', '-f', 'json')
+        nodes = {n['id']: n for n in json.loads(out)['nodes']}
+        osd_zone = {}
+        zone_osds = {}
+        for zone in nodes.values():
+            if zone['id'] >= 0 or \
+               zone['type_id'] != pool['peering_crush_bucket_barrier']:
+                continue
+            todo = [zone['id']]
+            while todo:
+                node = nodes[todo.pop()]
+                if node['id'] >= 0:
+                    osd_zone[node['id']] = zone['id']
+                    zone_osds.setdefault(zone['id'], []).append(node['id'])
+                todo += node.get('children', [])
+        block = pool['size'] // pool['num_zones']
+        if pool['type'] == 3:
+            zones = []
+            for i in range(0, len(up), block):
+                found = {osd_zone[o] for o in up[i:i + block] if o in osd_zone}
+                zones.append(found.pop() if len(found) == 1 else None)
+        else:
+            zones = list(dict.fromkeys(osd_zone[o] for o in up if o in osd_zone))
+        if len(zones) != pool['num_zones'] or None in zones or \
+           len(set(zones)) != len(zones) or \
+           any(len(zone_osds[z]) < block for z in zones):
+            return None
+        return [zone_osds[z] for z in zones]
+
     def thrash_pg_upmap(self):
         """
         Install or remove random pg_upmap entries in OSDMap
@@ -715,9 +754,21 @@ class OSDThrasher(Thrasher):
                     self.log('No pools; doing nothing')
                     return
                 n = sizes[0]
-                osds = self.in_osds + self.out_osds
-                shuffle(osds)
-                osds = osds[0:n]
+                pool = [x for x in j['pools'] if x['pool'] == poolid][0]
+                if pool.get('num_zones', 1) > 1:
+                    zones = self._zones_of_blocks(pool, pg['up'])
+                    if zones is None:
+                        self.log('No zones for %s; doing nothing' % pgid)
+                        return
+                    # the same share of OSDs in each zone, perhaps swapping zones
+                    shuffle(zones)
+                    osds = []
+                    for zone in zones:
+                        osds += random.sample(zone, n // len(zones))
+                else:
+                    osds = self.in_osds + self.out_osds
+                    shuffle(osds)
+                    osds = osds[0:n]
                 self.log('Setting %s to %s' % (pgid, osds))
                 cmd = ['osd', 'pg-upmap', pgid] + [str(x) for x in osds]
                 self.log('cmd %s' % cmd)
@@ -760,9 +811,27 @@ class OSDThrasher(Thrasher):
                     self.log('No pools; doing nothing')
                     return
                 n = sizes[0]
-                osds = self.in_osds + self.out_osds
-                shuffle(osds)
-                osds = osds[0:n*2]
+                pool = [x for x in j['pools'] if x['pool'] == poolid][0]
+                if pool.get('num_zones', 1) > 1:
+                    zones = self._zones_of_blocks(pool, pg['up'])
+                    if zones is None:
+                        self.log('No zones for %s; doing nothing' % pgid)
+                        return
+                    # each moved OSD stays in its zone
+                    osds = []
+                    for src in pg['up']:
+                        zone = next((z for z in zones if src in z), [])
+                        dsts = [o for o in zone
+                                if o not in pg['up'] and o not in osds]
+                        if dsts and random.random() < .5:
+                            osds += [src, random.choice(dsts)]
+                    if not osds:
+                        self.log('No OSD to move %s to; doing nothing' % pgid)
+                        return
+                else:
+                    osds = self.in_osds + self.out_osds
+                    shuffle(osds)
+                    osds = osds[0:n*2]
                 self.log('Setting %s to %s' % (pgid, osds))
                 cmd = ['osd', 'pg-upmap-items', pgid] + [str(x) for x in osds]
                 self.log('cmd %s' % cmd)
@@ -1013,9 +1082,7 @@ class OSDThrasher(Thrasher):
             timeout=self.config.get('timeout')
             )
         self.log("doing min_size thrashing")
-        self.ceph_manager.wait_for_clean(timeout=180)
-        assert self.ceph_manager.is_clean(), \
-            'not clean before minsize thrashing starts'
+        self.ceph_manager.wait_for_clean(timeout=180, wait_for_migration=False)
         start = time.time()
         while time.time() - start < self.config.get("test_min_size_duration", 1800):
             # look up k and m from all the pools on each loop, in case it
@@ -1077,7 +1144,7 @@ class OSDThrasher(Thrasher):
         self.all_up_in() # revive all OSDs
 
         # Wait until all PGs are active+clean after we have revived all the OSDs
-        self.ceph_manager.wait_for_clean(timeout=self.config.get('timeout'))
+        self.ceph_manager.wait_for_clean(timeout=self.config.get('timeout'), wait_for_migration=False)
 
     def inject_pause(self, conf_key, duration, check_after, should_be_down):
         """
@@ -1270,7 +1337,8 @@ class OSDThrasher(Thrasher):
         # the test *should* fail!
         time.sleep(20)
         self.ceph_manager.wait_for_clean(
-            timeout=self.config.get('timeout')
+            timeout=self.config.get('timeout'),
+            wait_for_migration=False
             )
 
         # now we wait 20s for the backfill replicas to hear about the clean
@@ -1279,7 +1347,8 @@ class OSDThrasher(Thrasher):
         self.kill_osd(mark_down=True, mark_out=True)
         self.log("Waiting for clean again")
         self.ceph_manager.wait_for_clean(
-            timeout=self.config.get('timeout')
+            timeout=self.config.get('timeout'),
+            wait_for_migration=False
             )
         self.log("Waiting for trim")
         time.sleep(int(self.config.get("map_discontinuity_sleep_time", 40)))
@@ -2193,12 +2262,22 @@ class CephManager:
             args = cmd_erasure_code_profile(profile_name, profile)
             self.raw_cluster_cmd(*args)
 
-    def create_erasure_code_crush_rule(self, rule_name, profile):
+    def create_erasure_code_crush_rule(self, rule_name, profile,
+                                       num_zones=None,
+                                       erasure_code_profile_name=None):
         """
         Create an erasure code crush rule that can be used as a parameter
         when creating an erasure coded pool.
+        :param num_zones: if > 1, build a stretch rule that places the k+m
+                          shards of erasure_code_profile_name in each zone,
+                          as a multi-zone pool needs
         """
         with self.lock:
+            if num_zones is not None and int(num_zones) > 1:
+                self.raw_cluster_cmd(
+                    'osd', 'crush', 'rule', 'create-erasure', rule_name,
+                    erasure_code_profile_name, '--num_zones', str(num_zones))
+                return
             args = cmd_ec_crush_profile(rule_name, profile)
             self.raw_cluster_cmd(*args)
 
@@ -2206,7 +2285,9 @@ class CephManager:
                                      erasure_code_profile_name=None,
                                      erasure_code_crush_rule_name=None,
                                      min_size=None,
-                                     erasure_code_use_overwrites=False):
+                                     erasure_code_use_overwrites=False,
+                                     num_zones=None,
+                                     osd_failure_domain=None):
         """
         Create a pool named unique_pool_X where X is unique.
         """
@@ -2220,12 +2301,15 @@ class CephManager:
                 erasure_code_profile_name=erasure_code_profile_name,
                 erasure_code_crush_rule_name=erasure_code_crush_rule_name,
                 min_size=min_size,
-                erasure_code_use_overwrites=erasure_code_use_overwrites)
+                erasure_code_use_overwrites=erasure_code_use_overwrites,
+                num_zones=num_zones,
+                osd_failure_domain=osd_failure_domain)
         return name
 
     @contextlib.contextmanager
-    def pool(self, pool_name, pg_num=16, erasure_code_profile_name=None):
-        self.create_pool(pool_name, pg_num, erasure_code_profile_name)
+    def pool(self, pool_name, pg_num=16, erasure_code_profile_name=None, num_zones=None):
+        self.create_pool(pool_name, pg_num, erasure_code_profile_name,
+                         num_zones=num_zones)
         yield
         self.remove_pool(pool_name)
 
@@ -2233,7 +2317,10 @@ class CephManager:
                     erasure_code_profile_name=None,
                     erasure_code_crush_rule_name=None,
                     min_size=None,
-                    erasure_code_use_overwrites=False):
+                    erasure_code_use_overwrites=False,
+                    num_zones=None,
+                    osd_failure_domain=None,
+                    pool_type='replicated'):
         """
         Create a pool named from the pool_name parameter.
         :param pool_name: name of the pool being created.
@@ -2243,6 +2330,10 @@ class CephManager:
         :param erasure_code_crush_rule_name: if set and !None create an
                                              erasure coded pool using the crush rule
         :param erasure_code_use_overwrites: if true, allow overwrites
+        :param num_zones: if set, configure the number of zones for pool
+        :param osd_failure_domain: if set, pass --osd_failure_domain to pool create;
+                                   required when num_zones > 1 and the CRUSH topology
+                                   uses a non-default failure domain (e.g. 'osd')
         """
         with self.lock:
             assert isinstance(pool_name, str)
@@ -2254,14 +2345,28 @@ class CephManager:
                             pool_name, str(pg_num),
                             str(pg_num), 'erasure',
                             erasure_code_profile_name]
-
                 if erasure_code_crush_rule_name:
                     cmd_args.extend([erasure_code_crush_rule_name])
 
+                if num_zones is not None:
+                    cmd_args.extend(['--num_zones', str(num_zones)])
+                self.raw_cluster_cmd(*cmd_args)
+            elif pool_type == 'erasure':
+                cmd_args = ['osd', 'pool', 'create',
+                            pool_name, str(pg_num),
+                            str(pg_num), 'erasure']
+                if num_zones is not None:
+                    cmd_args.extend(['--num_zones', str(num_zones)])
+                    if osd_failure_domain is not None:
+                        cmd_args.extend(['--osd_failure_domain', osd_failure_domain])
                 self.raw_cluster_cmd(*cmd_args)
             else:
                 cmd_args = ['osd', 'pool', 'create',
                             pool_name, str(pg_num)]
+                if num_zones is not None:
+                    cmd_args.extend(['--num_zones', str(num_zones)])
+                    if osd_failure_domain is not None:
+                        cmd_args.extend(['--osd_failure_domain', osd_failure_domain])
                 self.raw_cluster_cmd(*cmd_args)
             if min_size is not None:
                 self.raw_cluster_cmd(
@@ -2751,6 +2856,29 @@ class CephManager:
                 num += 1
         return num
 
+    def get_num_active_clean_or_migrating(self):
+        """
+        Get number of active+clean PGs plus any non-clean
+        PGs that are in a migration state.
+        """
+        pgs = self.get_pg_stats()
+        return self._get_num_active_clean_or_migrating(pgs)
+
+    def _get_num_active_clean_or_migrating(self, pgs):
+        num = 0
+        for pg in pgs:
+            if (pg['state'].count('active') and
+                pg['state'].count('clean') and
+                not pg['state'].count('stale')):
+                num += 1
+            elif (pg['state'].count('active') and
+                  not pg['state'].count('stale') and
+                  (pg['state'].count('migrating') or
+                   pg['state'].count('migration_wait') or
+                   pg['state'].count('migration_toofull'))):
+                num += 1
+        return num
+
     def get_is_making_recovery_progress(self):
         """
         Return whether there is recovery progress discernable in the
@@ -2761,6 +2889,28 @@ class CephManager:
         bps = status['pgmap'].get('recovering_bytes_per_sec', 0)
         ops = status['pgmap'].get('recovering_objects_per_sec', 0)
         return kps > 0 or bps > 0 or ops > 0
+
+    def get_is_making_migration_progress(self):
+        """
+        Return whether there is migration progress discernable in the
+        raw cluster status
+        """
+        status = self.raw_cluster_status()
+        bps = status['pgmap'].get('migrating_bytes_per_sec', 0)
+        ops = status['pgmap'].get('migrating_objects_per_sec', 0)
+        return bps > 0 or ops > 0
+
+    def get_is_migration_paused(self):
+        """
+        Return whether there are migration PGs in migration_wait
+        or migration_toofull states
+        """
+        pgs = self.get_pg_stats()
+        for pg in pgs:
+            if (pg['state'].count('migration_wait') or
+                pg['state'].count('migration_toofull')):
+                return True
+        return False
 
     def get_num_active(self):
         """
@@ -2907,9 +3057,11 @@ class CephManager:
         """
         pgs = self.get_pg_stats()
         for pg in pgs:
-           if pg['state'] != 'active+clean':
-             self.log('PG %s is not active+clean' % pg['pgid'])
-             self.log(pg)
+            if not (pg['state'].count('active') and
+                    pg['state'].count('clean') and
+                    not pg['state'].count('stale')):
+                self.log('PG %s is not active+clean' % pg['pgid'])
+                self.log(pg)
 
     def dump_pgs_not_active_down(self):
         """
@@ -2917,9 +3069,9 @@ class CephManager:
         """
         pgs = self.get_pg_stats()
         for pg in pgs:
-           if 'active' not in pg['state'] and 'down' not in pg['state']:
-             self.log('PG %s is not active or down' % pg['pgid'])
-             self.log(pg)
+            if 'active' not in pg['state'] and 'down' not in pg['state']:
+                self.log('PG %s is not active or down' % pg['pgid'])
+                self.log(pg)
 
     def dump_pgs_not_active(self):
         """
@@ -2927,9 +3079,9 @@ class CephManager:
         """
         pgs = self.get_pg_stats()
         for pg in pgs:
-           if 'active' not in pg['state']:
-             self.log('PG %s is not active' % pg['pgid'])
-             self.log(pg)
+            if 'active' not in pg['state']:
+                self.log('PG %s is not active' % pg['pgid'])
+                self.log(pg)
 
     def dump_pgs_not_active_peered(self, pgs):
         for pg in pgs:
@@ -2937,17 +3089,28 @@ class CephManager:
                 self.log('PG %s is not active or peered' % pg['pgid'])
                 self.log(pg)
 
-    def wait_for_clean(self, timeout=1200):
+    def wait_for_clean(self, timeout=1200, wait_for_migration=True):
         """
         Returns true when all pgs are clean.
         """
         self.log("waiting for clean")
         start = time.time()
-        num_active_clean = self.get_num_active_clean()
-        while not self.is_clean():
+        if wait_for_migration:
+            count_func = self._get_num_active_clean
+        else:
+            count_func = self._get_num_active_clean_or_migrating
+        pgs = self.get_pg_stats()
+        last_count = count_func(pgs)
+        while count_func(pgs) != len(pgs):
             if timeout is not None:
                 if self.get_is_making_recovery_progress():
-                    self.log("making progress, resetting timeout")
+                    self.log("making recovery progress, resetting timeout")
+                    start = time.time()
+                elif wait_for_migration and self.get_is_making_migration_progress():
+                    self.log("making migration progress, resetting timeout")
+                    start = time.time()
+                elif wait_for_migration and self.get_is_migration_paused():
+                    self.log("migration paused (waiting or toofull) resetting timeout")
                     start = time.time()
                 else:
                     self.log("no progress seen, keeping timeout for now")
@@ -2956,10 +3119,11 @@ class CephManager:
                         self.dump_pgs_not_active_clean()
                         assert time.time() - start < timeout, \
                             'wait_for_clean: failed before timeout expired'
-            cur_active_clean = self.get_num_active_clean()
-            if cur_active_clean != num_active_clean:
+            pgs = self.get_pg_stats()
+            current_count = count_func(pgs)
+            if current_count != last_count:
                 start = time.time()
-                num_active_clean = cur_active_clean
+                last_count = current_count
             time.sleep(3)
         self.log("clean!")
 
@@ -3501,9 +3665,59 @@ class CephManager:
             self.log("is_degraded_stretch_mode: {0}".format(degraded_stretch_mode))
             return degraded_stretch_mode == 1
         except (TypeError, AttributeError) as e:
-            # Log the error or handle it as needed
             self.log("Error accessing degraded_stretch_mode: {0}".format(e))
             return False
+
+    def is_recovering_stretch_mode(self):
+        """
+        Return whether the cluster is in the transient recovering stretch mode
+        (degraded_stretch_mode cleared but PGs still recovering).
+        """
+        try:
+            osdmap = self.get_osd_dump_json()
+            stretch_mode = osdmap.get('stretch_mode', {})
+            recovering = stretch_mode.get('recovering_stretch_mode', 0)
+            self.log("is_recovering_stretch_mode: {0}".format(recovering))
+            return recovering == 1
+        except (TypeError, AttributeError) as e:
+            self.log("Error accessing recovering_stretch_mode: {0}".format(e))
+            return False
+
+    def wait_for_degraded_stretch_mode(self, timeout=300):
+        """
+        Block until the cluster reports degraded stretch mode.
+        Raises AssertionError if the timeout expires first.
+        """
+        self.log("waiting for degraded stretch mode")
+        start = time.time()
+        while not self.is_degraded_stretch_mode():
+            if timeout is not None:
+                assert time.time() - start < timeout, \
+                    'timeout expired waiting for degraded stretch mode'
+            time.sleep(5)
+        self.log("cluster is in degraded stretch mode")
+
+    def wait_for_healthy_stretch_mode(self, timeout=600):
+        """
+        Block until degraded_stretch_mode == 0 AND recovering_stretch_mode == 0.
+
+        The monitor sets degraded_stretch_mode=0 / recovering_stretch_mode=1 as
+        soon as the second site rejoins, then waits for PGs to finish recovering
+        before clearing recovering_stretch_mode.  Checking only
+        is_degraded_stretch_mode() would exit too early, leaving PGs inactive.
+        Raises AssertionError if the timeout expires first.
+        """
+        self.log("waiting for healthy stretch mode")
+        start = time.time()
+        while True:
+            if not self.is_degraded_stretch_mode() and \
+                    not self.is_recovering_stretch_mode():
+                break
+            if timeout is not None:
+                assert time.time() - start < timeout, \
+                    'timeout expired waiting for healthy stretch mode'
+            time.sleep(10)
+        self.log("cluster has returned to healthy stretch mode")
 
 
 def utility_task(name):

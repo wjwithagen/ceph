@@ -26,6 +26,7 @@
 #include <string_view>
 #include <map>
 #include <memory>
+#include <optional>
 #include <queue>
 
 #include "MDSRank.h"
@@ -51,7 +52,7 @@
 #include "QuarantineManager.h"
 
 #include "include/ceph_fs.h"
-#include "include/filepath.h"
+#include "common/filepath.h"
 #include "include/util.h"
 
 #include "messages/MCacheExpire.h"
@@ -83,6 +84,7 @@
 
 #include "common/debug.h"
 #include "common/errno.h"
+#include "common/likely.h"
 #include "common/perf_counters.h"
 #include "common/safe_io.h"
 
@@ -283,6 +285,12 @@ void MDCache::handle_conf_change(const std::set<std::string>& changed, const MDS
   if (changed.count("mds_use_global_snaprealm_seq_for_subvol")) {
     use_global_snaprealm_seq = g_conf().get_val<bool>("mds_use_global_snaprealm_seq_for_subvol");
     dout(20) << __func__ << " mds_use_global_snaprealm_seq_for_subvol now " << use_global_snaprealm_seq << dendl;
+  }
+  if (changed.count("mds_defer_rejoin_send_for_testing") &&
+      !g_conf().get_val<bool>("mds_defer_rejoin_send_for_testing") &&
+      mds->is_rejoin()) {
+    dout(1) << "mds_defer_rejoin_send_for_testing cleared, retrying rejoins" << dendl;
+    maybe_send_pending_rejoins();
   }
 
   migrator->handle_conf_change(changed, mdsmap);
@@ -3014,6 +3022,7 @@ void MDCache::handle_mds_failure(mds_rank_t who)
   ambiguous_peer_updates.erase(who);
 
   rejoin_gather.insert(who);
+  rejoin_weak_applied.erase(who);
   rejoin_sent.erase(who);        // i need to send another
   rejoin_ack_sent.erase(who);    // i need to send another
   rejoin_ack_gather.erase(who);  // i'll need/get another.
@@ -3022,6 +3031,7 @@ void MDCache::handle_mds_failure(mds_rank_t who)
   dout(10) << " resolve_ack_gather " << resolve_ack_gather << dendl;
   dout(10) << " rejoin_sent " << rejoin_sent << dendl;
   dout(10) << " rejoin_gather " << rejoin_gather << dendl;
+  dout(10) << " rejoin_weak_applied " << rejoin_weak_applied << dendl;
   dout(10) << " rejoin_ack_gather " << rejoin_ack_gather << dendl;
 
  
@@ -4075,6 +4085,7 @@ void MDCache::dump_rejoin_status(Formatter *f) const
 {
   f->open_object_section("rejoin_status");
   f->dump_stream("rejoin_gather") << rejoin_gather;
+  f->dump_stream("rejoin_weak_applied") << rejoin_weak_applied;
   f->dump_stream("rejoin_ack_gather") << rejoin_ack_gather;
   f->dump_unsigned("num_opening_inodes", cap_imports_num_opening);
   f->close_section();
@@ -4100,12 +4111,23 @@ void MDCache::rejoin_start(MDSContext *rejoin_done_)
  *
  * we start out by sending rejoins to everyone in the recovery set.
  *
- * if we are rejoin, send for all regions in our cache.
+ * if we are rejoin, send OP_WEAK for all regions in our cache, but only
+ * to peers that have already reached rejoin (or later). peers still below
+ * rejoin (failed, replay, resolve, or reconnect) are skipped and retried
+ * from handle_mds_map once they catch up.
  * if we are active|stopping, send only to nodes that are rejoining.
  */
 void MDCache::rejoin_send_rejoins()
 {
   dout(10) << "rejoin_send_rejoins with recovery_set " << recovery_set << dendl;
+
+  // Hold every rejoin send, including a survivor's OP_STRONG, so a test can
+  // fail a peer and release the send while that peer is still below rejoin.
+  if (unlikely(g_conf().get_val<bool>("mds_defer_rejoin_send_for_testing"))) {
+    dout(1) << "rejoin_send_rejoins deferred by mds_defer_rejoin_send_for_testing" << dendl;
+    rejoins_pending = true;
+    return;
+  }
 
   if (rejoin_gather.count(mds->get_nodeid())) {
     dout(7) << "rejoin_send_rejoins still processing imported caps, delaying" << dendl;
@@ -4123,20 +4145,40 @@ void MDCache::rejoin_send_rejoins()
   ceph_assert(!migrator->is_exporting());
 
   if (!mds->is_rejoin()) {
+    // Survivor: expect OP_WEAK from peers that are currently rejoining.
+    // Fresh ranks that skipped handle_mds_failure() otherwise crash on
+    // rejoin_gather.count(from) when the first OP_WEAK arrives.
+    for (const auto& rank : recovery_set) {
+      if (rank == mds->get_nodeid() || rejoin_weak_applied.count(rank))
+	continue;
+      if (mds->mdsmap->is_rejoin(rank))
+	rejoin_gather.insert(rank);
+    }
     disambiguate_other_imports();
   }
 
   map<mds_rank_t, ref_t<MMDSCacheRejoin>> rejoins;
+  bool delayed = false;
 
-
-  // if i am rejoining, send a rejoin to everyone.
+  // if i am rejoining, send a rejoin to everyone already in rejoin or later.
   // otherwise, just send to others who are rejoining.
   for (const auto& rank : recovery_set) {
     if (rank == mds->get_nodeid())  continue;  // nothing to myself!
     if (rejoin_sent.count(rank)) continue;     // already sent a rejoin to this node!
-    if (mds->is_rejoin())
+    if (mds->is_rejoin()) {
+      auto st = mds->mdsmap->get_state(rank);
+      if (st < MDSMap::STATE_REJOIN) {
+	// Still owed an OP_WEAK: failed (STATE_NULL), replay, resolve,
+	// or reconnect. rejoins_pending retries this from handle_mds_map
+	// once the peer reaches rejoin.
+	dout(7) << "rejoin_send_rejoins peer mds." << rank
+		<< " not yet rejoin (state "
+		<< ceph_mds_state_name(st) << "), delaying OP_WEAK" << dendl;
+	delayed = true;
+	continue;
+      }
       rejoins[rank] = make_message<MMDSCacheRejoin>(MMDSCacheRejoin::OP_WEAK);
-    else if (mds->mdsmap->is_rejoin(rank))
+    } else if (mds->mdsmap->is_rejoin(rank))
       rejoins[rank] = make_message<MMDSCacheRejoin>(MMDSCacheRejoin::OP_STRONG);
   }
 
@@ -4190,7 +4232,15 @@ void MDCache::rejoin_send_rejoins()
     ceph_assert(dir->is_subtree_root());
     if (dir->is_ambiguous_dir_auth()) {
       // exporter is recovering, importer is survivor.
-      ceph_assert(rejoins.count(dir->authority().first));
+      if (!rejoins.count(dir->authority().first)) {
+	if (!rejoin_sent.count(dir->authority().first)) {
+	  dout(7) << "rejoin_send_rejoins delaying ambiguous subtree " << *dir
+		  << " until exporter mds." << dir->authority().first
+		  << " is sent a rejoin" << dendl;
+	  delayed = true;
+	}
+	continue;
+      }
       ceph_assert(!rejoins.count(dir->authority().second));
       continue;
     }
@@ -4326,7 +4376,7 @@ void MDCache::rejoin_send_rejoins()
     mds->send_message_mds(p.second, p.first);
   }
   rejoin_ack_gather.insert(mds->get_nodeid());   // we need to complete rejoin_gather_finish, too
-  rejoins_pending = false;
+  rejoins_pending = delayed;
 
   // nothing?
   if (mds->is_rejoin() && rejoin_gather.empty()) {
@@ -4508,6 +4558,36 @@ void MDCache::handle_cache_rejoin_weak(const cref_t<MMDSCacheRejoin> &weak)
 {
   mds_rank_t from = mds_rank_t(weak->get_source().num());
 
+  if (!rejoin_gather.count(from)) {
+    // Already applied. A second OP_WEAK while the sender is still in
+    // replay..rejoin must not import caps or bump replica nonces again.
+    // handle_mds_failure() clears this bit and re-arms rejoin_gather.
+    if (rejoin_weak_applied.count(from)) {
+      dout(7) << "handle_cache_rejoin_weak ignoring already-applied OP_WEAK from mds."
+	      << from << dendl;
+      return;
+    }
+    auto st = mds->mdsmap->get_state(from);
+    // OP_WEAK is sent by a recovering peer. A newly active survivor may
+    // not have that peer in rejoin_gather yet; add and continue.
+    if (st >= MDSMap::STATE_REPLAY && st <= MDSMap::STATE_REJOIN) {
+      dout(7) << "handle_cache_rejoin_weak from mds." << from
+	      << " not in rejoin_gather " << rejoin_gather
+	      << ", adding" << dendl;
+      rejoin_gather.insert(from);
+      recovery_set.insert(from);
+    } else {
+      // The sender will not retry (rejoin_sent). The local map may still
+      // show an earlier state; apply the message once it catches up.
+      dout(7) << "handle_cache_rejoin_weak deferring from mds." << from
+	      << " (not in rejoin_gather " << rejoin_gather
+	      << ", state " << ceph_mds_state_name(st) << ")" << dendl;
+      mds->wait_for_mdsmap(mds->mdsmap->get_epoch() + 1,
+			   new C_MDS_RetryMessage(mds, weak));
+      return;
+    }
+  }
+
   // possible response(s)
   ref_t<MMDSCacheRejoin> ack;      // if survivor
   set<vinodeno_t> acked_inodes;  // if survivor
@@ -4541,9 +4621,15 @@ void MDCache::handle_cache_rejoin_weak(const cref_t<MMDSCacheRejoin> &weak)
     }
 
     encode(imported_caps, ack->imported_caps);
+  } else if (!mds->is_rejoin()) {
+    // A delayed OP_WEAK can arrive while we are still in resolve/reconnect.
+    // Defer until rejoin_start() rather than asserting.
+    dout(7) << "handle_cache_rejoin_weak from mds." << from
+	    << " while in " << ceph_mds_state_name(mds->get_state())
+	    << ", waiting for rejoin" << dendl;
+    mds->wait_for_rejoin(new C_MDS_RetryMessage(mds, weak));
+    return;
   } else {
-    ceph_assert(mds->is_rejoin());
-
     // we may have already received a strong rejoin from the sender.
     rejoin_scour_survivor_replicas(from, NULL, acked_inodes, gather_locks);
     ceph_assert(gather_locks.empty());
@@ -4698,6 +4784,7 @@ void MDCache::handle_cache_rejoin_weak(const cref_t<MMDSCacheRejoin> &weak)
   ceph_assert(rejoin_gather.count(from));
   rejoin_gather.erase(from);
   if (survivor) {
+    rejoin_weak_applied.insert(from);
     // survivor.  do everything now.
     for (const auto &p : weak->inode_scatterlocks) {
       CInode *in = get_inode(p.first);
@@ -4832,6 +4919,29 @@ void MDCache::handle_cache_rejoin_strong(const cref_t<MMDSCacheRejoin> &strong)
       return;
     }
     ceph_abort_msg("got unexpected rejoin message during recovery");
+  }
+
+  if (!rejoin_gather.count(from)) {
+    // A survivor that appeared after rejoin_start() (e.g. max_mds scale-up)
+    // was never inserted into rejoin_gather. OP_STRONG is sent only by a
+    // clientreplay, active, or stopping rank.
+    if (mds->mdsmap->is_clientreplay_or_active_or_stopping(from)) {
+      dout(7) << "handle_cache_rejoin_strong from mds." << from
+	      << " not in rejoin_gather " << rejoin_gather
+	      << ", adding" << dendl;
+      rejoin_gather.insert(from);
+      recovery_set.insert(from);
+    } else {
+      // The sender will not retry (rejoin_sent). The local map may still
+      // show an earlier state; apply the message once it catches up.
+      dout(7) << "handle_cache_rejoin_strong deferring from mds." << from
+	      << " (not in rejoin_gather " << rejoin_gather
+	      << ", state " << ceph_mds_state_name(mds->mdsmap->get_state(from))
+	      << ")" << dendl;
+      mds->wait_for_mdsmap(mds->mdsmap->get_epoch() + 1,
+			   new C_MDS_RetryMessage(mds, strong));
+      return;
+    }
   }
 
   // assimilate any potentially dirty scatterlock state
@@ -10689,7 +10799,7 @@ void MDCache::discover_path(CDir *base,
   }
 
   if ((path_locked && want_path.depth() == 1) ||
-      !base->is_waiting_for_dentry(want_path[0].c_str(), snap) || !onfinish) {
+      !base->is_waiting_for_dentry(want_path[0], snap) || !onfinish) {
     discover_info_t& d = _create_discover(from);
     d.ino = base->ino();
     d.pin_base(base->inode);
@@ -10963,15 +11073,21 @@ void MDCache::handle_discover(const cref_t<MDiscover> &dis)
     CDentry::linkage_t *dnl = dn->get_linkage();
 
     // xlocked dentry?
-    //  ...always block on non-tail items (they are unrelated)
-    //  ...allow xlocked tail disocvery _only_ if explicitly requested
+    //  ...allow discovery of an xlocked dentry _only_ if explicitly requested
+    //     (path_locked), and only before the xlocker projects a new linkage.
+    //     The xlocker's witnesses all traverse before it projects. A replica
+    //     added after that gets the old linkage without being a witness, so
+    //     it is never corrected: rename sends it MDentryLink expecting a null
+    //     dentry, and a renamed-away srcdn is never unlinked on it.
     if (dn->lock.is_xlocked()) {
-      // is this the last (tail) item in the discover traversal?
-      if (dis->is_path_locked()) {
+      if (dis->is_path_locked() && !dn->is_projected()) {
 	dout(7) << "handle_discover allowing discovery of xlocked " << *dn << dendl;
       } else if (reply->is_empty()) {
 	dout(7) << "handle_discover blocking on xlocked " << *dn << dendl;
 	dn->lock.add_waiter(SimpleLock::WAIT_RD, new C_MDS_RetryMessage(mds, dis));
+	// an early-replied xlocker defers its journal flush; don't make the
+	// discover (and any peer request behind it) wait for the next tick.
+	mds->locker->nudge_log(&dn->lock);
 	return;
       } else {
 	dout(7) << "handle_discover non-empty reply, xlocked tail " << *dn << dendl;
@@ -14723,6 +14839,20 @@ void MDCache::dump_dir(Formatter *f, CDir *dir, bool dentry_dump) {
 void MDCache::handle_mdsmap(const MDSMap &mdsmap, const MDSMap &oldmap) {
   const mds_rank_t max_mds = mdsmap.get_max_mds();
 
+  // update the ephemeral distributed pin split floor before (re)queueing any
+  // export pins below, since queue_export_pin() consults it to decide whether
+  // a directory needs to be split further
+  if (max_mds <= 1) {
+    export_ephemeral_dist_frag_bits = 0;
+  } else {
+    double want = g_conf().get_val<double>("mds_export_ephemeral_distributed_factor");
+    want *= max_mds;
+    unsigned n = 0;
+    while ((1U << n) < (unsigned)want)
+      ++n;
+    export_ephemeral_dist_frag_bits = n;
+  }
+
   // process export_pin_delayed_queue whenever a new MDSMap received
   auto &q = export_pin_delayed_queue;
   for (auto it = q.begin(); it != q.end(); ) {
@@ -14748,17 +14878,6 @@ void MDCache::handle_mdsmap(const MDSMap &mdsmap, const MDSMap &oldmap) {
     for (auto& in : migrate) {
       in->maybe_export_pin();
     }
-  }
-
-  if (max_mds <= 1) {
-    export_ephemeral_dist_frag_bits = 0;
-  } else {
-    double want = g_conf().get_val<double>("mds_export_ephemeral_distributed_factor");
-    want *= max_mds;
-    unsigned n = 0;
-    while ((1U << n) < (unsigned)want)
-      ++n;
-    export_ephemeral_dist_frag_bits = n;
   }
 }
 
@@ -14856,18 +14975,76 @@ void MDCache::upkeep_main(void)
   }
 }
 
+// Own the metadata used by blockdiff so that asynchronous object scans do not
+// depend on the lifetime or subsequent changes of a cached CInode.
+struct MDCache::FileBlockDiffSnapshot {
+  struct VersionKey {
+    inodeno_t ino;
+    snapid_t first;
+    snapid_t last;
+
+    bool operator==(const VersionKey& other) const {
+      return ino == other.ino && first == other.first && last == other.last;
+    }
+  } version;
+  snapid_t snapid;
+  CInode::mempool_inode inode;
+
+  inodeno_t ino() const { return version.ino; }
+  const CInode::mempool_inode* get_inode() const { return &inode; }
+};
+
+static std::optional<MDCache::FileBlockDiffSnapshot>
+inode_snapshot_view(CInode *in, snapid_t snapid)
+{
+  // The projection and old_inodes are only valid on the auth MDS.
+  if (!in->is_auth()) {
+    return std::nullopt;
+  }
+
+  if (in->first <= snapid && snapid <= in->last) {
+    // A FLUSHSNAP stays in the projection until its journal entry commits.
+    return MDCache::FileBlockDiffSnapshot{
+      {in->ino(), in->first, in->last}, snapid, *in->get_projected_inode()};
+  }
+
+  // Multiversion hardlinks keep historical metadata in the head inode.
+  if (!in->is_head()) {
+    return std::nullopt;
+  }
+
+  snapid_t old_last = in->pick_old_inode(snapid);
+  if (!old_last) {
+    return std::nullopt;
+  }
+
+  const auto& old_inodes = in->get_old_inodes();
+  if (!old_inodes) {
+    return std::nullopt;
+  }
+  auto it = old_inodes->find(old_last);
+  if (it == old_inodes->end()) {
+    return std::nullopt;
+  }
+
+  return MDCache::FileBlockDiffSnapshot{
+    {in->ino(), it->second.first, it->first}, snapid, it->second.inode};
+}
+
 struct C_ListSnapsAggregator : public MDSIOContext {
-  C_ListSnapsAggregator(MDSRank *mds, CInode *in1, CInode *in2, BlockDiff *block_diff,
-			Context *on_finish)
+  C_ListSnapsAggregator(MDSRank *mds,
+                        const MDCache::FileBlockDiffSnapshot *in1,
+                        const MDCache::FileBlockDiffSnapshot *in2,
+                        BlockDiff *block_diff, Context *on_finish)
     : MDSIOContext(mds),
-      in1(in1),
-      in2(in2),
+      in1(*in1),
+      in2(*in2),
       block_diff(block_diff),
       on_finish(on_finish) {
   }
 
   void finish(int r) override {
-    mds->mdcache->aggregate_snap_sets(snap_set_context, in1, in2,
+    mds->mdcache->aggregate_snap_sets(snap_set_context, &in1, &in2,
                                       block_diff, on_finish);
   }
 
@@ -14879,16 +15056,61 @@ struct C_ListSnapsAggregator : public MDSIOContext {
     snap_set_context.push_back(std::move(ssc));
   }
 
-  CInode *in1;
-  CInode *in2;
+  const MDCache::FileBlockDiffSnapshot in1;
+  const MDCache::FileBlockDiffSnapshot in2;
   BlockDiff *block_diff;
   Context *on_finish;
   std::vector<std::unique_ptr<MDCache::SnapSetContext>> snap_set_context;
 };
 
-void MDCache::file_blockdiff(CInode *in1, CInode *in2, BlockDiff *block_diff, uint64_t max_objects,
-			     MDSContext *ctx) {
-  ceph_assert(in1->last <= in2->last);
+void MDCache::file_blockdiff(CInode *in1, snapid_t snapid1,
+                            CInode *in2, snapid_t snapid2,
+                            BlockDiff *block_diff, uint64_t max_objects,
+                            MDSContext *ctx) {
+  ceph_assert(snapid1 <= snapid2);
+
+  auto view2 = inode_snapshot_view(in2, snapid2);
+  if (view2 && !in1->is_auth()) {
+    // in1 is authoritative on another rank. The request is not forwarded
+    // there because in2 decides where it runs, so report the whole file as
+    // changed.
+    dout(10) << __func__ << ": inode1 is not auth, reporting whole file:"
+             << " snapid1=" << snapid1 << " inode1=" << *in1
+             << " snapid2=" << snapid2 << " inode2=" << *in2 << dendl;
+    block_diff->blocks.union_insert(0, view2->get_inode()->size);
+    ctx->complete(0);
+    return;
+  }
+
+  auto view1 = inode_snapshot_view(in1, snapid1);
+  if (!view1 || !view2) {
+    dout(1) << __func__ << ": failed to select inode versions: snapid1="
+            << snapid1 << " inode1=" << *in1 << " snapid2=" << snapid2
+            << " inode2=" << *in2 << dendl;
+    ctx->complete(-ESTALE);
+    return;
+  }
+
+  dout(20) << __func__ << ": snapid1=" << snapid1 << " version1=["
+           << view1->version.first << "," << view1->version.last
+           << "] snapid2=" << snapid2 << " version2=["
+           << view2->version.first << "," << view2->version.last << "]"
+           << dendl;
+
+  if (view1->version == view2->version) {
+    dout(20) << __func__ << ": snaps have same inode version" << dendl;
+    ctx->complete(0);
+    return;
+  }
+
+  file_blockdiff(&*view1, &*view2, block_diff, max_objects, ctx);
+}
+
+void MDCache::file_blockdiff(const FileBlockDiffSnapshot *in1,
+                            const FileBlockDiffSnapshot *in2,
+                            BlockDiff *block_diff, uint64_t max_objects,
+                            MDSContext *ctx) {
+  ceph_assert(in1->snapid <= in2->snapid);
 
   // I think this is not required since the MDS disallows setting
   // layout when truncate_seq > 1.
@@ -14977,14 +15199,16 @@ void MDCache::file_blockdiff(CInode *in1, CInode *in2, BlockDiff *block_diff, ui
 }
 
 void MDCache::aggregate_snap_sets(const std::vector<std::unique_ptr<SnapSetContext>> &snap_set_ctx,
-                                  CInode *in1, CInode *in2, BlockDiff *block_diff, Context *on_finish) {
+                                  const FileBlockDiffSnapshot *in1,
+                                  const FileBlockDiffSnapshot *in2,
+                                  BlockDiff *block_diff, Context *on_finish) {
   dout(20) << __func__ << dendl;
 
   // always signal to the client to request again since request
   // completion is signalled in file_blockdiff().
   int r = 1;
-  snapid_t snapid1 = in1->last;
-  snapid_t snapid2 = in2->last;
+  snapid_t snapid1 = in1->snapid;
+  snapid_t snapid2 = in2->snapid;
   uint64_t scans = snap_set_ctx.size();
 
   interval_set<uint64_t> extents;

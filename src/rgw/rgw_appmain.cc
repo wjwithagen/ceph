@@ -82,6 +82,7 @@
 #ifdef WITH_RADOSGW_DBSTORE
 #include "rgw_sal_dbstore.h"
 #endif
+#include "rgw_cuobj.h"
 #include "rgw_lua_background.h"
 #include "services/svc_zone.h"
 #ifdef WITH_RADOSGW_LANCEDB
@@ -600,6 +601,14 @@ int rgw::AppMain::init_frontends2(RGWLib* rgwlib)
   ratelimiter.reset(new ActiveRateLimiter{dpp->get_cct()});
   ratelimiter->start();
 
+  if (g_conf().get_val<bool>("rgw_cuobj_enabled")) {
+    int cuobj_r = RGWCuObjServer::init(dpp->get_cct());
+    if (cuobj_r < 0) {
+      derr << "WARNING: cuObj RDMA server init failed: " << cuobj_r
+           << " (RDMA acceleration disabled)" << dendl;
+    }
+  }
+
   // initialize RGWProcessEnv
   env.rest = &rest;
   env.auth_registry = rgw::auth::StrategyRegistry::create(
@@ -808,11 +817,12 @@ void rgw::AppMain::init_s3vector()
 
 void rgw::AppMain::shutdown(std::function<void(void)> finalize_async_signals)
 {
-  // stop the realm reloader
-  rgw_pauser.reset();
-  fe_pauser.reset();
+  // stop the realm reloader. its destructor waits for a reload in progress,
+  // which still uses the pausers
   realm_watcher.reset();
   reloader.reset();
+  rgw_pauser.reset();
+  fe_pauser.reset();
 #ifdef WITH_RADOSGW_RADOS
   pusher.reset();
   if (env.driver->get_name() == "rados") {
@@ -870,6 +880,8 @@ void rgw::AppMain::shutdown(std::function<void(void)> finalize_async_signals)
   }
 
   finalize_async_signals(); // callback
+
+  RGWCuObjServer::shutdown();
 
   rgw_tools_cleanup();
   rgw_shutdown_resolver();

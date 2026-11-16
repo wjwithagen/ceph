@@ -15,12 +15,15 @@ The automated upgrade process follows Ceph best practices.  For example:
 .. note::
 
    The Ceph cluster health status is likely to switch to
-   ``HEALTH_WARNING`` during the upgrade.
+   ``HEALTH_WARN`` during the upgrade.
 
 .. note::
 
-   If a cluster host is or becomes unavailable the upgrade will be paused
-   until it is restored.
+   If a host is offline or in maintenance mode, ``ceph orch upgrade start``
+   refuses to start the upgrade. If a host goes offline during the upgrade,
+   cephadm pauses the upgrade and raises the ``UPGRADE_OFFLINE_HOST`` health
+   alert. The upgrade stays paused after the host returns. To continue, run
+   ``ceph orch upgrade resume``.
 
 .. note::
 
@@ -56,9 +59,9 @@ The automated upgrade process follows Ceph best practices.  For example:
 
      ceph config get mgr mgr/cephadm/pg_autoscale_during_upgrade
 
-   If autoscaling was already off before the upgrade, cephadm does not change
-   it unless you have set ``pg_autoscale_during_upgrade`` to ``true`` (opt-in
-   to turn autoscaling on for the duration of the upgrade).
+   If autoscaling was already off before the upgrade, it is still off after
+   the upgrade. Setting ``pg_autoscale_during_upgrade`` to ``true`` tells
+   cephadm to leave the autoscaler as it is. It does not turn autoscaling on.
 
 
 Starting the Upgrade
@@ -129,20 +132,32 @@ This process uses the ceph ``osd ok-to-upgrade`` command.
 
 Requirements:
 
-* For OSD-only upgrades, pass both ``--crush_bucket_type`` and ``--crush_bucket_name``
-  and ``--daemon-types osd`` only. Supported types today are ``host``, ``rack``,
-  and ``chassis``.
+* For OSD-only upgrades, pass ``--crush_bucket_type`` and ``--daemon-types osd``.
+  Supported bucket types today are ``host``, ``rack``, and ``chassis``.
+* ``--crush_bucket_name`` is **optional**:
+
+  * **Type and name both given:** cephadm upgrades OSDs in that one named
+    bucket only.
+  * **Type given, name omitted:** cephadm discovers every CRUSH bucket of
+    that type (via ``osd crush tree``), then upgrades them one at a time, in
+    CRUSH tree order, automatically advancing to the next bucket once the
+    current one finishes. No further operator action is needed between
+    buckets; see `Auto-iterating across all buckets of a type`_ below.
+
 * The Monitor's ``osd ok-to-upgrade`` expects the target **short** Ceph version
   (same shape as ``ceph_version_short`` in ``ceph osd metadata``).
-* If the Monitors indicate to cephadm that no OSDs in the selected CRUSH bucket
-  are okay to upgrade, cephadm will log details and then retry the operation.
+* If the Monitors indicate to cephadm that no OSDs in the current CRUSH bucket
+  are okay to upgrade, cephadm will log details and then retry the operation
+  on that same bucket; it does not skip ahead to the next bucket.
 * If the bucket parameters for a ceph ``osd ok-to-upgrade`` upgrade are not provided,
   cephadm will fall back to the default ceph osd ok-to-stop gate for OSD upgrades.
 * Bucket-scope upgrades apply only to OSDs. CRUSH buckets do not influence upgrades
   of other daemon types, for example Monitors, Managers, and MDSes.
+* The set of buckets (and their membership) is fixed when the upgrade starts.
+  Do not add, remove, or rename CRUSH buckets of the type being upgraded while
+  an upgrade is in progress.
 
-Example
--------
+Single-bucket example (type and name):
 
 .. prompt:: bash #
 
@@ -151,8 +166,45 @@ Example
     --crush_bucket_type rack --crush_bucket_name rack-a
 
 When performing OSD upgrades within this failure domain, cephadm calls
-ceph ``osd ok-to-upgrade`` with the specified bucket name and type, and max set to
+ceph ``osd ok-to-upgrade`` with the specified bucket name, and max set to
 :confval:`mgr/cephadm/max_parallel_osd_upgrades`
+
+.. _Auto-iterating across all buckets of a type:
+
+Auto-iterating across all buckets of a type
+--------------------------------------------
+
+If an operator provides ``--crush_bucket_type`` without
+``--crush_bucket_name``, cephadm looks up every bucket of that type
+(for example every ``rack``, or every ``host``) from the current CRUSH map
+and upgrades them one at a time instead of requiring a separate
+``ceph orch upgrade start`` invocation per bucket:
+
+.. prompt:: bash #
+
+  ceph orch upgrade start --image quay.io/ceph/ceph:v21.2.1 \
+    --daemon-types osd \
+    --crush_bucket_type rack
+
+For each bucket in turn, cephadm:
+
+#. Calls ``osd ok-to-upgrade`` for the current bucket and upgrades the OSDs
+   that the Monitors report as safe to move, the same way as the
+   single-bucket case above.
+#. Once every OSD in the current bucket is on the target image, advances to
+   the next bucket in the (frozen) list and repeats.
+#. After the last bucket finishes, completes the upgrade the same way a
+   normal OSD upgrade does (for example setting ``require_osd_release`` once
+   every OSD in the cluster is on the target version).
+
+The list of buckets is captured once, when the upgrade starts, so later
+changes to the CRUSH map are not picked up mid-upgrade. This also means 
+the upgrade resumes against the same bucket list after a Manager failover, 
+continuing from the bucket that was in progress rather than restarting.
+
+``ceph orch upgrade status`` reports which bucket is currently being
+upgraded along with how many buckets in the list are already complete and
+how many remain, for example:
 
 .. warning:: Do not change the cluster's topology during an OSD upgrade phase.
    This includes the name or type of any CRUSH bucket.
@@ -192,8 +244,8 @@ behavior of upgrading all daemons of the type in one pass.
 Monitoring the Upgrade
 ======================
 
-Determine (1) whether an upgrade is in progress and (2) which version the
-cluster is upgrading to by running the following command:
+Determine (1) whether an upgrade is in progress and (2) which container image
+the cluster is upgrading to by running the following command:
 
 .. prompt:: bash #
 
@@ -212,8 +264,8 @@ looks like this:
 
   [...]
     progress:
-      Upgrade to quay.io/ceph/ceph:v20.2.3 (00h 20m 12s)
-        [=======.....................] (time remaining: 01h 43m 31s)
+      Upgrade to 20.2.3 (20m)
+        [=======.....................] (remaining: 60m)
 
 
 Watching the Cephadm Log During an Upgrade
@@ -236,6 +288,34 @@ You can stop the upgrade process at any time by running the following command:
   ceph orch upgrade stop
 
 
+.. _cephadm-downgrading:
+
+Downgrading
+===========
+
+Ceph does not support downgrading a cluster to an earlier major release.
+Cephadm refuses to start such a downgrade, and it also refuses to move a
+cluster from a stable release to a release candidate or a development release.
+When cephadm has upgraded every OSD to a new major release, it raises the
+``require_osd_release`` flag in the OSD map to that release, so no manual step
+is needed. This is a one-way step: the flag can't be lowered again, and OSDs
+from an earlier release can no longer start.
+
+Cephadm does not prevent a downgrade to an earlier point release of the same
+major release, for example from 20.2.1 to 20.2.0, but such downgrades are not
+supported. They may work in some situations and fail in others. They are not
+recommended, and they are done only at the administrator's risk. If you are
+tempted to downgrade to an earlier point release, consider instead a
+configuration workaround, or an upgrade to a later point release or a later
+major release. You can also build a local custom container image of the
+release you are running with the code fixes you need, for example by
+cherry-picking commits from a later release, and upgrade to that image as
+described in `Using Customized Container Images`_.
+
+To return to an earlier major release, deploy a new cluster at that release
+and migrate or restore the data into it.
+
+
 Post-upgrade Actions
 ====================
 
@@ -248,8 +328,8 @@ Potential Problems
 ==================
 
 
-Error: ENOENT: Module not found
--------------------------------
+Error ENOENT: Module not found
+------------------------------
 
 The message ``Error ENOENT: Module not found`` appears in response to the
 command ``ceph orch upgrade status`` if the orchestrator has crashed:
@@ -306,8 +386,9 @@ following command:
 
 This alert (``UPGRADE_FAILED_PULL``) means that Ceph was unable to pull the
 container image for the target version. This can happen if you specify a
-version or container image that does not exist (e.g. "1.2.3"), or if the
-container registry cannot be reached by one or more hosts in the cluster.
+version or container image that does not exist (e.g.
+``quay.io/ceph/ceph:v20.2.99``), or if the container registry cannot be
+reached by one or more hosts in the cluster.
 
 To cancel the existing upgrade and to specify a different target version, run
 the following commands:
@@ -351,7 +432,7 @@ Using Customized Container Images
 For most users, upgrading requires nothing more complicated than specifying the
 Ceph version to which to upgrade. In such cases, cephadm locates the specific
 Ceph container image to use by combining the :confval:`container_image_base`
-configuration option (default: ``docker.io/ceph/ceph``) with a tag of
+configuration option (default: ``quay.io/ceph/ceph``) with a tag of
 ``vX.Y.Z``.
 
 But it is possible to upgrade to an arbitrary container image, if that's what
@@ -432,10 +513,14 @@ Example: specifying services and using limit:
    * ``grafana``
    * ``loki``
    * ``promtail``
+   * ``alloy``
+   * ``pushgateway``
+   * ``mgmt-gateway``
+   * ``oauth2-proxy``
 
    If you specify parameters that would upgrade daemons out of order, the
-   upgrade command will block and note which daemons will be missed if
-   you proceed.
+   upgrade command fails with ``Cannot start upgrade.`` and names the daemons
+   that you must upgrade first.
 
 .. note::
 
@@ -519,4 +604,4 @@ For example:
 
 .. prompt:: bash #
 
-  ceph orch update service prometheus quay.io/prometheus/prometheus:v2.55.1
+  ceph orch update service prometheus quay.io/prometheus/prometheus:v3.6.0

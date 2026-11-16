@@ -26,6 +26,7 @@
 #include <boost/random/mersenne_twister.hpp>
 #include <boost/random/uniform_int.hpp>
 #include <boost/random/binomial_distribution.hpp>
+#include <random>
 #include <fmt/format.h>
 #include <gtest/gtest.h>
 #include <limits.h>
@@ -4240,6 +4241,49 @@ TEST_P(StoreTest, SimpleCloneRangeTest) {
     ObjectStore::Transaction t;
     t.remove(cid, hoid);
     t.remove(cid, hoid2);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+}
+
+/* Cloning the whole of a smaller object to the start of a larger one must
+ * leave the rest of the larger one alone. */
+TEST_P(StoreTest, CloneRangeOfSmallerObject) {
+  int r;
+  coll_t cid;
+  auto ch = store->create_new_collection(cid);
+  {
+    ObjectStore::Transaction t;
+    t.create_collection(cid, 0);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+  ghobject_t src(hobject_t(sobject_t("src", CEPH_NOSNAP)));
+  src.hobj.pool = -1;
+  ghobject_t dst(hobject_t(sobject_t("dst", CEPH_NOSNAP)));
+  dst.hobj.pool = -1;
+  bufferlist a, b;
+  a.append(std::string(3 * 4096, 'a'));
+  b.append(std::string(4096, 'b'));
+  {
+    ObjectStore::Transaction t;
+    t.write(cid, dst, 0, a.length(), a);
+    t.write(cid, src, 0, b.length(), b);
+    t.clone_range(cid, src, dst, 0, b.length(), 0);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+  bufferlist expected, got;
+  expected.append(b);
+  expected.append(std::string(2 * 4096, 'a'));
+  r = store->read(ch, dst, 0, a.length(), got);
+  ASSERT_EQ(r, (int)a.length());
+  ASSERT_TRUE(bl_eq(expected, got));
+  {
+    ObjectStore::Transaction t;
+    t.remove(cid, src);
+    t.remove(cid, dst);
+    t.remove_collection(cid);
     r = queue_transaction(store, ch, std::move(t));
     ASSERT_EQ(r, 0);
   }
@@ -10299,6 +10343,69 @@ TEST_P(StoreTestSpecificAUSize, SmallWriteOnShardedExtents) {
   }
 }
 
+TEST_P(StoreTestSpecificAUSize, SmallWriteNear4GiBShardedOnode) {
+  if (string(GetParam()) != "bluestore")
+    GTEST_SKIP();
+  SetVal(g_conf(), "bluestore_write_v2", "false");
+  StartDeferred(4096);
+
+  int r;
+  coll_t cid;
+  ghobject_t hoid(hobject_t(sobject_t("Near4G", CEPH_NOSNAP)));
+  hoid.hobj.pool = -1;
+  auto ch = store->create_new_collection(cid);
+  {
+    ObjectStore::Transaction t;
+    t.create_collection(cid, 0);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+  // Build an extent map large enough to be sharded (> shard_max_size bytes),
+  // placed well above 0 so that shard 0 covers [0, ~1MiB) and the shard that
+  // covers the top of the object is not shard 0.
+  bufferlist bl4k;
+  bl4k.append(std::string(0x1000, 'x'));
+  for (unsigned batch = 0; batch < 6; ++batch) {
+    ObjectStore::Transaction t;
+    for (unsigned i = 0; i < 100; ++i) {
+      uint64_t off = 0x100000 + (batch * 100 + i) * 0x2000;
+      t.write(cid, hoid, off, bl4k.length(), bl4k);
+    }
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+  // force the onode to be reloaded from disk so shards are really used
+  ch.reset();
+  ASSERT_EQ(0, store->umount());
+  ASSERT_EQ(0, store->mount());
+  ch = store->open_collection(cid);
+
+  // small (< min_alloc_size) write near the 4GiB limit; legal for _write()
+  const uint64_t off = 0xffffe000;
+  bufferlist small;
+  small.append(std::string(0x800, 'y'));
+  ASSERT_LT(off + small.length(), 0xffffffffull);
+  {
+    ObjectStore::Transaction t;
+    t.write(cid, hoid, off, small.length(), small);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+  {
+    bufferlist got;
+    r = store->read(ch, hoid, off, small.length(), got);
+    ASSERT_EQ((int)small.length(), r);
+    ASSERT_TRUE(bl_eq(small, got));
+  }
+  {
+    ObjectStore::Transaction t;
+    t.remove(cid, hoid);
+    t.remove_collection(cid);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+}
+
 TEST_P(StoreTestSpecificAUSize, ReproBug56488Test) {
 
   if (string(GetParam()) != "bluestore")
@@ -11033,6 +11140,107 @@ TEST_P(StoreTestSpecificAUSize, BluestoreRepairSharedBlobTest) {
   ASSERT_EQ(bstore->fsck(false), 0);
 
   cerr << "Completing" << std::endl;
+  bstore->mount();
+}
+
+// Repair of a broken shared blob must rebuild references for every pextent
+// of the blobs sharing it, not only the first one, and the repaired record
+// must allow the extents to be released again.
+TEST_P(StoreTestSpecificAUSize, BluestoreRepairSharedBlobMultiPextent) {
+  if (string(GetParam()) != "bluestore")
+    return;
+
+  SetVal(g_conf(), "bluestore_fsck_on_mount", "false");
+  SetVal(g_conf(), "bluestore_fsck_on_umount", "false");
+  SetVal(g_conf(), "bluestore_allocator", "avl");
+
+  const size_t block_size = 0x1000;
+  StartDeferred(block_size);
+
+  BlueStore* bstore = dynamic_cast<BlueStore*> (store.get());
+
+  const uint64_t pool = 555;
+  coll_t cid(spg_t(pg_t(0, pool), shard_id_t::NO_SHARD));
+  auto ch = store->create_new_collection(cid);
+
+  ghobject_t hoid = make_object("Object 1", pool);
+  ghobject_t hoid_cloned = hoid;
+  hoid_cloned.hobj.snap = 1;
+  ghobject_t hoid2 = make_object("Object 2", pool);
+
+  bufferlist bl;
+  bl.append(string(block_size, 'x'));
+  int r;
+  {
+    ObjectStore::Transaction t;
+    t.create_collection(cid, 0);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+  {
+    // the write to hoid2 in between leaves hoid's blob with two pextents
+    ObjectStore::Transaction t;
+    t.write(cid, hoid, 0, bl.length(), bl);
+    t.write(cid, hoid2, 0, bl.length(), bl);
+    t.write(cid, hoid, block_size * 2, bl.length(), bl);
+    t.clone(cid, hoid, hoid_cloned);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+  ch.reset(nullptr);
+  bstore->umount();
+  ASSERT_EQ(bstore->fsck(false), 0);
+  bstore->mount();
+
+  string key;
+  _key_encode_u64(1, &key);
+  bluestore_extent_ref_map_t original;
+  {
+    bufferlist bl;
+    bluestore_shared_blob_t sb(1);
+    ASSERT_EQ(bstore->get_shared_blob(key, bl), 0);
+    decode(sb, bl);
+    ASSERT_EQ(sb.ref_map.ref_map.size(), 2u);
+    original = sb.ref_map;
+    // break it: an extra reference on the second pextent
+    auto it = std::next(sb.ref_map.ref_map.begin());
+    sb.ref_map.get(it->first, block_size);
+    bl.clear();
+    encode(sb, bl);
+    bstore->inject_broken_shared_blob_key(key, bl);
+  }
+  bstore->umount();
+  ASSERT_GT(bstore->fsck(false), 0);
+  ASSERT_EQ(bstore->repair(false), 0);
+  bstore->mount();
+  {
+    bufferlist bl;
+    bluestore_shared_blob_t sb(1);
+    ASSERT_EQ(bstore->get_shared_blob(key, bl), 0);
+    decode(sb, bl);
+    EXPECT_EQ(original, sb.ref_map);
+  }
+  bstore->umount();
+  EXPECT_EQ(bstore->fsck(false), 0);
+  bstore->mount();
+
+  // releasing the shared extents must work with the repaired record
+  ch = store->open_collection(cid);
+  {
+    ObjectStore::Transaction t;
+    t.remove(cid, hoid_cloned);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+  {
+    ObjectStore::Transaction t;
+    t.remove(cid, hoid);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+  ch.reset(nullptr);
+  bstore->umount();
+  EXPECT_EQ(bstore->fsck(false), 0);
   bstore->mount();
 }
 
@@ -13581,6 +13789,151 @@ TEST_P(StoreTestSpecificAUSize, OverwriteDeferredV2Test) {
 
   doOverwriteDeferredTest(store.get(), true);
 }
+typedef std::mt19937 gen_type_2;
+gen_type_2 rng = gen_type_2(0);
+uniform_int_distribution<> random_byte =
+    uniform_int_distribution<>(0, 200); //'!', '~');
+
+std::string random_string(uint32_t msg_size)
+{
+  std::string result;
+  uint32_t s = 0;
+  result.reserve(msg_size);
+  while (s < msg_size) {
+    result.push_back(random_byte(rng));
+    s++;
+  }
+  return result;
+}
+
+TEST_P(StoreTestSpecificAUSize, WriteV2CompressReject64K) {
+
+  if(string(GetParam()) != "bluestore")
+    return;
+
+  SetVal(g_conf(), "bluestore_write_v2", "true");
+  SetVal(g_conf(), "bluestore_compression_algorithm", "snappy");
+  SetVal(g_conf(), "bluestore_compression_mode", "force");
+  SetVal(g_conf(), "bluestore_default_buffered_write", "false");
+
+  g_conf().apply_changes(nullptr);
+
+  StartDeferred(65536);
+
+  int r;
+  coll_t cid;
+  ghobject_t hoid(hobject_t(sobject_t("Object 1", CEPH_NOSNAP)));
+
+  auto ch = store->create_new_collection(cid);
+  {
+    ObjectStore::Transaction t;
+    t.create_collection(cid, 0);
+    cerr << "Creating collection " << cid << std::endl;
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+  {
+    bool exists = store->exists(ch, hoid);
+    ASSERT_TRUE(!exists);
+
+    ObjectStore::Transaction t;
+    t.touch(cid, hoid);
+    cerr << "Creating object " << hoid << std::endl;
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+
+    exists = store->exists(ch, hoid);
+    ASSERT_EQ(true, exists);
+  }
+
+  uint32_t blob_size = 128 * 1024;
+  uint32_t object_size = blob_size * 8;
+  string object_content = random_string(object_size);
+  bufferlist object_content_bl;
+  object_content_bl.append(object_content);
+
+  //1. fill with random data
+  for (uint32_t offs = 0; offs < object_size; offs += blob_size) {
+    bufferlist bl;
+    string msg = object_content.substr(offs, blob_size);
+    bl.append(msg);
+    ObjectStore::Transaction t;
+    C_SaferCond c;
+    t.register_on_commit(&c);
+    t.write(cid, hoid, offs, bl.length(), bl);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+    c.wait();
+  }
+  //00000~20000 blob A
+  //20000~20000 blob B
+  //40000~20000 blob C
+  //60000~20000 blob D
+  //80000~20000 blob E
+  //a0000~20000 blob F
+  //c0000~20000 blob G
+  //e0000~20000 blob H
+  //2. force known sharding
+  BlueStore* bstore = dynamic_cast<BlueStore*>(store.get());
+  std::vector<bluestore_onode_t::shard_info> new_shard_info;
+  new_shard_info.emplace_back(0, 0);
+  new_shard_info.emplace_back(0x30000, 0);
+  new_shard_info.emplace_back(0x90000, 0);
+  bstore->debug_force_reshard(cid, hoid, new_shard_info, 0, 0, 0, 0);
+  //00000~20000 blob A  shard a
+  //20000~10000 blob B1 shard a
+  //30000~10000 blob B2 shard b
+  //40000~20000 blob C  shard b
+  //60000~20000 blob D  shard b
+  //80000~10000 blob E1 shard b
+  //90000~10000 blob E2 shard c
+  //a0000~20000 blob F  shard c
+  //c0000~20000 blob G  shard c
+  //e0000~20000 blob H  shard c
+  //3. overwrite
+  bufferlist bl;
+  string msg = object_content.substr(0x50000, 128 * 1024);
+  bl.append(msg);
+  ObjectStore::Transaction t;
+  C_SaferCond c;
+  t.register_on_commit(&c);
+  t.write(cid, hoid, 0x50000, bl.length(), bl);
+  // the default 0x20000 scan around during recompression makes
+  // the affected range 0x50000~0x20000 -> 0x30000~0x60000
+  r = queue_transaction(store, ch, std::move(t));
+  ASSERT_EQ(r, 0);
+  c.wait();
+  //00000~20000 blob A  shard a
+  //20000~20000 blob B  shard a <- modified not written
+  //range 30000~10000           <- not in shard marked to write
+  //40000~20000 blob C  shard b
+  //60000~20000 blob D  shard b
+  //80000~10000 blob E1 shard b
+  //90000~10000 blob E2 shard c
+  //a0000~20000 blob F  shard c
+  //c0000~20000 blob G  shard c
+  //e0000~20000 blob H  shard c
+  // unload hoid's ExtentMap
+  ch.reset();
+  EXPECT_EQ(store->umount(), 0);
+  EXPECT_EQ(store->mount(), 0);
+  ch = store->open_collection(cid);
+  //00000~20000 blob A  shard a
+  //20000~10000 blob B1 shard a
+  //30000~10000                 <- missing!
+  //40000~20000 blob C  shard b
+  //60000~20000 blob D  shard b
+  //80000~10000 blob E1 shard b
+  //90000~10000 blob E2 shard c
+  //a0000~20000 blob F  shard c
+  //c0000~20000 blob G  shard c
+  //e0000~20000 blob H  shard c
+  bufferlist object_content_read;
+  r = store->read(ch, hoid, 0, object_size, object_content_read);
+  EXPECT_EQ(r, (int)object_size);
+  EXPECT_TRUE(bl_eq(object_content_read, object_content_bl));
+}
+
 #endif  // WITH_BLUESTORE
 
 int main(int argc, char **argv) {

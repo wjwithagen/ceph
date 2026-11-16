@@ -117,6 +117,11 @@ protected:
     info.bucket.tenant = "tenant";
     info.layout.current_index.layout.type = rgw::BucketIndexType::Normal;
     info.layout.current_index.layout.normal.num_shards = 1;
+
+    // make sure logs vector is not empty
+    rgw::bucket_log_layout_generation bllg;
+    info.layout.logs.push_back(bllg);
+    
     return info;
   }
 
@@ -182,6 +187,38 @@ TEST_P(BucketInstanceMetadata, RejectBucketTypeChanges) {
   EXPECT_EQ(-EINVAL, put(incoming, false));
   EXPECT_EQ(0, service.writes);
   EXPECT_EQ(0, index.calls);
+}
+
+TEST_P(BucketInstanceMetadata, PreserveLayoutLogs) {
+  service.exists = true;
+  service.info = bucket_info();
+  service.info.layout.logs.back().gen = 3;
+  // a local update of an existing instance that omits the logs keeps the
+  // stored ones
+  auto incoming = service.info;
+  incoming.layout.logs.clear();
+  EXPECT_EQ(STATUS_APPLIED, put(incoming, false));
+  EXPECT_EQ(1, service.writes);
+  ASSERT_EQ(1u, service.info.layout.logs.size());
+  EXPECT_EQ(3u, service.info.layout.logs.back().gen);
+
+  // but the logs may not end up empty
+  service.info.layout.logs.clear();
+  EXPECT_EQ(-EINVAL, put(incoming, false));
+  EXPECT_EQ(1, service.writes);
+}
+
+TEST_P(BucketInstanceMetadata, IndexlessWithoutLayoutLogs) {
+  // indexless buckets are created without layout logs, so a local update
+  // of an existing indexless instance is accepted with empty logs
+  service.exists = true;
+  service.info = bucket_info();
+  service.info.layout.current_index.layout.type = rgw::BucketIndexType::Indexless;
+  service.info.layout.logs.clear();
+  auto incoming = service.info;
+  EXPECT_EQ(STATUS_APPLIED, put(incoming, false));
+  EXPECT_EQ(1, service.writes);
+  EXPECT_TRUE(service.info.layout.logs.empty());
 }
 
 TEST_P(BucketInstanceMetadata, MetadataSync) {

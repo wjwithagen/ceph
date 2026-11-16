@@ -67,6 +67,7 @@ Synopsis
         [--pool-snaps]
         [--balance-reads]
         [--localize-reads]
+        [--crush-location <loc>]
         [--offlen_randomization_ratio <0-100>]
         [--write-fadvise-dontneed]
         [--max-attr-len <bytes>]
@@ -77,6 +78,12 @@ Synopsis
         [--dedup_chunk_algo <fastcdc|fixcdc>]
         [--dedup_chunk_size <bytes>]
         [--timestamps]
+        [--migrate-pool]
+        [--migration-enable-ec-optimizations]
+        [--initial-migration-delay <seconds>]
+        [--migration-interval <seconds>]
+        [--migration-pg-count <pg_num>]
+
 
 At least one ``--op`` with a positive weight is required.
 
@@ -122,7 +129,7 @@ Pool Type and Behavior
 ``--ec-pool``
     Indicates that the target is an erasure-coded pool **that does not support overwrites**.
     **Must appear before any** ``--op`` **arguments.**
-    
+
     .. note::
 
        This is largely a legacy parameter. When Ceph originally introduced
@@ -133,7 +140,7 @@ Pool Type and Behavior
        prevents the test runner from passing this flag.
 
     Using this flag has the following effects:
-    
+
     1. Implicitly sets ``--no-sparse``.
     2. Initial object creation writes use ``append`` mode instead of ``write``.
     3. Overwrite operations (``write``, ``write_excl``, ``writesame``) are
@@ -150,6 +157,37 @@ Pool Type and Behavior
 ``--pool-snaps``
     Use pool-level snapshots instead of self-managed snapshots.
 
+Pool Migration
+--------------
+
+``--migrate-pool``
+    Begin a pool migration from the pool receiving operations to a new pool.
+    If the migration completes during the test, another be scheduled such that there is
+    always an ongoing migration.
+
+    .. note::
+
+        This will migrate all objects from the original pool to a new pool which has the same name as
+        the original pool, followed by a migration suffix.
+
+``--migration-enable-ec-optimizations``
+    Enable erasure code optimizations on the migration target pool.
+    Pool type must be EC, will have no effect if specified on a non-EC pool.
+
+``--initial-migration-delay <seconds>``
+    How long to wait in seconds after the test has began to
+    start the first pool migration. Default: ``0``.
+
+``--migration-interval <seconds>``
+    How long to wait between successive pool migrations in seconds.
+    Default: ``60``.
+
+``--migration-pg-count <n>``
+    Number of PGs the target migration pool should have (0-65536). If set,
+    successive migrations will flip-flop between the original pool's PG
+    count and the specified number. If not set, target will retain the
+    original pool's PG count.
+
 Read Routing
 ------------
 
@@ -160,6 +198,13 @@ Read Routing
 ``--localize-reads``
     Set ``LIBRADOS_OPERATION_LOCALIZE_READS`` on read operations,
     preferring the closest replica.
+
+``--crush-location <loc>``
+    Set the client's CRUSH location for zone-aware reads (e.g.,
+    ``datacenter=zone-0``).  The location is applied via
+    ``crush_location`` in the librados configuration and influences
+    which OSD shard handles split reads on EC pools.  Has no effect
+    unless the cluster is configured for zone-aware placement.
 
 ``--offlen_randomization_ratio <n>``
     Percentage chance (0–100) that a read uses a randomized offset
@@ -394,6 +439,23 @@ Deduplication test::
       --op write 50 \
       --op set_chunk 30 \
       --op tier_promote 10
+
+Pool migration test::
+
+    ceph_test_rados \
+      --pool testpool \
+      --migrate-pool \
+      --migration-enable-ec-optimizations \
+      --migration-pg-count 16 \
+      --migration-interval 30 \
+      --initial-migration-delay 20 \
+      --max-ops 10000 \
+      --objects 500 \
+      --max-in-flight 16 \
+      --size 4000000 \
+      --op read 100 \
+      --op write 100 \
+      --op delete 10
 
 Exit Status
 -----------

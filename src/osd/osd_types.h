@@ -94,6 +94,9 @@ class SnapContext;
 /// min recovery priority for MBackfillReserve
 #define OSD_RECOVERY_PRIORITY_MIN 0
 
+// base pool-migration priority
+#define OSD_POOL_MIGRATION_PRIORITY_BASE 60
+
 /// base backfill priority for MBackfillReserve
 #define OSD_BACKFILL_PRIORITY_BASE 100
 
@@ -321,6 +324,7 @@ struct request_redirect_t {
 private:
   object_locator_t redirect_locator; ///< this is authoritative
   std::string redirect_object; ///< If non-empty, the request goes to this object name
+  std::optional<hobject_t> redirect_migration_watermark; ///< Migration watermark for pool migration
 
   friend std::ostream& operator<<(std::ostream& out, const request_redirect_t& redir);
 public:
@@ -328,6 +332,11 @@ public:
   request_redirect_t() {}
   explicit request_redirect_t(const object_locator_t& orig, int64_t rpool) :
       redirect_locator(orig) { redirect_locator.pool = rpool; }
+  explicit request_redirect_t(const object_locator_t& orig, int64_t rpool, hobject_t migration_watermark) :
+      redirect_locator(orig) {
+    redirect_locator.pool = rpool;
+    redirect_migration_watermark = migration_watermark;
+  }
   explicit request_redirect_t(const object_locator_t& rloc) :
       redirect_locator(rloc) {}
   explicit request_redirect_t(const object_locator_t& orig,
@@ -342,7 +351,13 @@ public:
     if (!redirect_object.empty())
       obj = redirect_object;
   }
-
+  bool is_pool_migration() const {
+    return redirect_migration_watermark.has_value();
+  }
+  void update_migration_watermark(hobject_t & obj) const {
+    ceph_assert(is_pool_migration());
+    obj = *redirect_migration_watermark;
+  }
   void encode(ceph::buffer::list& bl) const;
   void decode(ceph::buffer::list::const_iterator& bl);
   void dump(ceph::Formatter *f) const;
@@ -351,6 +366,44 @@ public:
 WRITE_CLASS_ENCODER(request_redirect_t)
 
 std::ostream& operator<<(std::ostream& out, const request_redirect_t& redir);
+
+/**
+ * osd_core_hint_t
+ *
+ * Sent by a Crimson OSD in MOSDOpReply (an optional field of v9, which
+ * older decoders ignore): the reactor core that owns the PG addressed by
+ * the op, and the port on which that core accepts client connections -
+ * on the IP of the OSD's address the client already uses. Advisory only:
+ * an op sent to any of the OSD's addresses is still served. Versioned, so
+ * that it may carry more (e.g. a per-core IP) later.
+ */
+struct osd_core_hint_t {
+  uint32_t core = 0;
+  uint16_t port = 0;
+
+  osd_core_hint_t() = default;
+  osd_core_hint_t(uint32_t core, uint16_t port)
+    : core(core), port(port) {}
+
+  bool operator==(const osd_core_hint_t&) const = default;
+
+  void encode(ceph::buffer::list& bl) const;
+  void decode(ceph::buffer::list::const_iterator& bl);
+  void dump(ceph::Formatter *f) const;
+  static std::list<osd_core_hint_t> generate_test_instances();
+};
+WRITE_CLASS_ENCODER(osd_core_hint_t)
+
+namespace fmt {
+template <>
+struct formatter<osd_core_hint_t> {
+  constexpr auto parse(fmt::format_parse_context& ctx) { return ctx.begin(); }
+  template <typename FormatContext>
+  auto format(const osd_core_hint_t& h, FormatContext& ctx) const {
+    return fmt::format_to(ctx.out(), "core {} port {}", h.core, h.port);
+  }
+};
+} // namespace fmt
 
 // Internal OSD op flags - set by the OSD based on the op types
 enum {
@@ -984,6 +1037,11 @@ WRITE_CLASS_ENCODER_FEATURES(objectstore_perf_stat_t)
 #define PG_STATE_FAILED_REPAIR      (1ULL << 32) // A repair failed to fix all errors
 #define PG_STATE_LAGGY              (1ULL << 33) // PG is laggy/unreabable due to slow/delayed pings
 #define PG_STATE_WAIT               (1ULL << 34) // PG is waiting for prior intervals' readable period to expire
+#define PG_STATE_MIGRATION_WAIT     (1ULL << 35) // PG is waiting to start migration to a new pool
+#define PG_STATE_MIGRATING          (1ULL << 36) // PG is migrating
+#define PG_STATE_MIGRATION_TOOFULL  (1ULL << 37) // PG migration can't proceed: too full
+#define PG_STATE_MIGRATION_UNFOUND  (1ULL << 38) // PG migration can't proceed: unreadable object
+#define PG_STATE_MIGRATION_ERROR    (1ULL << 39) // PG migration can't proceed: other error
 
 std::string pg_state_string(uint64_t state);
 std::string pg_vector_string(const std::vector<int32_t> &a);
@@ -1400,6 +1458,8 @@ struct pg_pool_t {
   uint64_t flags = 0;           ///< FLAG_*
   __u8 type = 0;                ///< TYPE_*
   __u8 size = 0, min_size = 0;  ///< number of osds in each pg
+  __u8 replica = 0;             ///< number of replicas per zone
+  __u8 num_zones = 1;           ///< number of zones
   __u8 crush_rule = 0;          ///< crush placement rule
   __u8 object_hash = 0;         ///< hash mapping object name to ps
   pg_autoscale_mode_t pg_autoscale_mode = pg_autoscale_mode_t::UNKNOWN;
@@ -1554,6 +1614,30 @@ public:
                                      ///< user does not specify any expected value
   bool fast_read = false;            ///< whether turn on fast read on the pool or not
   shard_id_set nonprimary_shards; ///< EC partial writes: shards that cannot become a primary
+
+  // Pool migration
+  std::optional<int64_t> migration_src; ///< pool we are migrating from
+  std::optional<int64_t> migration_target; ///< pool we are migrating to
+  std::optional<int64_t> migration_root; ///< chain-root source pool, recorded on
+                                          ///< the migration tip. Set while this pool
+                                          ///< is the tip, cleared when it becomes a
+                                          ///< source stub. Permanent across
+                                          ///< migration completion (unlike
+                                          ///< migration_src).
+  std::set<pg_t> migrating_pgs; ///< PGs currently migrating. Any higher value PGs have completed migration
+  uint32_t lowest_migrated_pg = 0; ///< PG with the lowest ID that has completed migration
+
+  void clear_migrating_pgs() { migrating_pgs.clear(); }
+
+  bool is_migrating() const { return migration_src.has_value() || migration_target.has_value(); }
+  bool is_migration_src() const { return migration_target.has_value(); }
+  bool is_migration_target() const { return migration_src.has_value(); }
+  bool is_pg_migrating(pg_t pgid) const { return migrating_pgs.contains(pgid); }
+  bool has_pg_migrated(pg_t pgid) const {
+    return is_migration_src() &&
+      (pgid.ps() >= lowest_migrated_pg) &&
+      !is_pg_migrating(pgid);
+  }
   pool_opts_t opts; ///< options
 
   typedef enum {
@@ -1698,6 +1782,8 @@ public:
   unsigned get_type() const { return type; }
   unsigned get_size() const { return size; }
   unsigned get_min_size() const { return min_size; }
+  unsigned get_num_zones() const { return num_zones; }
+  unsigned get_replica() const { return replica; }
   int get_crush_rule() const { return crush_rule; }
   int get_object_hash() const { return object_hash; }
   const char *get_object_hash_name() const {
@@ -1716,7 +1802,8 @@ public:
   uint64_t get_auid() const { return auid; }
 
   uint8_t get_ec_data_shard_count() const {
-    return ec_data_shard_count.value_or(nonprimary_shards.size() + 1);
+    return ec_data_shard_count.value_or(
+      nonprimary_shards.size() / get_num_zones() + 1);
   }
 
   void set_snap_seq(snapid_t s) { snap_seq = s; }
@@ -1753,6 +1840,10 @@ public:
     return has_flag(FLAG_CRIMSON);
   }
 
+  bool is_bulk() const {
+    return has_flag(FLAG_BULK);
+  }
+
   bool can_shift_osds() const {
     switch (get_type()) {
     case TYPE_REPLICATED:
@@ -1777,6 +1868,30 @@ public:
   // return, for a given pg, the fraction (denominator) of the total
   // pool size that it represents.
   unsigned get_pg_num_divisor(pg_t pgid) const;
+
+  int64_t get_pg_num_min() const {
+    int64_t pg_num_min = 0;
+    opts.get(pool_opts_t::PG_NUM_MIN, &pg_num_min);
+    return pg_num_min;
+  }
+
+  int64_t get_pg_num_max() const {
+    int64_t pg_num_max = 0;
+    opts.get(pool_opts_t::PG_NUM_MAX, &pg_num_max);
+    return pg_num_max;
+  }
+
+  int64_t get_target_size_bytes() const {
+    int64_t target_size_bytes = 0;
+    opts.get(pool_opts_t::TARGET_SIZE_BYTES, &target_size_bytes);
+    return target_size_bytes;
+  }
+
+  double get_target_size_ratio() const {
+    double target_size_ratio = 0.0;
+    opts.get(pool_opts_t::TARGET_SIZE_RATIO, &target_size_ratio);
+    return target_size_ratio;
+  }
 
   bool is_pending_merge(pg_t pgid, bool *target) const;
 
@@ -1880,9 +1995,11 @@ public:
   /// choose a random hash position within a pg
   uint32_t get_random_pg_position(pg_t pgid, uint32_t seed) const;
 
-  /// EC partial writes: test if a shard is a non-primary
+  /// EC partial writes: test if a shard is a non-primary. A shard of a zone
+  /// that the pool no longer has is one if its relative shard is.
   bool is_nonprimary_shard(const shard_id_t shard) const {
-    return !nonprimary_shards.empty() && nonprimary_shards.contains(shard);
+    return !nonprimary_shards.empty() &&
+      nonprimary_shards.contains(get_relative_shard(shard));
   }
 
   void set_shard_mapping(std::vector<shard_id_t> && mapping) {
@@ -1898,6 +2015,35 @@ public:
     } else {
       return shard_id_t::NO_SHARD;
     }
+  }
+
+  int get_zone_size() const {
+    return size / get_num_zones();
+  }
+
+  /// EC multi-zone: convert absolute shard ID to relative shard ID
+  /// For multi-zone EC pools: absolute_shard = relative_shard + zone * (k+m)
+  /// where k+m = pool.size
+  shard_id_t get_relative_shard(const shard_id_t shard) const {
+
+    // Fast path for common case (id < size) and negative shards
+    if (std::cmp_less(shard.id, get_zone_size())) {
+      return shard;
+    }
+    // Convert absolute to relative using modulo
+    return shard_id_t(shard.id % get_zone_size());
+  }
+
+  int get_shard_zone(const shard_id_t shard) const {
+    if (std::cmp_less(shard.id, get_zone_size())) {
+      return 0;
+    }
+    return shard.id / get_zone_size();
+  }
+
+  /// EC multi-zone: inverse of get_relative_shard() for the given zone
+  shard_id_t get_abs_shard(const shard_id_t rel_shard, int zone) const {
+    return shard_id_t(rel_shard.id + zone * get_zone_size());
   }
 
   void encode(ceph::buffer::list& bl, uint64_t features) const;
@@ -1965,6 +2111,8 @@ struct object_stat_sum_t {
   int64_t num_omap_bytes{0};
   int64_t num_omap_keys{0};
   int64_t num_objects_repaired{0};
+  int64_t num_objects_migrated{0};
+  int64_t num_bytes_migrated{0};
 
   object_stat_sum_t() = default;
 
@@ -1993,6 +2141,8 @@ struct object_stat_sum_t {
     FLOOR(num_objects_recovered);
     FLOOR(num_bytes_recovered);
     FLOOR(num_keys_recovered);
+    FLOOR(num_objects_migrated);
+    FLOOR(num_bytes_migrated);
     FLOOR(num_objects_dirty);
     FLOOR(num_whiteouts);
     FLOOR(num_objects_omap);
@@ -2056,6 +2206,8 @@ struct object_stat_sum_t {
     SPLIT(num_objects_recovered);
     SPLIT(num_bytes_recovered);
     SPLIT(num_keys_recovered);
+    SPLIT(num_objects_migrated);
+    SPLIT(num_bytes_migrated);
     SPLIT(num_objects_dirty);
     SPLIT(num_whiteouts);
     SPLIT(num_objects_omap);
@@ -2116,6 +2268,8 @@ struct object_stat_sum_t {
         sizeof(num_objects_recovered) +
         sizeof(num_bytes_recovered) +
         sizeof(num_keys_recovered) +
+        sizeof(num_objects_migrated) +
+        sizeof(num_bytes_migrated) +
         sizeof(num_shallow_scrub_errors) +
         sizeof(num_deep_scrub_errors) +
         sizeof(num_objects_dirty) +
@@ -3454,6 +3608,8 @@ public:
     int32_t new_crush_member,
     bool old_allow_ec_optimizations,
     bool new_allow_ec_optimizations,
+    const std::set<pg_t>& old_migrating_pgs,
+    const std::set<pg_t>& new_migrating_pgs,
     pg_t pgid
     );
 
@@ -4979,7 +5135,8 @@ public:
         // .have = nil
         missing_it->second = item(e.version, eversion_t(), e.is_delete());
         missing_it->second.clean_regions.mark_fully_dirty();
-      } else if (pool.is_nonprimary_shard(shard) && !e.is_written_shard(shard)) {
+      } else if (pool.is_nonprimary_shard(shard) &&
+                 !e.is_written_shard(pool.get_relative_shard(shard))) {
 	// new object, partial write and not already missing - skip
 	skipped = true;
       } else {
@@ -4998,7 +5155,7 @@ public:
         missing_it->second.clean_regions.mark_fully_dirty();
       else
         missing_it->second.clean_regions.merge(e.clean_regions);
-    } else if (pool.is_nonprimary_shard(shard) && !e.is_written_shard(shard)) {
+    } else if (pool.is_nonprimary_shard(shard) && !e.is_written_shard(pool.get_relative_shard(shard))) {
       // existing object, partial write and not already missing - skip
       skipped = true;
     } else {
@@ -5326,6 +5483,8 @@ WRITE_CLASS_ENCODER(object_copy_cursor_t)
  * the copy request). The client then looks into the attrs, data, and/or omap
  * based on the contents of the cursor.
  */
+struct watch_info_t;
+
 struct object_copy_data_t {
   enum {
     FLAG_DATA_DIGEST = 1<<0,
@@ -5355,12 +5514,15 @@ struct object_copy_data_t {
   uint64_t truncate_seq;
   uint64_t truncate_size;
 
+  std::map<std::pair<uint64_t, entity_name_t>, watch_info_t> watchers;
+
 public:
   object_copy_data_t() :
     size((uint64_t)-1), data_digest(-1),
     omap_digest(-1), flags(0),
     truncate_seq(0),
-    truncate_size(0) {}
+    truncate_size(0),
+    watchers() {}
 
   static std::list<object_copy_data_t> generate_test_instances();
   void encode(ceph::buffer::list& bl, uint64_t features) const;

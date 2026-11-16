@@ -7,6 +7,7 @@
 #include <iomanip>
 #include <list>
 #include <memory>
+#include <grp.h>
 
 #include <boost/asio/bind_executor.hpp>
 #include <boost/asio/bind_cancellation_slot.hpp>
@@ -64,9 +65,11 @@ using timeout_timer = rgw::basic_timeout_timer<ceph::coarse_mono_clock,
 static constexpr size_t parse_buffer_size = rgw::asio::parse_buffer_size;
 using parse_buffer = rgw::asio::parse_buffer;
 
-// use mmap/mprotect to allocate 512k coroutine stacks
+// use mmap/mprotect to allocate 1MB coroutine stacks
+// increased from 512k to support deep Rust/LanceDB call chains (s3vector)
+// NOTE: not increasing the stack-size may result with stack-overflow 
 auto make_stack_allocator() {
-  return boost::context::protected_fixedsize_stack{512*1024};
+  return boost::context::protected_fixedsize_stack{1024*1024};
 }
 
 static constexpr std::chrono::milliseconds BACKOFF_MAX_WAIT(5000);
@@ -348,11 +351,12 @@ void handle_connection(boost::asio::io_context& context,
         client_env.set("TLS_VERSION", tls_version);
       }
       int http_ret = 0;
+      uint64_t rdma_bytes = 0;
       string user = "-";
       const auto started = ceph::coarse_real_clock::now();
       ceph::coarse_real_clock::duration latency{};
       process_request(env, &req, uri_prefix, &client, y,
-                      scheduler, &user, &latency, &http_ret);
+                      scheduler, &user, &latency, &http_ret, &rdma_bytes);
 
       if (cct->_conf->subsys.should_gather(ceph_subsys_rgw_access, 1)) {
         // access log line elements begin per Apache Combined Log Format with additions following
@@ -360,7 +364,7 @@ void handle_connection(boost::asio::io_context& context,
             << remote_endpoint.address() << " - " << user << " [" << log_apache_time{started} << "] \""
             << message.method_string() << ' ' << message.target() << ' '
             << http_version{message.version()} << "\" " << http_ret << ' '
-            << client.get_bytes_sent() + client.get_bytes_received() << ' '
+            << client.get_bytes_sent() + client.get_bytes_received() + rdma_bytes << ' '
             << log_header{message, http::field::referer, "\""} << ' '
             << log_header{message, http::field::user_agent, "\""} << ' '
             << log_header{message, http::field::range} << " latency="
@@ -540,6 +544,9 @@ tcp::endpoint parse_endpoint(boost::asio::string_view input,
       } else {
         auto port_str = input.substr(addr_end + 2);
         endpoint.port(parse_port(port_str.data(), ec));
+        if (ec) {
+          return endpoint;
+        }
       }
     } else {
       endpoint.port(default_port);
@@ -569,6 +576,33 @@ static int drop_privileges(CephContext *ctx)
   gid_t gid = ctx->get_set_gid();
   std::string uid_string = ctx->get_set_uid_string();
   std::string gid_string = ctx->get_set_gid_string();
+  // if a `setuser` config specified and the 'qat' *supplemental* group exists, inherit the 'qat' group to the user
+  struct group *grp{nullptr};
+  if (uid && (grp=getgrnam("qat"))) {
+    if (initgroups(uid_string.c_str(), grp->gr_gid) != 0) {
+      int err = errno;
+      ldout(ctx, -1) << "QAT warning: unable to initialize the `qat` supplemental group (" << grp->gr_gid << ") for user '" << uid_string << "' : " << cpp_strerror(err) << dendl;
+    }
+    // log the supplemental groups list
+    gid_t groups[NGROUPS_MAX]{0};
+    int num_groups = getgroups(NGROUPS_MAX, groups);
+    if (num_groups == -1) {
+      int err = errno;
+      ldout(ctx, -1) << "QAT warning: unable to getgroups for user '" << uid_string << "' : " << cpp_strerror(err) << dendl;
+    } else {
+      ldout(ctx, 0) << "supplemental groups:" << dendl;
+      for (int i=0 ; i < num_groups ; i++) {
+        struct group *grp = getgrgid(groups[i]);
+        if (grp) {
+          ldout(ctx, 0) << "  " << grp->gr_gid << " = " << grp->gr_name << dendl;
+        } else {
+          int err = errno;
+          ldout(ctx, -1) << "  QAT warning: unable to getgrgid for group " << groups[i] << " : " << cpp_strerror(err) << dendl;
+        }
+      }
+    }
+  }
+
   if (gid && setgid(gid) != 0) {
     int err = errno;
     ldout(ctx, -1) << "unable to setgid " << gid << ": " << cpp_strerror(err) << dendl;

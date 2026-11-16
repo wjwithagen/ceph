@@ -343,23 +343,27 @@ std::ostream& operator<<(std::ostream& out, const object_locator_t& loc)
 // -- request_redirect_t --
 void request_redirect_t::encode(ceph::buffer::list& bl) const
 {
-  ENCODE_START(1, 1, bl);
+  ENCODE_START(2, 1, bl);
   encode(redirect_locator, bl);
   encode(redirect_object, bl);
   // legacy of the removed osd_instructions member
   encode((uint32_t)0, bl);
+  encode(redirect_migration_watermark, bl);
   ENCODE_FINISH(bl);
 }
 
 void request_redirect_t::decode(ceph::buffer::list::const_iterator& bl)
 {
-  DECODE_START(1, bl);
+  DECODE_START(2, bl);
   uint32_t legacy_osd_instructions_len;
   decode(redirect_locator, bl);
   decode(redirect_object, bl);
   decode(legacy_osd_instructions_len, bl);
   if (legacy_osd_instructions_len) {
     bl += legacy_osd_instructions_len;
+  }
+  if (struct_v >= 2) {
+    decode(redirect_migration_watermark, bl);
   }
   DECODE_FINISH(bl);
 }
@@ -380,12 +384,45 @@ list<request_redirect_t> request_redirect_t::generate_test_instances()
   o.push_back(request_redirect_t(loc, 0));
   o.push_back(request_redirect_t(loc, "redir_obj"));
   o.push_back(request_redirect_t(loc));
+  o.push_back(request_redirect_t(loc, 0,
+      hobject_t(object_t("objname"), "key", 123, 456, -1, "")));
   return o;
 }
 
 std::ostream& operator<<(std::ostream& out, const request_redirect_t& redir) {
   out << "object " << redir.redirect_object << ", locator{" << redir.redirect_locator << "}";
   return out;
+}
+
+// -- osd_core_hint_t --
+void osd_core_hint_t::encode(ceph::buffer::list& bl) const
+{
+  ENCODE_START(1, 1, bl);
+  encode(core, bl);
+  encode(port, bl);
+  ENCODE_FINISH(bl);
+}
+
+void osd_core_hint_t::decode(ceph::buffer::list::const_iterator& bl)
+{
+  DECODE_START(1, bl);
+  decode(core, bl);
+  decode(port, bl);
+  DECODE_FINISH(bl);
+}
+
+void osd_core_hint_t::dump(Formatter *f) const
+{
+  f->dump_unsigned("core", core);
+  f->dump_unsigned("port", port);
+}
+
+list<osd_core_hint_t> osd_core_hint_t::generate_test_instances()
+{
+  list<osd_core_hint_t> o;
+  o.push_back(osd_core_hint_t());
+  o.push_back(osd_core_hint_t(3, 6810));
+  return o;
 }
 
 void objectstore_perf_stat_t::dump(Formatter *f) const
@@ -1308,6 +1345,16 @@ std::string pg_state_string(uint64_t state)
     *css << "laggy+";
   if (state & PG_STATE_WAIT)
     *css << "wait+";
+  if (state & PG_STATE_MIGRATION_WAIT)
+    *css << "migration_wait+";
+  if (state & PG_STATE_MIGRATING)
+    *css << "migrating+";
+  if (state & PG_STATE_MIGRATION_TOOFULL)
+    *css << "migration_toofull+";
+  if (state & PG_STATE_MIGRATION_UNFOUND)
+    *css << "migration_unfound+";
+  if (state & PG_STATE_MIGRATION_ERROR)
+    *css << "migration_error+";
   auto ret = css->str();
   if (ret.length() > 0)
     ret.resize(ret.length() - 1);
@@ -1385,6 +1432,16 @@ std::optional<uint64_t> pg_string_state(const std::string& state)
     type = PG_STATE_LAGGY;
   else if (state == "wait")
     type = PG_STATE_WAIT;
+  else if (state == "migration_wait")
+    type = PG_STATE_MIGRATION_WAIT;
+  else if (state == "migrating")
+    type = PG_STATE_MIGRATING;
+  else if (state == "migration_toofull")
+    type = PG_STATE_MIGRATION_TOOFULL;
+  else if (state == "migration_unfound")
+    type = PG_STATE_MIGRATION_UNFOUND;
+  else if (state == "migration_error")
+    type = PG_STATE_MIGRATION_ERROR;
   else if (state == "unknown")
     type = 0;
   else
@@ -1769,6 +1826,8 @@ void pg_pool_t::dump(Formatter *f, const CrushWrapper *crush,
   f->dump_int("type", get_type());
   f->dump_int("size", get_size());
   f->dump_int("min_size", get_min_size());
+  f->dump_int("num_zones", get_num_zones());
+  f->dump_int("replica", get_replica());
   const int rule_id = get_crush_rule();
   f->dump_int("crush_rule", rule_id);
   if (show_rule_names && crush && crush->rule_exists(rule_id)) {
@@ -1847,6 +1906,14 @@ void pg_pool_t::dump(Formatter *f, const CrushWrapper *crush,
   f->dump_unsigned("expected_num_objects", expected_num_objects);
   f->dump_bool("fast_read", fast_read);
   f->dump_stream("nonprimary_shards") << nonprimary_shards;
+  if (migration_src.has_value())
+    f->dump_int("migration_src", *migration_src);
+  if (migration_target.has_value())
+    f->dump_int("migration_target", *migration_target);
+  if (migration_root.has_value())
+    f->dump_int("migration_root", *migration_root);
+  f->dump_stream("migrating_pgs") << migrating_pgs;
+  f->dump_unsigned("lowest_migrated_pg", lowest_migrated_pg);
   f->open_object_section("options");
   opts.dump(f);
   f->close_section(); // options
@@ -2168,9 +2235,15 @@ void pg_pool_t::encode(ceph::buffer::list& bl, uint64_t features) const
     return;
   }
 
-  uint8_t v = 33;
+  uint8_t v = 35;
   // NOTE: any new encoding dependencies must be reflected by
   // SIGNIFICANT_FEATURES
+  if (!HAVE_SIGNIFICANT_FEATURE(features, OSD_STRETCH_ZONES)) {
+    v = 34;
+  }
+  if (!HAVE_SIGNIFICANT_FEATURE(features, SERVER_VAMPIRE)) {
+    v = 33;
+  }
   if (!HAVE_SIGNIFICANT_FEATURE(features, SERVER_UMBRELLA)) {
     v = 32;
   }
@@ -2221,7 +2294,9 @@ void pg_pool_t::encode(ceph::buffer::list& bl, uint64_t features) const
     encode(tmp, bl);
   }
   encode((uint32_t)0, bl); // crash_replay_interval
-  encode(min_size, bl);
+  // before v35, min_size counts every zone
+  const __u8 encoded_min_size = v >= 35 ? min_size : min_size * num_zones;
+  encode(encoded_min_size, bl);
   encode(quota_max_bytes, bl);
   encode(quota_max_objects, bl);
   encode(tiers, bl);
@@ -2303,12 +2378,23 @@ void pg_pool_t::encode(ceph::buffer::list& bl, uint64_t features) const
     encode(ec_data_shard_count, bl);
     encode(ec_coding_shard_count, bl);
   }
+  if (v >= 34) {
+    encode(migration_src, bl);
+    encode(migration_target, bl);
+    encode(migrating_pgs, bl);
+    encode(lowest_migrated_pg, bl);
+    encode(migration_root, bl);
+  }
+  if (v >= 35) {
+    encode(replica, bl);
+    encode(num_zones, bl);
+  }
   ENCODE_FINISH(bl);
 }
 
 void pg_pool_t::decode(ceph::buffer::list::const_iterator& bl)
 {
-  DECODE_START_LEGACY_COMPAT_LEN(33, 5, 5, bl);
+  DECODE_START_LEGACY_COMPAT_LEN(35, 5, 5, bl);
   decode(type, bl);
   decode(size, bl);
   decode(crush_rule, bl);
@@ -2504,7 +2590,6 @@ void pg_pool_t::decode(ceph::buffer::list::const_iterator& bl)
   } else {
     nonprimary_shards.clear();
   }
-
   if (struct_v >= 33) {
     decode(shard_mapping, bl);
     decode(ec_data_shard_count, bl);
@@ -2513,6 +2598,28 @@ void pg_pool_t::decode(ceph::buffer::list::const_iterator& bl)
     shard_mapping.clear();
     ec_data_shard_count.reset();
     ec_coding_shard_count.reset();
+  }
+  if (struct_v >= 34) {
+    decode(migration_src, bl);
+    decode(migration_target, bl);
+    decode(migrating_pgs, bl);
+    decode(lowest_migrated_pg, bl);
+    decode(migration_root, bl);
+  } else {
+    migration_src.reset();
+    migration_target.reset();
+    migrating_pgs.clear();
+    lowest_migrated_pg = 0;
+    migration_root.reset();
+  }
+  if (struct_v >= 35) {
+    decode(replica, bl);
+    decode(num_zones, bl);
+  } else {
+    // an earlier release's pool, or one before the upgrade commit: one
+    // zone and a min_size over all its copies
+    num_zones = 1;
+    replica = size;
   }
   DECODE_FINISH(bl);
   calc_pg_masks();
@@ -2527,10 +2634,18 @@ bool pg_pool_t::stretch_set_can_peer(const set<int>& want, const OSDMap& osdmap,
   const uint32_t barrier_count = peering_crush_bucket_count;
   set<int> ancestors;
   const shared_ptr<CrushWrapper>& crush = osdmap.crush;
+  // Earlier releases count a hole in an EC acting set, and the shadow
+  // bucket of each device class, as buckets. Both releases peer the same
+  // PGs until the upgrade is committed, so they must count alike.
+  const bool stretch_zones = osdmap.stretch_zones();
   for (int osdid : want) {
+    if (stretch_zones && osdid == CRUSH_ITEM_NONE) {
+      continue;
+    }
     int ancestor = crush->get_parent_of_type(osdid, barrier_id,
 					     crush_rule);
-    ancestors.insert(ancestor);
+    ancestors.insert(stretch_zones ? crush->get_non_shadow_id(ancestor)
+                                   : ancestor);
   }
   if (ancestors.size() < barrier_count) {
     if (out) {
@@ -2618,6 +2733,12 @@ list<pg_pool_t> pg_pool_t::generate_test_instances()
   a.expected_num_objects = 123456;
   a.fast_read = false;
   a.nonprimary_shards.clear();
+  a.migration_src = 4;
+  a.migration_target = 5;
+  a.migration_root = 4;
+  a.migrating_pgs = { pg_t(1,2), pg_t(3,4) };
+  a.lowest_migrated_pg = 5;
+
   a.application_metadata = {{"rbd", {{"key", "value"}}}};
   o.push_back(pg_pool_t(a));
 
@@ -2643,8 +2764,14 @@ void pg_pool_t::print(ostream& out, const CrushWrapper *crush) const
         << static_cast<unsigned int>(p.ec_coding_shard_count.value_or(0));
   }
   const int rule_id = p.get_crush_rule();
-  out << " size " << p.get_size()
-      << " min_size " << p.get_min_size()
+  out << " size " << p.get_size();
+  if (p.get_num_zones() > 1) {
+    out << " num_zones " << p.get_num_zones();
+    if (p.is_replicated()) {
+      out << " replica " << p.get_replica();
+    }
+  }
+  out << " min_size " << p.get_min_size()
       << " crush_rule ";
   if (crush && crush->rule_exists(rule_id)) {
     out << crush->get_rule_name(rule_id);
@@ -2774,11 +2901,13 @@ void object_stat_sum_t::dump(Formatter *f) const
   f->dump_int("num_omap_bytes", num_omap_bytes);
   f->dump_int("num_omap_keys", num_omap_keys);
   f->dump_int("num_objects_repaired", num_objects_repaired);
+  f->dump_int("num_objects_migrated", num_objects_migrated);
+  f->dump_int("num_bytes_migrated", num_bytes_migrated);
 }
 
 void object_stat_sum_t::encode(ceph::buffer::list& bl) const
 {
-  ENCODE_START(20, 14, bl);
+  ENCODE_START(21, 14, bl);
 #if defined(CEPH_LITTLE_ENDIAN)
   bl.append((char *)(&num_bytes), sizeof(object_stat_sum_t));
 #else
@@ -2822,6 +2951,8 @@ void object_stat_sum_t::encode(ceph::buffer::list& bl) const
   encode(num_omap_bytes, bl);
   encode(num_omap_keys, bl);
   encode(num_objects_repaired, bl);
+  encode(num_objects_migrated, bl);
+  encode(num_bytes_migrated, bl);
 #endif
   ENCODE_FINISH(bl);
 }
@@ -2829,7 +2960,7 @@ void object_stat_sum_t::encode(ceph::buffer::list& bl) const
 void object_stat_sum_t::decode(ceph::buffer::list::const_iterator& bl)
 {
   bool decode_finish = false;
-  static const int STAT_SUM_DECODE_VERSION = 20;
+  static const int STAT_SUM_DECODE_VERSION = 21;
   DECODE_START(STAT_SUM_DECODE_VERSION, bl);
 #if defined(CEPH_LITTLE_ENDIAN)
   if (struct_v == STAT_SUM_DECODE_VERSION) {
@@ -2890,6 +3021,10 @@ void object_stat_sum_t::decode(ceph::buffer::list::const_iterator& bl)
     if (struct_v >= 20) {
       decode(num_objects_repaired, bl);
     }
+    if (struct_v >= 21) {
+      decode(num_objects_migrated, bl);
+      decode(num_bytes_migrated, bl);
+    }
   }
   DECODE_FINISH(bl);
 }
@@ -2936,6 +3071,8 @@ list<object_stat_sum_t> object_stat_sum_t::generate_test_instances()
   a.num_omap_bytes = 20000;
   a.num_omap_keys = 200;
   a.num_objects_repaired = 300;
+  a.num_objects_migrated = 64;
+  a.num_bytes_migrated = 128;
   o.push_back(object_stat_sum_t(a));
 
   return o;
@@ -2983,6 +3120,8 @@ void object_stat_sum_t::add(const object_stat_sum_t& o)
   num_omap_bytes += o.num_omap_bytes;
   num_omap_keys += o.num_omap_keys;
   num_objects_repaired += o.num_objects_repaired;
+  num_objects_migrated += o.num_objects_migrated;
+  num_bytes_migrated += o.num_bytes_migrated;
 }
 
 void object_stat_sum_t::sub(const object_stat_sum_t& o)
@@ -3027,6 +3166,8 @@ void object_stat_sum_t::sub(const object_stat_sum_t& o)
   num_omap_bytes -= o.num_omap_bytes;
   num_omap_keys -= o.num_omap_keys;
   num_objects_repaired -= o.num_objects_repaired;
+  num_objects_migrated -= o.num_objects_migrated;
+  num_bytes_migrated -= o.num_bytes_migrated;
 }
 
 bool operator==(const object_stat_sum_t& l, const object_stat_sum_t& r)
@@ -3071,7 +3212,9 @@ bool operator==(const object_stat_sum_t& l, const object_stat_sum_t& r)
     l.num_objects_manifest == r.num_objects_manifest &&
     l.num_omap_bytes == r.num_omap_bytes &&
     l.num_omap_keys == r.num_omap_keys &&
-    l.num_objects_repaired == r.num_objects_repaired;
+    l.num_objects_repaired == r.num_objects_repaired &&
+    l.num_objects_migrated == r.num_objects_migrated &&
+    l.num_bytes_migrated == r.num_bytes_migrated;
 }
 
 // -- object_stat_collection_t --
@@ -4693,6 +4836,8 @@ bool PastIntervals::is_new_interval(
   int32_t new_crush_member,
   bool old_allow_ec_optimizations,
   bool new_allow_ec_optimizations,
+  const std::set<pg_t>& old_migrating_pgs,
+  const std::set<pg_t>& new_migrating_pgs,
   pg_t pgid) {
   return old_acting_primary != new_acting_primary ||
     new_acting != old_acting ||
@@ -4717,7 +4862,10 @@ bool PastIntervals::is_new_interval(
     old_crush_target != new_crush_target ||
     old_crush_barrier != new_crush_barrier ||
     old_crush_member != new_crush_member ||
-    old_allow_ec_optimizations != new_allow_ec_optimizations;
+    old_allow_ec_optimizations != new_allow_ec_optimizations ||
+    // PG started/finished or pool started/finished migration
+    old_migrating_pgs.contains(pgid) != new_migrating_pgs.contains(pgid) ||
+    old_migrating_pgs.empty() != new_migrating_pgs.empty();
 }
 
 bool PastIntervals::is_new_interval(
@@ -4740,6 +4888,13 @@ bool PastIntervals::is_new_interval(
   const pg_pool_t *pi = osdmap->get_pg_pool(pgid.pool());
   if (!pi) {
     return true;  // pool was deleted this epoch -> (final!) interval change
+  }
+  // the rules that judge a stretch pool change at the upgrade commit, and
+  // what min_size counts changes with num_zones
+  if (plast->num_zones != pi->num_zones ||
+      ((plast->is_stretch_pool() || pi->is_stretch_pool()) &&
+       lastmap->stretch_zones() != osdmap->stretch_zones())) {
+    return true;
   }
   return
     is_new_interval(old_acting_primary,
@@ -4767,6 +4922,7 @@ bool PastIntervals::is_new_interval(
 		    plast->peering_crush_bucket_barrier, pi->peering_crush_bucket_barrier,
 		    plast->peering_crush_mandatory_member, pi->peering_crush_mandatory_member,
 		    plast->allows_ecoptimizations(), pi->allows_ecoptimizations(),
+		    plast->migrating_pgs, pi->migrating_pgs,
 		    pgid);
 }
 
@@ -4868,9 +5024,7 @@ bool PastIntervals::check_new_interval(
 
     if (num_acting &&
 	i.primary != -1 &&
-	num_acting >= old_pg_pool.min_size &&
-	(!old_pg_pool.is_stretch_pool() ||
-	 old_pg_pool.stretch_set_can_peer(old_acting, *lastmap, out)) &&
+	lastmap->acting_set_writeable(old_pg_pool, old_acting, out) &&
         could_have_gone_active(old_acting_shards)) {
       if (out)
 	*out << __func__ << " " << i
@@ -6388,7 +6542,7 @@ list<object_copy_cursor_t> object_copy_cursor_t::generate_test_instances()
 
 void object_copy_data_t::encode(ceph::buffer::list& bl, uint64_t features) const
 {
-  ENCODE_START(8, 5, bl);
+  ENCODE_START(9, 5, bl);
   encode(size, bl);
   encode(mtime, bl);
   encode(attrs, bl);
@@ -6405,12 +6559,13 @@ void object_copy_data_t::encode(ceph::buffer::list& bl, uint64_t features) const
   encode(truncate_seq, bl);
   encode(truncate_size, bl);
   encode(reqid_return_codes, bl);
+  encode(watchers, bl, features);
   ENCODE_FINISH(bl);
 }
 
 void object_copy_data_t::decode(ceph::buffer::list::const_iterator& bl)
 {
-  DECODE_START(8, bl);
+  DECODE_START(9, bl);
   if (struct_v < 5) {
     // old
     decode(size, bl);
@@ -6471,6 +6626,11 @@ void object_copy_data_t::decode(ceph::buffer::list::const_iterator& bl)
     if (struct_v >= 8) {
       decode(reqid_return_codes, bl);
     }
+    if (struct_v >= 9) {
+      decode(watchers,bl);
+    } else {
+      watchers.clear();
+    }
   }
   DECODE_FINISH(bl);
 }
@@ -6507,7 +6667,17 @@ list<object_copy_data_t> object_copy_data_t::generate_test_instances()
   o.back().omap_header.append("this is an omap header");
   o.back().snaps.push_back(123);
   o.back().reqids.push_back(make_pair(osd_reqid_t(), version_t()));
-
+  entity_addr_t ea;
+  ea.set_type(entity_addr_t::TYPE_LEGACY);
+  ea.set_nonce(5);
+  ea.set_family(AF_INET);
+  ea.set_in4_quad(0, 127);
+  ea.set_in4_quad(1, 0);
+  ea.set_in4_quad(2, 1);
+  ea.set_in4_quad(3, 2);
+  ea.set_port(2);
+  o.back().watchers[make_pair(123, entity_name_t::CLIENT(777))] = watch_info_t(123, 99, ea);
+  o.back().watchers[make_pair(456, entity_name_t::CLIENT(555))] = watch_info_t(456, 60, ea);
   return o;
 }
 
@@ -6543,6 +6713,15 @@ void object_copy_data_t::dump(Formatter *f) const
     if (it != reqid_return_codes.end()) {
       f->dump_int("return_code", it->second);
     }
+    f->close_section();
+  }
+  f->close_section();
+  f->open_object_section("watchers");
+  for (auto p = watchers.cbegin(); p != watchers.cend(); ++p) {
+    CachedStackStringStream css;
+    *css << p->first.second;
+    f->open_object_section(css->strv());
+    p->second.dump(f);
     f->close_section();
   }
   f->close_section();
@@ -7958,7 +8137,7 @@ std::string ObjectRecoveryInfo::fmt_print() const
   return fmt::format(
       "ObjectRecoveryInfo({}@{}, size: {}, copy_subset: {}, "
       "clone_subset: {}, snapset: {}, object_exist: {}, num_omap_keys: {})",
-      soid, version, size, copy_subset, clone_subset, 
+      soid, version, size, copy_subset, clone_subset,
       ss, object_exist, num_omap_keys);
 }
 
@@ -8609,6 +8788,10 @@ ostream& operator<<(ostream& out, const OSDOp& op)
       out << " " << utime_t(op.op.hit_set_get.stamp);
       break;
     case CEPH_OSD_OP_SCRUBLS:
+      break;
+    case CEPH_OSD_OP_PG_POOL_MIGRATION_RESERVE:
+      break;
+    case CEPH_OSD_OP_PG_POOL_MIGRATION_RELEASE:
       break;
     }
   }

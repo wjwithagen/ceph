@@ -498,6 +498,58 @@ PerfCounters *build_osd_logger(CephContext *cct) {
       l_osd_scrub_ec_reserv_secondaries_num, "scrub_ec_replicas_in_reservation",
       "number of replicas to reserve EC");
 
+  // ----   write fan-out - stretch clusters
+  osd_plb.add_u64_counter(l_osd_stretch_cross_zone_write_ops,
+      "cross_zone_write_ops",
+      "Sub-writes sent to a remote zone during write fan-out (EC and replicated)");
+  osd_plb.add_u64_counter(l_osd_stretch_cross_zone_write_bytes,
+      "cross_zone_write_bytes",
+      "Bytes sent to a remote zone during write fan-out (EC and replicated)",
+      nullptr, 0, unit_t(UNIT_BYTES));
+  osd_plb.add_time_avg(l_osd_stretch_cross_zone_write_lat,
+      "cross_zone_write_latency",
+      "Round-trip latency of sub-writes to a remote zone");
+  osd_plb.add_u64_counter_histogram(l_osd_stretch_cross_zone_write_lat_hist,
+      "cross_zone_write_latency_bytes_histogram",
+      op_hist_x_axis_config, op_hist_y_axis_config,
+      "Histogram of remote-zone sub-write latency + bytes sent");
+
+  // ---- recovery pushed - stretch clusters
+  osd_plb.add_u64_counter(l_osd_stretch_cross_zone_recovery_push_ops,
+    "cross_zone_recovery_push_ops",
+    "Recovery pushes sent to a remote zone (EC and replicated)");
+  osd_plb.add_u64_counter(l_osd_stretch_cross_zone_recovery_push_bytes,
+    "cross_zone_recovery_push_bytes",
+    "Bytes pushed to a remote zone during recovery",
+    nullptr, 0, unit_t(UNIT_BYTES));
+  osd_plb.add_time_avg(l_osd_stretch_cross_zone_recovery_push_lat,
+    "cross_zone_recovery_push_latency",
+    "Round-trip latency of recovery pushes to a remote zone");
+  osd_plb.add_u64_counter_histogram(l_osd_stretch_cross_zone_recovery_push_lat_hist,
+    "cross_zone_recovery_push_latency_bytes_histogram",
+    op_hist_x_axis_config, op_hist_y_axis_config,
+    "Histogram of remote-zone recovery push latency + bytes sent");
+
+  // --- remote-zone reads - stretch clusters
+  osd_plb.add_u64_counter(l_osd_stretch_cross_zone_read_ops,
+    "cross_zone_subread_ops",
+    "EC sub-reads and replicated pulls sent to a remote zone");
+  osd_plb.add_u64_counter(l_osd_stretch_cross_zone_read_sent_bytes,
+      "cross_zone_subread_sent_bytes",
+      "Bytes requested by EC sub-reads from remote-zone shards",
+      nullptr, 0, unit_t(UNIT_BYTES));
+  osd_plb.add_u64_counter(l_osd_stretch_cross_zone_read_recv_bytes,
+      "cross_zone_subread_recv_bytes",
+      "Bytes received from remote-zone shards and replicas",
+      nullptr, 0, unit_t(UNIT_BYTES));
+  osd_plb.add_time_avg(l_osd_stretch_cross_zone_read_lat,
+      "cross_zone_subread_latency",
+      "Round-trip latency of sub-reads and pulls to a remote zone");
+  osd_plb.add_u64_counter_histogram(l_osd_stretch_cross_zone_read_lat_hist,
+      "cross_zone_subread_latency_bytes_histogram",
+      op_hist_x_axis_config, op_hist_y_axis_config,
+      "Histogram of remote-zone sub-read and pull latency + bytes received");
+
   return osd_plb.create_perf_counters();
 }
 
@@ -583,6 +635,13 @@ PerfCounters *build_recoverystate_perf(CephContext *cct) {
     "shared OSD-wide counter cannot lose a lower value (the companion max "
     "is pg_rebuild_duration's max_inc).",
     NULL, PerfCountersBuilder::PRIO_USEFUL);
+  rs_perf.add_u64_counter(rs_stats_invalidated, "stats_invalidated", "Number of times pg stats received invalidations");
+  rs_perf.add_time_avg(rs_waitlocalpoolmigrationreserved_latency, "waitlocalpoolmigrationreserved_latency", "Wait local pool migration reserved recovery state latency");
+  rs_perf.add_time_avg(rs_waitremotepoolmigrationreserved_latency, "waitremotepoolmigrationreserved_latency", "Wait remote pool migration reserved recovery state latency");
+  rs_perf.add_time_avg(rs_notmigrating_latency, "notmigrating_latency", "Notmigrating recovery state latency");
+  rs_perf.add_time_avg(rs_repwaitmigrationreserved_latency, "repwaitmigrationreserved_latency", "Rep wait migration reserved recovery state latency");
+  rs_perf.add_time_avg(rs_migratingsource_latency, "migratingsource_latency", "Migrating source recovery state latency");
+  rs_perf.add_time_avg(rs_migratingtarget_latency, "migratingtarget_latency", "Migrating target recovery state latency");
 
   return rs_perf.create_perf_counters();
 }

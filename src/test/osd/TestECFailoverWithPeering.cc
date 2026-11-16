@@ -16,22 +16,49 @@
 #include <gtest/gtest.h>
 #include <gtest/gtest-spi.h>
 #include "test/osd/ECPeeringTestFixture.h"
+#include "osd/osd_perf_counters.h"
+#include "osd/PrimaryLogPG.h"
+#include "messages/MOSDECSubOpRead.h"
 #include "test/osd/TestCommon.h"
 
 using namespace std;
 
-/**
- * TestECFailoverWithPeering - parameterized EC peering and failover tests.
- *
- * This fixture is parameterized over BackendConfig to test multiple EC
- * configurations (different k/m values, stripe units, plugins, and optimizations).
- * Only EC configurations are tested since peering and failover are EC-specific.
+namespace {
+
+/* One step of an op on a single object: truncate to off, or write or zero
+ * len bytes at off. Written data is chosen when the op is submitted.
  */
-class TestECFailoverWithPeering : public ECPeeringTestFixture,
-                                   public ::testing::WithParamInterface<BackendConfig> {
+struct ObjOp {
+  enum Type { TRUNCATE, WRITE, ZERO } type;
+  uint64_t off;
+  uint64_t len;
+};
+
+ObjOp Truncate(uint64_t size) { return {ObjOp::TRUNCATE, size, 0}; }
+ObjOp Write(uint64_t off, uint64_t len) { return {ObjOp::WRITE, off, len}; }
+ObjOp Zero(uint64_t off, uint64_t len) { return {ObjOp::ZERO, off, len}; }
+
+/* An object created with size bytes of random data. The ops in committed
+ * are then applied one at a time, each committing before the next. Each
+ * entry of ops is one op under test; they are all in flight together.
+ */
+struct ObjectScenario {
+  uint64_t size;
+  std::vector<std::vector<ObjOp>> committed;
+  std::vector<std::vector<ObjOp>> ops;
+};
+
+}  // namespace
+
+/**
+ * ECTruncateTestBase - EC peering fixture configured from a BackendConfig,
+ * with helpers that submit ops mixing truncates, writes and zeros while
+ * keeping a model of the expected contents of each object, and that check
+ * every shard of an object against its model.
+ */
+class ECTruncateTestBase : public ECPeeringTestFixture {
 public:
-  TestECFailoverWithPeering() : ECPeeringTestFixture() {
-    const auto& config = GetParam();
+  explicit ECTruncateTestBase(const BackendConfig& config) {
     k = config.k;
     m = config.m;
     stripe_unit = config.stripe_unit;
@@ -40,9 +67,480 @@ public:
     pool_flags = config.pool_flags;
     num_zones = config.num_zones;
   }
-  
-  void SetUp() override {
-    ECPeeringTestFixture::SetUp();
+
+protected:
+  /* Read the head object of every shard directly from the store. */
+  std::map<int, bufferlist> read_shards(const std::string& obj_name) {
+    const hobject_t hoid = make_test_object(obj_name);
+    std::map<int, bufferlist> shards;
+    for (int shard = 0; shard < k + m; ++shard) {
+      ghobject_t ghoid(hoid, ghobject_t::NO_GEN, shard_id_t(shard));
+      TestPG* test_pg = find_test_pg_for_shard(shard);
+      ceph_assert(test_pg);
+      EXPECT_LE(0, get_osd_fixture(test_pg->pg_whoami.osd)->store->read(
+        test_pg->ch, ghoid, 0, 0, shards[shard]))
+        << "shard " << shard;
+    }
+    return shards;
+  }
+
+  ECUtil::stripe_info_t get_sinfo() {
+    return ECUtil::stripe_info_t(ec_impl, &get_pool(), stripe_unit * k);
+  }
+
+  int get_shard(unsigned raw_shard) {
+    return int(get_sinfo().get_shard(raw_shard_id_t(raw_shard)));
+  }
+
+  /* Queue ops, in order, as a single PGTransaction on an existing object on
+   * the primary, and apply them to model, which must hold the contents of the
+   * object once every op queued before is applied. The returned result is
+   * set when the op completes.
+   */
+  std::shared_ptr<int> queue_ops(const std::string& obj_name,
+                                 const std::vector<ObjOp>& ops,
+                                 std::string& model) {
+    const uint64_t pre_op_size = model.size();
+    std::vector<std::pair<ObjOp, bufferlist>> steps;
+    for (const auto& op : ops) {
+      bufferlist bl;
+      switch (op.type) {
+      case ObjOp::TRUNCATE:
+        model.resize(op.off, '\0');
+        break;
+      case ObjOp::WRITE:
+        bl = create_random_buffer(op.len);
+        if (model.size() < op.off + op.len) {
+          model.resize(op.off + op.len, '\0');
+        }
+        model.replace(op.off, op.len, bl.c_str(), op.len);
+        break;
+      case ObjOp::ZERO:
+        ceph_assert(op.off + op.len <= model.size());
+        model.replace(op.off, op.len, op.len, '\0');
+        break;
+      }
+      steps.emplace_back(op, bl);
+    }
+
+    const uint64_t new_size = model.size();
+    std::shared_ptr<int> result;
+    run_primary_op(
+      [&](std::shared_ptr<int> r) {
+        result = r;
+        do_ops_impl(obj_name, steps, pre_op_size, new_size, r);
+      }, false);
+    ceph_assert(result);
+    return result;
+  }
+
+  int submit_ops(const std::string& obj_name,
+                 const std::vector<ObjOp>& ops,
+                 std::string& model) {
+    auto result = queue_ops(obj_name, ops, model);
+    event_loop->run_until_idle();
+    return *result;
+  }
+
+  void do_ops_impl(const std::string& obj_name,
+                   const std::vector<std::pair<ObjOp, bufferlist>>& steps,
+                   uint64_t pre_op_size,
+                   uint64_t new_size,
+                   std::shared_ptr<int> result) {
+    hobject_t hoid = make_test_object(obj_name);
+    PGTransactionUPtr pg_t = std::make_unique<PGTransaction>();
+
+    ObjectContextRef obc = get_object_context(hoid, false);
+    ceph_assert(obc);
+    ceph_assert(obc->obs.oi.size == pre_op_size);
+    pg_t->obc_map[hoid] = obc;
+    TestPG* test_pg = get_test_pg();
+    test_pg->outstanding_writes[hoid]++;
+
+    for (const auto& [op, bl] : steps) {
+      switch (op.type) {
+      case ObjOp::TRUNCATE:
+        pg_t->truncate(hoid, op.off);
+        break;
+      case ObjOp::WRITE: {
+        bufferlist data = bl;
+        pg_t->write(hoid, op.off, data.length(), data);
+        break;
+      }
+      case ObjOp::ZERO:
+        pg_t->zero(hoid, op.off, op.len);
+        break;
+      }
+    }
+
+    object_stat_sum_t delta_stats;
+    delta_stats.num_bytes = int64_t(new_size) - int64_t(pre_op_size);
+
+    eversion_t prior_version = obc->obs.oi.version;
+    eversion_t at_version = get_next_version();
+
+    object_info_t new_oi = obc->obs.oi;
+    new_oi.version = at_version;
+    new_oi.prior_version = prior_version;
+    new_oi.size = new_size;
+    {
+      bufferlist oi_bl;
+      new_oi.encode(oi_bl, osdmap->get_features(CEPH_ENTITY_TYPE_OSD, nullptr));
+      pg_t->setattr(hoid, OI_ATTR, oi_bl);
+    }
+    obc->obs.oi = new_oi;
+
+    std::vector<pg_log_entry_t> log_entries;
+    pg_log_entry_t entry;
+    entry.op = pg_log_entry_t::MODIFY;
+    entry.soid = hoid;
+    entry.version = at_version;
+    entry.prior_version = prior_version;
+    log_entries.push_back(entry);
+
+    auto write_complete = make_write_completion(
+      test_pg, hoid, result,
+      [obc, prior_version, pre_op_size]() {
+        obc->obs.oi.version = prior_version;
+        obc->obs.oi.size = pre_op_size;
+        obc->attr_cache.clear();
+      },
+      [this, obj_name, steps, at_version](int) {
+        for (const auto& [op, bl] : steps) {
+          switch (op.type) {
+          case ObjOp::TRUNCATE:
+            record_truncate_and_write(obj_name, op.off, {}, at_version);
+            break;
+          case ObjOp::WRITE:
+            record_truncate_and_write(obj_name, std::nullopt,
+                                      {{op.off, bl.to_str()}}, at_version);
+            break;
+          case ObjOp::ZERO:
+            record_truncate_and_write(obj_name, std::nullopt,
+                                      {{op.off, std::string(op.len, '\0')}},
+                                      at_version);
+            break;
+          }
+        }
+      });
+
+    do_transaction(
+      hoid, std::move(pg_t), delta_stats, at_version, std::move(log_entries),
+      write_complete);
+  }
+
+  /* Check every shard of an object, other than those in skip, against model,
+   * the expected contents of the object. Each shard must be as long as the
+   * shard size for the object size. Each data shard must hold its chunks of
+   * the object, and zeros past the end of the object. Each parity shard must
+   * hold the parity that ec_impl encodes from those data chunks.
+   */
+  void check_shards(const std::string& obj_name,
+                    const std::string& model,
+                    const std::set<int>& skip) {
+    SCOPED_TRACE("check_shards " + obj_name);
+    const ECUtil::stripe_info_t sinfo = get_sinfo();
+    const uint64_t size = model.size();
+    const uint64_t sw = sinfo.get_stripe_width();
+    auto shards = read_shards(obj_name);
+    std::set<int> bad_shards;
+
+    for (int shard = 0; shard < k + m; ++shard) {
+      if (!skip.contains(shard)) {
+        EXPECT_EQ(sinfo.object_size_to_shard_size(size, shard_id_t(shard)),
+                  shards.at(shard).length())
+          << "length of shard " << shard << " for object size " << size;
+      }
+    }
+
+    for (uint64_t stripe = 0; stripe * sw < size; ++stripe) {
+      shard_id_map<bufferptr> in(k + m);
+      shard_id_map<bufferptr> out(k + m);
+      for (raw_shard_id_t raw; raw < k + m; ++raw) {
+        bufferptr bp = buffer::create_aligned(stripe_unit, EC_ALIGN_SIZE);
+        bp.zero();
+        if (raw < k) {
+          const uint64_t ro_offset = stripe * sw + int(raw) * stripe_unit;
+          if (ro_offset < size) {
+            bp.copy_in(0, std::min(stripe_unit, size - ro_offset),
+                       model.data() + ro_offset);
+          }
+          in[sinfo.get_shard(raw)] = bp;
+        } else {
+          out[sinfo.get_shard(raw)] = bp;
+        }
+      }
+      ASSERT_EQ(0, ec_impl->encode_chunks(in, out));
+
+      for (int shard = 0; shard < k + m; ++shard) {
+        const shard_id_t id(shard);
+        if (skip.contains(shard) || bad_shards.contains(shard)) {
+          continue;
+        }
+        const bufferptr& expected = in.contains(id) ? in.at(id) : out.at(id);
+        bufferlist& stored = shards.at(shard);
+        const uint64_t offset = stripe * stripe_unit;
+        if (offset >= stored.length()) {
+          continue;
+        }
+        const uint64_t length = std::min(stripe_unit, stored.length() - offset);
+        const char* actual = stored.c_str() + offset;
+        for (uint64_t i = 0; i < length; ++i) {
+          if (actual[i] != expected.c_str()[i]) {
+            ADD_FAILURE() << (in.contains(id) ? "data" : "parity")
+                          << " shard " << shard << " differs from the model"
+                          << " at shard offset " << offset + i
+                          << " (stripe " << stripe << ", object size "
+                          << size << ")";
+            bad_shards.insert(shard);
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  std::string object_name(const std::string& name, size_t index) {
+    return name + "_" + std::to_string(index);
+  }
+
+  /* Create each object and apply its committed ops, returning the models. */
+  std::vector<std::string> create_objects(
+      const std::string& name,
+      const std::vector<ObjectScenario>& objects) {
+    std::vector<std::string> models;
+    for (size_t i = 0; i < objects.size(); ++i) {
+      bufferlist bl = create_random_buffer(objects[i].size);
+      models.emplace_back(bl.c_str(), bl.length());
+      create_and_write_verify(object_name(name, i), models.back());
+      for (const auto& ops : objects[i].committed) {
+        EXPECT_EQ(0, submit_ops(object_name(name, i), ops, models.back()));
+      }
+    }
+    return models;
+  }
+
+  struct QueuedOp {
+    size_t object;
+    std::shared_ptr<int> result;
+    std::string model;  // The object once this op is applied.
+  };
+
+  /* Queue every object's ops, with the i'th op of each object queued after
+   * the (i-1)'th op of every object.
+   */
+  std::vector<QueuedOp> queue_all_ops(
+      const std::string& name,
+      const std::vector<ObjectScenario>& objects,
+      std::vector<std::string>& models) {
+    std::vector<QueuedOp> queued;
+    for (size_t step = 0; ; ++step) {
+      bool any = false;
+      for (size_t i = 0; i < objects.size(); ++i) {
+        if (step < objects[i].ops.size()) {
+          auto result =
+            queue_ops(object_name(name, i), objects[i].ops[step], models[i]);
+          queued.push_back({i, result, models[i]});
+          any = true;
+        }
+      }
+      if (!any) {
+        return queued;
+      }
+    }
+  }
+
+  void verify_objects(const std::string& name,
+                      const std::vector<std::string>& models,
+                      const std::set<int>& down) {
+    for (size_t i = 0; i < models.size(); ++i) {
+      if (!models[i].empty()) {
+        verify_object(object_name(name, i), models[i], 0, models[i].size());
+      }
+      check_shards(object_name(name, i), models[i], down);
+    }
+  }
+
+  /* Apply the ops of each object, all in flight together, and check the
+   * objects and their shards. Then take down the OSD holding the first data
+   * shard, so that reads must decode, and check again.
+   */
+  void run_forward(const std::string& name,
+                   const std::vector<ObjectScenario>& objects) {
+    ASSERT_TRUE(all_shards_active()) << "Initial peering must complete";
+    auto models = create_objects(name, objects);
+    const auto queued = queue_all_ops(name, objects, models);
+    event_loop->run_until_idle();
+    for (const auto& op : queued) {
+      EXPECT_EQ(0, *op.result);
+    }
+    {
+      SCOPED_TRACE("after the ops");
+      verify_objects(name, models, {});
+    }
+
+    const int down = get_shard(0);
+    mark_osd_down(down);
+    event_loop->run_until_idle();
+    ASSERT_TRUE(all_shards_active()) << "All shards should be active after peering";
+    SCOPED_TRACE("with shard " + std::to_string(down) + " down");
+    verify_objects(name, models, {down});
+  }
+
+  /* Submit the ops of each object so that they reach every shard except
+   * blocked_shard, then take down the OSD of failing_shard so that peering
+   * rolls back those still in flight. An op that does not write to
+   * blocked_shard can complete first, and must then survive, but at least
+   * one op must be left to roll back. Each object must be left as it was
+   * after its last completed op, and each surviving shard of an object with
+   * no completed op must be restored exactly.
+   */
+  void run_rollback(const std::string& name,
+                    const std::vector<ObjectScenario>& objects,
+                    int blocked_shard,
+                    int failing_shard) {
+    ASSERT_TRUE(all_shards_active()) << "Initial peering must complete";
+    ASSERT_NE(blocked_shard, failing_shard);
+    ASSERT_GE(k + m - 1, k) << "Too few shards would remain up";
+
+    const auto originals = create_objects(name, objects);
+    std::vector<std::map<int, bufferlist>> original_shards;
+    for (size_t i = 0; i < objects.size(); ++i) {
+      original_shards.push_back(read_shards(object_name(name, i)));
+    }
+    {
+      SCOPED_TRACE("before the ops");
+      verify_objects(name, originals, {});
+    }
+
+    const int primary = get_primary_shard_from_osdmap();
+    event_loop->suspend_from_to_osd(primary, blocked_shard);
+    auto models = originals;
+    const auto queued = queue_all_ops(name, objects, models);
+    event_loop->run_until_idle();
+
+    auto expected = originals;
+    std::vector<bool> in_flight(objects.size(), false);
+    std::vector<bool> completed(objects.size(), false);
+    for (const auto& op : queued) {
+      if (*op.result == 0) {
+        EXPECT_FALSE(in_flight[op.object]) << "ops must complete in order";
+        expected[op.object] = op.model;
+        completed[op.object] = true;
+      } else {
+        EXPECT_EQ(-EINPROGRESS, *op.result);
+        in_flight[op.object] = true;
+      }
+    }
+    EXPECT_TRUE(std::ranges::any_of(in_flight, std::identity{}))
+      << "No op writes to shard " << blocked_shard
+      << ", so none is left to roll back";
+
+    mark_osd_down(failing_shard);
+    event_loop->unsuspend_from_to_osd(primary, blocked_shard);
+    event_loop->run_until_idle();
+    ASSERT_TRUE(all_shards_active()) << "All shards should be active after peering";
+
+    SCOPED_TRACE("after rollback with shard " + std::to_string(blocked_shard) +
+                 " blocked and shard " + std::to_string(failing_shard) +
+                 " failed");
+    verify_objects(name, expected, {failing_shard});
+    for (size_t i = 0; i < objects.size(); ++i) {
+      if (completed[i]) {
+        continue;
+      }
+      const auto shards = read_shards(object_name(name, i));
+      for (int shard = 0; shard < k + m; ++shard) {
+        if (shard == failing_shard) {
+          continue;
+        }
+        EXPECT_EQ(original_shards[i].at(shard).length(), shards.at(shard).length())
+          << "size of shard " << shard << " of " << object_name(name, i);
+        EXPECT_TRUE(original_shards[i].at(shard).contents_equal(shards.at(shard)))
+          << "contents of shard " << shard << " of " << object_name(name, i);
+      }
+    }
+  }
+
+  /* Whether any op under test of the objects writes shard, a data shard
+   * that cannot be primary. An op writes such a shard if it changes the
+   * size of its object, or changes bytes that the shard holds. */
+  bool ops_write_shard(const std::vector<ObjectScenario>& objects,
+                       int shard) {
+    const ECUtil::stripe_info_t sinfo = get_sinfo();
+    for (const auto& object : objects) {
+      uint64_t size = object.size;
+      auto changed_range = [&size](const ObjOp& op) {
+        std::pair<uint64_t, uint64_t> range;
+        switch (op.type) {
+        case ObjOp::TRUNCATE:
+          range = std::minmax(size, op.off);
+          size = op.off;
+          break;
+        case ObjOp::WRITE:
+          range = {std::min(size, op.off), op.off + op.len};
+          size = std::max(size, op.off + op.len);
+          break;
+        case ObjOp::ZERO:
+          range = {op.off, op.off + op.len};
+          break;
+        }
+        return range;
+      };
+      for (const auto& ops : object.committed) {
+        for (const auto& op : ops) {
+          changed_range(op);
+        }
+      }
+      for (const auto& ops : object.ops) {
+        const uint64_t old_size = size;
+        for (const auto& op : ops) {
+          const auto [start, end] = changed_range(op);
+          if (start == end) {
+            continue;
+          }
+          ECUtil::shard_extent_set_t extents(k + m);
+          sinfo.ro_range_to_shard_extent_set(start, end - start, extents);
+          if (extents.contains(shard_id_t(shard))) {
+            return true;
+          }
+        }
+        if (size != old_size) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+};
+
+/**
+ * TestECFailoverWithPeering - parameterized EC peering and failover tests.
+ *
+ * This fixture is parameterized over BackendConfig to test multiple EC
+ * configurations (different k/m values, stripe units, plugins, and optimizations).
+ * Only EC configurations are tested since peering and failover are EC-specific.
+ */
+class TestECFailoverWithPeering : public ECTruncateTestBase,
+                                   public ::testing::WithParamInterface<BackendConfig> {
+public:
+  TestECFailoverWithPeering() : ECTruncateTestBase(GetParam()) {}
+
+protected:
+  /* Truncate an object and apply writes of the given {offset, length} in a
+   * single op that reaches every shard except shard 1, then fail the last
+   * parity shard so that the op is rolled back.
+   */
+  void rollback_truncate_and_write(
+      const std::string& obj_name,
+      uint64_t object_size,
+      uint64_t truncate_to,
+      const std::vector<std::pair<uint64_t, uint64_t>>& writes) {
+    std::vector<ObjOp> ops{Truncate(truncate_to)};
+    for (auto [offset, length] : writes) {
+      ops.push_back(Write(offset, length));
+    }
+    run_rollback(obj_name, {{object_size, {}, {ops}}}, 1, get_shard(k + m - 1));
   }
 
   // Shard ids whose OSD is currently up (i.e. that have a TestPG).
@@ -54,6 +552,321 @@ public:
       }
     }
     return shards;
+  }
+
+  std::vector<int> zone_osds(int zone) const {
+    std::vector<int> osds;
+    for (int i = 0; i < k + m; i++) {
+      osds.push_back(zone * (k + m) + i);
+    }
+    return osds;
+  }
+
+  // A whole-zone outage as the monitor handles it: the zone's OSDs go down,
+  // then degraded stretch mode leaves the other zone as the only one that
+  // must satisfy min_size.
+  void fail_zone(int zone) {
+    mark_osds_down(zone_osds(zone));
+    EXPECT_FALSE(get_primary_test_pg()->get_peering_state()->is_active());
+    enter_degraded_stretch_mode(1 - zone);
+  }
+
+  // ceph osd pool set <pool> num_zones 1, as the monitor does it to a pool
+  // over two zones: the pool keeps shards 0 to k+m-1, on zone's OSDs, with
+  // the pg_upmap cut to them; pg_temp and primary_temp are dropped, and
+  // stretch mode ends with its last pool over zones. up_osds come up in the
+  // same map.
+  void go_to_one_zone(int zone = 0, const std::vector<int>& up_osds = {}) {
+    auto new_osdmap = std::make_shared<OSDMap>();
+    new_osdmap->deepish_copy_from(*osdmap);
+    pg_pool_t pool = *new_osdmap->get_pg_pool(pool_id);
+    pool.size = k + m;
+    pool.num_zones = 1;
+    pool.min_size = k + std::min(1, m - 1);
+    pool.nonprimary_shards = ECUtil::nonprimary_shards(k, m, {}, 1);
+    pool.peering_crush_bucket_count = 0;
+    pool.peering_crush_bucket_target = 0;
+    pool.peering_crush_bucket_barrier = 0;
+    pool.peering_crush_mandatory_member = CRUSH_ITEM_NONE;
+    OSDMap::Incremental inc(new_osdmap->get_epoch() + 1);
+    inc.fsid = new_osdmap->get_fsid();
+    inc.new_pools[pool_id] = pool;
+    const std::vector<int> block0 = zone_osds(zone);
+    inc.new_pg_upmap[pgid].assign(block0.begin(), block0.end());
+    inc.new_pg_temp[pgid] = mempool::osdmap::vector<int32_t>();
+    inc.new_primary_temp[pgid] = -1;
+    inc.change_stretch_mode = true;
+    inc.stretch_mode_enabled = false;
+    inc.new_stretch_bucket_count = 0;
+    inc.new_degraded_stretch_mode = 0;
+    inc.new_recovering_stretch_mode = 0;
+    inc.new_stretch_mode_bucket = 0;
+    for (int osd : up_osds) {
+      inc.new_up_client[osd] = new_osdmap->get_addrs(osd);
+      inc.new_hb_back_up[osd] = new_osdmap->get_hb_back_addrs(osd);
+      inc.new_hb_front_up[osd] = new_osdmap->get_hb_front_addrs(osd);
+    }
+    new_osdmap->apply_incremental(inc);
+    update_osdmap_with_peering(new_osdmap);
+  }
+
+  void restore_zone(int zone) {
+    for (int osd : zone_osds(zone)) {
+      mark_osd_up(osd);
+    }
+    enter_recovery_stretch_mode();
+  }
+
+  // The monitor only leaves stretch recovery by itself once the PGs are
+  // clean.
+  void finish_stretch_recovery() {
+    EXPECT_TRUE(primary_is_clean());
+    enter_healthy_stretch_mode();
+  }
+
+  bool shard_has_object(const std::string& obj_name, version_t gen, int shard) {
+    TestPG* test_pg = get_test_pg(shard, shard);
+    ceph_assert(test_pg != nullptr);
+    ghobject_t ghoid(make_test_object(obj_name), gen, shard_id_t(shard));
+    struct stat st;
+    return get_osd_fixture(shard)->store->stat(test_pg->ch, ghoid, &st) == 0;
+  }
+
+  std::set<shard_id_t> ec_read_shards() {
+    std::set<shard_id_t> shards;
+    for (auto& [osd, msg] : get_primary_listener()->sent_messages_with_dest) {
+      if (auto read = boost::dynamic_pointer_cast<MOSDECSubOpRead>(msg)) {
+        shards.insert(read->pgid.shard);
+      }
+    }
+    return shards;
+  }
+
+  /**
+   * Helper method to run zone recovery test with specified zone failure order.
+   *
+   * @param first_zone_to_fail The zone to fail first (0 or 1)
+   * @param obj_name_suffix Suffix for the object name to make it unique
+   * @param write_size Size of the degraded write (0 = full stripe, default)
+   */
+  void run_zone_recovery_test(int first_zone_to_fail, const std::string& obj_name_suffix, size_t write_size = 0) {
+    int second_zone_to_fail = 1 - first_zone_to_fail;  // The other zone
+
+    std::cout << "\n=== Testing zone-level recovery (failing zone "
+              << first_zone_to_fail << " first, then zone "
+              << second_zone_to_fail << ") ===" << std::endl;
+
+    const std::string obj_name = "test_zone_recovery_" + obj_name_suffix;
+    const size_t object_size = stripe_unit * k;  // One full stripe
+
+    // Use write_size if specified, otherwise use full stripe
+    const size_t degraded_write_size = (write_size > 0) ? write_size : object_size;
+
+    std::string pattern_a(object_size, 'A');
+    std::string pattern_b(degraded_write_size, 'B');
+
+    // Step 1: Create and write object with pattern A
+    std::cout << "Step 1: Writing pattern A" << std::endl;
+    create_and_write_verify(obj_name, pattern_a);
+
+    // Step 2: Fail all OSDs in the first zone
+    std::cout << "Step 2: Failing all OSDs in zone " << first_zone_to_fail << std::endl;
+    std::vector<int> first_zone_osds = zone_osds(first_zone_to_fail);
+    int first_zone_start = first_zone_to_fail * (k + m);
+    int first_zone_end = first_zone_start + (k + m);
+    fail_zone(first_zone_to_fail);
+
+    // Verify the primary has changed (should be from the second zone)
+    int new_primary_after_first_fail = get_primary_shard_from_osdmap();
+    int second_zone_start = second_zone_to_fail * (k + m);
+    int second_zone_end = second_zone_start + (k + m);
+    ASSERT_GE(new_primary_after_first_fail, second_zone_start)
+      << "New primary should be from zone " << second_zone_to_fail
+      << " (>= " << second_zone_start << ") after zone " << first_zone_to_fail << " failure";
+    ASSERT_LT(new_primary_after_first_fail, second_zone_end)
+      << "New primary should be from zone " << second_zone_to_fail
+      << " (< " << second_zone_end << ") after zone " << first_zone_to_fail << " failure";
+
+    // Step 3: Write and verify pattern B (with first zone down)
+    std::cout << "Step 3: Writing pattern B (" << degraded_write_size
+              << " bytes) with zone " << first_zone_to_fail << " down" << std::endl;
+    write_verify(obj_name, 0, pattern_b, object_size);
+    write_verify(obj_name, 0, pattern_b, object_size);
+
+    // Step 4: Un-fail all OSDs in the first zone (bring them back up)
+    std::cout << "Step 4: Bringing zone " << first_zone_to_fail << " OSDs back up" << std::endl;
+    restore_zone(first_zone_to_fail);
+
+    // Step 5: Run recovery
+    // After bringing the first zone back up, the OSDs should be marked as having missing objects
+    std::cout << "Step 5: Running recovery" << std::endl;
+
+    // Get the current primary (should still be from the second zone or could have changed)
+    int current_primary = get_primary_shard_from_osdmap();
+    ASSERT_GE(current_primary, 0) << "Should have a valid primary";
+
+    auto primary_ps = get_primary_test_pg()->get_peering_state();
+
+    // Ensure the PG is active before checking peer_missing
+    ASSERT_TRUE(primary_ps->is_active())
+      << "Primary should be active before checking peer_missing. State: "
+      << primary_ps->get_current_state();
+
+    const auto& peer_missing_map = primary_ps->get_peer_missing();
+
+    // Debug: Print peer_missing_map contents
+    std::cout << "  peer_missing_map has " << peer_missing_map.size() << " entries:" << std::endl;
+    for (const auto& [shard, missing] : peer_missing_map) {
+      std::cout << "    OSD " << shard.osd << ": " << missing.num_missing() << " missing objects" << std::endl;
+    }
+
+    // Verify that first zone OSDs have the object missing
+    hobject_t hoid = make_test_object(obj_name);
+    bool found_missing = false;
+    std::vector<int> osds_with_missing;
+
+    for (int first_zone_osd : first_zone_osds) {
+      pg_shard_t first_zone_shard(first_zone_osd, shard_id_t(first_zone_osd));
+      auto peer_missing_it = peer_missing_map.find(first_zone_shard);
+      if (peer_missing_it != peer_missing_map.end()) {
+        const pg_missing_t& peer_missing = peer_missing_it->second;
+        std::cout << "  Checking OSD " << first_zone_osd << " for object " << hoid << std::endl;
+        if (peer_missing.is_missing(hoid)) {
+          found_missing = true;
+          osds_with_missing.push_back(first_zone_osd);
+          std::cout << "  OSD " << first_zone_osd << " is missing the object" << std::endl;
+        } else {
+          std::cout << "  OSD " << first_zone_osd << " is NOT missing the object" << std::endl;
+        }
+      } else {
+        std::cout << "  OSD " << first_zone_osd << " not in peer_missing_map" << std::endl;
+      }
+    }
+    ASSERT_TRUE(found_missing)
+      << "At least one zone " << first_zone_to_fail
+      << " OSD should have the object missing after coming back up";
+
+    // Get the first OSD with missing object to use for recovery
+    int first_missing_osd = osds_with_missing[0];
+    std::cout << "  Using OSD " << first_missing_osd << " as the recovery target" << std::endl;
+
+    // Use the fixture helper to run recovery and verify callbacks
+    // This will recover the object to all missing OSDs in the first zone
+    run_recovery(obj_name, first_zone_to_fail == 0, pattern_b);
+
+    // Step 6: Verify data is readable after recovery
+    std::cout << "Step 6: Verifying data after recovery" << std::endl;
+    bool corruption_detected = scrub_object(obj_name);
+    ASSERT_FALSE(corruption_detected)
+      << "Scrub detected corruption in object '" << obj_name
+      << "' after both zone recoveries with " << (degraded_write_size < object_size ? "partial" : "full")
+      << " write (write_size=" << degraded_write_size << ", object_size=" << object_size << ")";
+    finish_stretch_recovery();
+
+    // Step 7: Fail all OSDs in the second zone
+    std::cout << "Step 7: Failing all OSDs in zone " << second_zone_to_fail << std::endl;
+    std::vector<int> second_zone_osds = zone_osds(second_zone_to_fail);
+    fail_zone(second_zone_to_fail);
+
+    // Verify the primary has changed back to the first zone
+    int new_primary_after_second_fail = get_primary_shard_from_osdmap();
+    ASSERT_GE(new_primary_after_second_fail, first_zone_start)
+      << "New primary should be from zone " << first_zone_to_fail
+      << " (>= " << first_zone_start << ") after zone " << second_zone_to_fail << " failure";
+    ASSERT_LT(new_primary_after_second_fail, first_zone_end)
+      << "New primary should be from zone " << first_zone_to_fail
+      << " (< " << first_zone_end << ") after zone " << second_zone_to_fail << " failure";
+
+    // Step 8: Write pattern C with second zone down to create data that first zone will need to recover
+    std::string pattern_c(degraded_write_size, 'C');
+    std::cout << "Step 8: Writing pattern C (" << degraded_write_size
+              << " bytes) with zone " << second_zone_to_fail << " down" << std::endl;
+    write_verify(obj_name, 0, pattern_c, object_size);
+
+    // For partial writes, construct expected data: pattern_c followed by pattern_a remainder
+    std::string expected_data;
+    if (degraded_write_size < object_size) {
+      expected_data = pattern_c + std::string(object_size - degraded_write_size, 'A');
+    } else {
+      // Full stripe write
+      expected_data = pattern_c;
+    }
+
+    // Step 9: Un-fail all OSDs in the second zone (bring them back up)
+    std::cout << "Step 9: Bringing zone " << second_zone_to_fail << " OSDs back up" << std::endl;
+    restore_zone(second_zone_to_fail);
+
+    // Step 10: Run recovery for second zone
+    std::cout << "Step 10: Running recovery for zone " << second_zone_to_fail << std::endl;
+
+    // Get the current primary (should be from the first zone)
+    current_primary = get_primary_shard_from_osdmap();
+    ASSERT_GE(current_primary, 0) << "Should have a valid primary";
+
+    primary_ps = get_primary_test_pg()->get_peering_state();
+
+    // Ensure the PG is active before checking peer_missing
+    ASSERT_TRUE(primary_ps->is_active())
+      << "Primary should be active before checking peer_missing. State: "
+      << primary_ps->get_current_state();
+
+    const auto& peer_missing_map_second = primary_ps->get_peer_missing();
+
+    // Debug: Print peer_missing_map contents
+    std::cout << "  peer_missing_map has " << peer_missing_map_second.size() << " entries:" << std::endl;
+    for (const auto& [shard, missing] : peer_missing_map_second) {
+      std::cout << "    OSD " << shard.osd << ": " << missing.num_missing() << " missing objects" << std::endl;
+    }
+
+    // Verify that second zone OSDs have the object missing
+    found_missing = false;
+    osds_with_missing.clear();
+
+    for (int second_zone_osd : second_zone_osds) {
+      pg_shard_t second_zone_shard(second_zone_osd, shard_id_t(second_zone_osd));
+      auto peer_missing_it = peer_missing_map_second.find(second_zone_shard);
+      if (peer_missing_it != peer_missing_map_second.end()) {
+        const pg_missing_t& peer_missing = peer_missing_it->second;
+        std::cout << "  Checking OSD " << second_zone_osd << " for object " << hoid << std::endl;
+        if (peer_missing.is_missing(hoid)) {
+          found_missing = true;
+          osds_with_missing.push_back(second_zone_osd);
+          std::cout << "  OSD " << second_zone_osd << " is missing the object" << std::endl;
+        } else {
+          std::cout << "  OSD " << second_zone_osd << " is NOT missing the object" << std::endl;
+        }
+      } else {
+        std::cout << "  OSD " << second_zone_osd << " not in peer_missing_map" << std::endl;
+      }
+    }
+    ASSERT_TRUE(found_missing)
+      << "At least one zone " << second_zone_to_fail
+      << " OSD should have the object missing after coming back up";
+
+    // Get the first OSD with missing object to use for recovery
+    int second_missing_osd = osds_with_missing[0];
+    std::cout << "  Using OSD " << second_missing_osd << " as the recovery target" << std::endl;
+
+    // Use the fixture helper to run recovery and verify callbacks
+    // This will recover the object to all missing OSDs in the second zone
+    // Pass the expected data based on whether it was a partial or full write
+    run_recovery(obj_name, first_zone_to_fail != 0, expected_data);
+
+    // Step 11: Verify data is readable after second recovery
+    std::cout << "Step 11: Verifying data after second zone recovery" << std::endl;
+    verify_object(obj_name);
+
+    // Step 12: Scrub to verify data integrity after both recoveries
+    std::cout << "Step 12: Scrubbing object to verify data integrity after both recoveries" << std::endl;
+    corruption_detected = scrub_object(obj_name);
+    ASSERT_FALSE(corruption_detected)
+      << "Scrub detected corruption in object '" << obj_name
+      << "' after both zone recoveries with " << (degraded_write_size < object_size ? "partial" : "full")
+      << " write (write_size=" << degraded_write_size << ", object_size=" << object_size << ")";
+    finish_stretch_recovery();
+
+    std::cout << "=== Zone-level recovery test (zone " << first_zone_to_fail
+              << " first) completed successfully ===" << std::endl;
   }
 };
 
@@ -85,6 +898,91 @@ TEST_P(TestECFailoverWithPeering, WriteWithPeering) {
   auto* primary_ps = get_primary_test_pg()->get_peering_state();
   ASSERT_GT(primary_ps->get_pg_log().get_log().log.size(), 0)
     << "Primary should have log entries after write";
+}
+
+// A write sends every shard of the other zone a sub-write that carries
+// data, so cross_zone_write_bytes counts at least the bytes written.
+TEST_P(TestECFailoverWithPeering, CrossZoneWriteBytesCounted) {
+  if (num_zones != 2) {
+    GTEST_SKIP() << "requires num_zones == 2";
+  }
+  PerfCounters *logger = get_primary_listener()->get_logger();
+  const uint64_t ops_before = logger->get(l_osd_stretch_cross_zone_write_ops);
+  const uint64_t bytes_before = logger->get(l_osd_stretch_cross_zone_write_bytes);
+
+  const std::string test_data(8192, 'x');
+  create_and_write_verify("test_cross_zone_write_bytes", test_data);
+
+  // every write of the object sends a sub-write to each shard of zone 1
+  const uint64_t ops = logger->get(l_osd_stretch_cross_zone_write_ops) - ops_before;
+  ASSERT_GE(ops, static_cast<uint64_t>(k + m));
+  EXPECT_EQ(0u, ops % (k + m));
+  EXPECT_GE(logger->get(l_osd_stretch_cross_zone_write_bytes) - bytes_before,
+            test_data.size());
+}
+
+// Async recovery keeps each zone of a stretched pool at its min_size: OSDs
+// of one zone that missed different writes are recovered asynchronously
+// only as far as the zone has shards above min_size.
+// A read that the primary's zone cannot serve reads the other zone's
+// shards, and the cross-zone sub-read counters count it.
+TEST_P(TestECFailoverWithPeering, CrossZoneReadCounted) {
+  if (num_zones != 2) {
+    GTEST_SKIP() << "requires num_zones == 2";
+  }
+  const std::string obj_name = "test_cross_zone_read";
+  const std::string test_data(k * stripe_unit, 'r');
+  create_and_write_verify(obj_name, test_data);
+
+  // more errors than zone 0 can decode around, none on the primary's shard
+  for (int shard = 1; shard <= m + 1; ++shard) {
+    inject_read_error_for_shard(obj_name, shard, -EIO);
+  }
+  PerfCounters *logger = get_primary_listener()->get_logger();
+  const uint64_t ops_before = logger->get(l_osd_stretch_cross_zone_read_ops);
+  const uint64_t sent_before =
+    logger->get(l_osd_stretch_cross_zone_read_sent_bytes);
+  const uint64_t recv_before =
+    logger->get(l_osd_stretch_cross_zone_read_recv_bytes);
+
+  bufferlist out;
+  ASSERT_EQ(static_cast<int>(test_data.size()),
+            read_object(obj_name, 0, test_data.size(), out, test_data.size()));
+  EXPECT_EQ(test_data, out.to_str());
+
+  EXPECT_GT(logger->get(l_osd_stretch_cross_zone_read_ops), ops_before);
+  EXPECT_GT(logger->get(l_osd_stretch_cross_zone_read_sent_bytes), sent_before);
+  EXPECT_GT(logger->get(l_osd_stretch_cross_zone_read_recv_bytes), recv_before);
+}
+
+TEST_P(TestECFailoverWithPeering, AsyncRecoveryKeepsEachZoneAtMinSize) {
+  if (num_zones != 2) {
+    GTEST_SKIP() << "requires num_zones == 2";
+  }
+  ScopedConfig cfg_async_recovery("osd_async_recovery_min_cost", "0");
+  const pg_pool_t *pool = osdmap->get_pg_pool(pool_id);
+  const int spare = k + m - pool->min_size;
+  ASSERT_GE(spare, 1);
+  const std::vector<int> zone1 = zone_osds(1);
+  const std::string data(stripe_unit * k, 'A');
+
+  // each of spare + 1 OSDs of zone 1 misses a write to its own object
+  for (int i = 0; i <= spare; ++i) {
+    mark_osd_down(zone1[i]);
+    create_and_write_verify("obj" + std::to_string(i), data);
+    mark_osd_up(zone1[i]);
+  }
+
+  PeeringState *ps = get_primary_test_pg()->get_peering_state();
+  ASSERT_TRUE(ps->is_active()) << ps->get_current_state();
+  int async_in_zone1 = 0;
+  for (const pg_shard_t &shard : ps->get_async_recovery_targets()) {
+    if (std::ranges::find(zone1, shard.osd) != zone1.end()) {
+      ++async_in_zone1;
+    }
+  }
+  EXPECT_LE(async_in_zone1, spare);
+  EXPECT_EQ(0u, osdmap->num_acting_below_min_size(*pool, ps->get_acting()));
 }
 
 TEST_P(TestECFailoverWithPeering, OSDFailureWithPeering) {
@@ -297,6 +1195,74 @@ TEST_P(TestECFailoverWithPeering, RecoveryWithPeering) {
   ASSERT_TRUE(listener_ptr->activate_complete_called)
     << "on_activate_complete should have been called during peering";
 }
+
+TEST_P(TestECFailoverWithPeering, MultiZoneFailoverWithPeering) {
+  const auto& config = GetParam();
+
+  // Skip test if zones are not configured or only one zone
+  if (config.num_zones != 2) {
+    GTEST_SKIP() << "MultiZoneFailoverWithPeering test requires num_zones == 2";
+  }
+
+  ASSERT_TRUE(all_shards_active()) << "Initial peering must complete";
+
+  const std::string obj_name = "test_multizone_failover";
+  const std::string test_data = "Data for multi-zone failover test";
+
+  // Write data before failure and verify
+  create_and_write_verify(obj_name, test_data);
+
+  // Fail the first k+m OSDs (entire first zone)
+  // With num_zones=2 and k=4, m=2, we have 12 total OSDs
+  // Failing the first 6 (k+m) simulates losing an entire zone
+  std::vector<int> failed_osds = zone_osds(0);
+  fail_zone(0);
+
+  // Verify the primary has changed (OSD 0 was in the failed zone)
+  int new_primary_shard = get_primary_shard_from_osdmap();
+  ASSERT_GE(new_primary_shard, k + m)
+    << "New primary should be from the second zone (>= k+m)";
+
+  auto* primary_ps = get_primary_test_pg()->get_peering_state();
+  for (int failed_osd : failed_osds) {
+    ASSERT_TRUE(primary_ps->get_acting_recovery_backfill().count(
+      pg_shard_t(failed_osd, shard_id_t(failed_osd))) == 0)
+      << "Failed OSD " << failed_osd << " should not be in acting set";
+  }
+
+  ASSERT_TRUE(all_shards_active())
+    << "Surviving zone should be fully active after zone failover, primary state: "
+    << get_state_name(new_primary_shard);
+
+  // Perform degraded read after failover
+  // With 2 zones of k=4,m=2 each, losing one zone (6 OSDs) leaves us with
+  // 6 remaining OSDs, which is exactly k+m and sufficient for EC reconstruction
+  verify_object(obj_name);
+}
+
+// Degraded stretch mode only handles two zones, so with three zones every
+// zone must still meet min_size: losing one leaves the PG peered until it is
+// back.
+TEST_P(TestECFailoverWithPeering, ThreeZoneZoneLossPeeredUntilZoneReturns) {
+  if (num_zones != 3) {
+    GTEST_SKIP() << "requires num_zones == 3";
+  }
+  ASSERT_TRUE(all_shards_active()) << "Initial peering must complete";
+  const std::string obj_name = "test_3zone_loss";
+  create_and_write_verify(obj_name, "Data for three-zone loss");
+
+  for (int zone = 0; zone < num_zones; ++zone) {
+    mark_osds_down(zone_osds(zone));
+    EXPECT_FALSE(get_primary_test_pg()->get_peering_state()->is_active())
+      << "zone " << zone << " down";
+    for (int osd : zone_osds(zone)) {
+      mark_osd_up(osd);
+    }
+    ASSERT_TRUE(all_shards_active()) << "zone " << zone << " back";
+    verify_object(obj_name);
+  }
+}
+
 TEST_P(TestECFailoverWithPeering, ZeroSizeObjectWithAttributesRecovery) {
   //  ASSERT_TRUE(all_shards_active()) << "Initial peering must complete";
 
@@ -388,6 +1354,14 @@ const std::vector<BackendConfig> kECPeeringConfigs = {
   {PGBackendTestFixture::EC, "jerasure", "reed_sol_van", pg_pool_t::FLAG_EC_OVERWRITES | pg_pool_t::FLAG_EC_OPTIMIZATIONS,  16384, 4, 2, 1, "EC_Jerasure_Opt_k4m2_su16k"},
   {PGBackendTestFixture::EC, "jerasure", "reed_sol_van", pg_pool_t::FLAG_EC_OVERWRITES | pg_pool_t::FLAG_EC_OPTIMIZATIONS,  4096,  2, 1, 1, "EC_Jerasure_Opt_k2m1_su4k"},
   {PGBackendTestFixture::EC, "jerasure", "reed_sol_van", pg_pool_t::FLAG_EC_OVERWRITES | pg_pool_t::FLAG_EC_OPTIMIZATIONS,  4096,  8, 3, 1, "EC_Jerasure_Opt_k8m3_su4k"},
+
+  // Multi-zone configuration (num_zones = 2)
+  {PGBackendTestFixture::EC, "isa", "reed_sol_van", pg_pool_t::FLAG_EC_OVERWRITES | pg_pool_t::FLAG_EC_OPTIMIZATIONS,  4096,  4, 2, 2, "EC_ISA_Opt_k4m2_zones2"},
+  {PGBackendTestFixture::EC, "isa", "reed_sol_van", pg_pool_t::FLAG_EC_OVERWRITES | pg_pool_t::FLAG_EC_OPTIMIZATIONS,  4096,  2, 1, 2, "EC_ISA_Opt_k2m1_zones2"},
+  {PGBackendTestFixture::EC, "isa", "reed_sol_van", pg_pool_t::FLAG_EC_OVERWRITES | pg_pool_t::FLAG_EC_OPTIMIZATIONS,  4096,  8, 3, 2, "EC_ISA_Opt_k8m3_zones2"},
+  {PGBackendTestFixture::EC, "jerasure", "reed_sol_van", pg_pool_t::FLAG_EC_OVERWRITES | pg_pool_t::FLAG_EC_OPTIMIZATIONS,  8192,  4, 2, 2, "EC_Jerasure_Opt_k4m2_su8k_zones2"},
+  {PGBackendTestFixture::EC, "isa", "reed_sol_van", pg_pool_t::FLAG_EC_OVERWRITES | pg_pool_t::FLAG_EC_OPTIMIZATIONS,  4096,  2, 1, 3, "EC_ISA_Opt_k2m1_zones3"},
+  {PGBackendTestFixture::EC, "isa", "reed_sol_van", pg_pool_t::FLAG_EC_OVERWRITES | pg_pool_t::FLAG_EC_OPTIMIZATIONS,  4096,  4, 2, 3, "EC_ISA_Opt_k4m2_zones3"},
 };
 
 }  // namespace
@@ -1130,7 +2104,8 @@ TEST_P(TestECFailoverWithPeering, ScrubDetectsCorruption) {
                 << ", supports_crc=" << (supports_crc ? "true" : "false")
                 << ")" << std::endl;
 
-      if (supports_crc) {
+      // over zones the copies of a shard are compared with any plugin
+      if (supports_crc || num_zones > 1) {
         EXPECT_TRUE(corruption_detected)
           << "scrub_object() should detect corruption for object " << obj_name
           << " during zone iteration " << zone
@@ -1207,7 +2182,8 @@ TEST_P(TestECFailoverWithPeering, ObjectTrackerDetectsCorruption) {
   bool corruption_after = scrub_object(obj_name, /*skip_verify=*/true);
 
   const bool supports_crc = (ec_plugin == "isa");
-  if (supports_crc) {
+  // over zones the copies of a shard are compared with any plugin
+  if (supports_crc || num_zones > 1) {
     EXPECT_TRUE(corruption_after)
       << "Scrub should detect corruption after we corrupted the object";
   } else {
@@ -1241,6 +2217,11 @@ TEST_P(TestECFailoverWithPeering, OSD0DownAddNewOSDRecovery) {
   auto new_osdmap = std::make_shared<OSDMap>();
   new_osdmap->deepish_copy_from(*osdmap);
   OSDMapTestHelpers::new_osd_up(*new_osdmap, new_osd_id, pgid, 0);
+  if (num_zones > 1) {
+    OSDMapTestHelpers::insert_stretch_osd(
+      g_ceph_context, *new_osdmap->crush, new_osd_id, 0);
+    new_osdmap->crush->finalize();
+  }
   update_osdmap_with_peering(new_osdmap);
 
   // Verify peering completed with the new OSD
@@ -1974,6 +2955,1282 @@ TEST_P(TestECFailoverWithPeering, ECRollbackPreservesOlderShardVersions) {
   std::cout << "=== ECRollbackPreservesOlderShardVersions completed successfully ===" << std::endl;
 }
 
+/**
+ * RollbackTruncate*
+ *
+ * Roll back a divergent op that truncates an object to a size that ends part
+ * way through a page of the first shard, optionally writing to the object in
+ * the same op. Rollback must restore the data that the truncate removed,
+ * including the rest of the page holding the new end, which the truncate
+ * zeroes. The truncate leaves a partial stripe at the new end, so the op also
+ * rewrites the parity, which must be restored too.
+ */
+TEST_P(TestECFailoverWithPeering, RollbackTruncate) {
+  const uint64_t sw = k * stripe_unit;
+  const uint64_t truncate_to = sw + stripe_unit / 2 + 1;
+  rollback_truncate_and_write("rollback_truncate",
+                              8 * sw + 3 * stripe_unit, truncate_to, {});
+}
+
+// Write below the new end, ending at it.
+TEST_P(TestECFailoverWithPeering, RollbackTruncateAndWriteBelowNewEnd) {
+  const uint64_t sw = k * stripe_unit;
+  const uint64_t truncate_to = sw + stripe_unit / 2 + 1;
+  rollback_truncate_and_write("rollback_truncate_below",
+                              8 * sw + 3 * stripe_unit, truncate_to,
+                              {{truncate_to - stripe_unit / 4, stripe_unit / 4}});
+}
+
+// Write straddling the new end.
+TEST_P(TestECFailoverWithPeering, RollbackTruncateAndWriteAcrossNewEnd) {
+  const uint64_t sw = k * stripe_unit;
+  const uint64_t truncate_to = sw + stripe_unit / 2 + 1;
+  rollback_truncate_and_write("rollback_truncate_across",
+                              8 * sw + 3 * stripe_unit, truncate_to,
+                              {{truncate_to - stripe_unit / 4, stripe_unit / 2}});
+}
+
+// Write starting just above the new end, in the page that holds it.
+TEST_P(TestECFailoverWithPeering, RollbackTruncateAndWriteAboveNewEnd) {
+  const uint64_t sw = k * stripe_unit;
+  const uint64_t truncate_to = sw + stripe_unit / 2 + 1;
+  rollback_truncate_and_write("rollback_truncate_above",
+                              8 * sw + 3 * stripe_unit, truncate_to,
+                              {{truncate_to + 7, stripe_unit}});
+}
+
+// Write inside the truncated range, stripes above the new end.
+TEST_P(TestECFailoverWithPeering, RollbackTruncateAndWriteInTruncatedRange) {
+  const uint64_t sw = k * stripe_unit;
+  const uint64_t truncate_to = sw + stripe_unit / 2 + 1;
+  rollback_truncate_and_write("rollback_truncate_in_range",
+                              8 * sw + 3 * stripe_unit, truncate_to,
+                              {{4 * sw + 7, stripe_unit}});
+}
+
+/**
+ * RollbackTruncateUp
+ *
+ * Roll back a divergent op that truncates an object to a larger size. The
+ * rollback truncates each shard back to its old size, which differs between
+ * shards.
+ */
+TEST_P(TestECFailoverWithPeering, RollbackTruncateUp) {
+  const uint64_t sw = k * stripe_unit;
+  const uint64_t object_size = 5 * sw + stripe_unit + 123;
+  run_rollback("rollback_truncate_up",
+               {{object_size, {}, {{Truncate(object_size + sw + 77)}}}},
+               1, get_shard(k + m - 1));
+}
+
+/**
+ * TruncateAndWriteInPage, WritesInPageAboveEnd
+ *
+ * An op that leaves a gap between two extents of a shard within a page, here
+ * between the part of a page that a truncate keeps and a write further into
+ * that page, or between two writes to a page above the end of the object,
+ * must keep the data on either side of the gap and zero the gap.
+ */
+TEST_P(TestECFailoverWithPeering, TruncateAndWriteInPage) {
+  const uint64_t sw = k * stripe_unit;
+  run_forward("truncate_and_write_in_page",
+              {{5 * sw + stripe_unit + 123, {}, {{Truncate(1), Write(8, 50)}}}});
+}
+
+TEST_P(TestECFailoverWithPeering, WritesInPageAboveEnd) {
+  const uint64_t sw = k * stripe_unit;
+  const uint64_t object_size = 5 * sw + stripe_unit + 123;
+  const uint64_t page = ECUtil::align_next(object_size);
+  run_forward("writes_in_page_above_end",
+              {{object_size, {}, {{Write(page + 10, 10), Write(page + 100, 10)}}}});
+}
+
+/**
+ * ECZoneRecoveryTest - Test zone-level EC recovery scenario (zone 0 fails first)
+ *
+ * This test verifies the EC recovery mechanism at the zone level by:
+ * 1. Writing and verifying an object with pattern A
+ * 2. Failing all OSDs in zone 0 (simulating zone failure)
+ * 3. Writing and verifying pattern B (overwrite with zone 0 down)
+ * 4. Bringing zone 0 OSDs back up
+ * 5. Running recovery to sync zone 0 with the new data
+ * 6. Reading data - should get pattern B (latest write)
+ * 7. Failing all OSDs in zone 1
+ * 8. Reading data again - should still get pattern B (from recovered zone 0)
+ *
+ * This test only runs for multi-zone configurations (num_zones > 1).
+ */
+TEST_P(TestECFailoverWithPeering, ECZoneRecoveryTest) {
+  // Skip test if zones are not configured or only one zone
+  if (num_zones != 2) {
+    GTEST_SKIP() << "ECZoneRecoveryTest requires num_zones == 2";
+  }
+
+  ASSERT_TRUE(all_shards_active()) << "Initial peering must complete";
+
+  // Run test with zone 0 failing first
+  run_zone_recovery_test(0, "zone0_first");
+}
+
+/**
+ * ECZoneRecoveryTestReverse - Test zone-level EC recovery scenario (zone 1 fails first)
+ *
+ * This test verifies the EC recovery mechanism at the zone level by:
+ * 1. Writing and verifying an object with pattern A
+ * 2. Failing all OSDs in zone 1 (simulating zone failure)
+ * 3. Writing and verifying pattern B (overwrite with zone 1 down)
+ * 4. Bringing zone 1 OSDs back up
+ * 5. Running recovery to sync zone 1 with the new data
+ * 6. Reading data - should get pattern B (latest write)
+ * 7. Failing all OSDs in zone 0
+ * 8. Reading data again - should still get pattern B (from recovered zone 1)
+ *
+ * This test only runs for multi-zone configurations (num_zones > 1).
+ */
+TEST_P(TestECFailoverWithPeering, ECZoneRecoveryTestReverse) {
+  // Skip test if zones are not configured or only one zone
+  if (num_zones != 2) {
+    GTEST_SKIP() << "ECZoneRecoveryTestReverse requires num_zones == 2";
+  }
+
+  ASSERT_TRUE(all_shards_active()) << "Initial peering must complete";
+
+  // Run test with zone 1 failing first (opposite order)
+  run_zone_recovery_test(1, "zone1_first");
+}
+
+/**
+ * ECZoneRecoveryPartialWriteTest - Test zone-level EC recovery with partial writes
+ *
+ * This test verifies the EC recovery mechanism at the zone level when partial
+ * writes are performed during degraded mode. The test:
+ * 1. Writes and verifies an object with pattern A (full stripe)
+ * 2. Fails all OSDs in zone 0 (simulating zone failure)
+ * 3. Writes and verifies pattern B as a PARTIAL write (half stripe) with zone 0 down
+ * 4. Brings zone 0 OSDs back up
+ * 5. Runs recovery to sync zone 0 with the partial write
+ * 6. Reads data - should get pattern B for the partial region and pattern A for remainder
+ * 7. Fails all OSDs in zone 1
+ * 8. Reads data again - should still get the correct partial write (from recovered zone 0)
+ *
+ * This test only runs for multi-zone configurations (num_zones > 1).
+ */
+TEST_P(TestECFailoverWithPeering, ECZoneRecoveryPartialWriteTest) {
+  // Skip test if zones are not configured or only one zone
+  if (num_zones != 2) {
+    GTEST_SKIP() << "ECZoneRecoveryPartialWriteTest requires num_zones == 2";
+  }
+
+  ASSERT_TRUE(all_shards_active()) << "Initial peering must complete";
+
+  // Test with a partial write size (half of a full stripe)
+  size_t partial_write_size = (stripe_unit * k) / 2;
+
+  // Run test with zone 0 failing first and a partial write
+  run_zone_recovery_test(0, "zone0_partial", partial_write_size);
+}
+
+TEST_P(TestECFailoverWithPeering, ECZoneRecoveryPartialWriteTestReverse) {
+  // Skip test if zones are not configured or only one zone
+  if (num_zones != 2) {
+    GTEST_SKIP() << "ECZoneRecoveryPartialWriteTest requires num_zones == 2";
+  }
+
+  ASSERT_TRUE(all_shards_active()) << "Initial peering must complete";
+
+  // Test with a partial write size (half of a full stripe)
+  size_t partial_write_size = (stripe_unit * k) / 2;
+
+  // Run test with zone 0 failing first and a partial write
+  run_zone_recovery_test(1, "zone1_partial", partial_write_size);
+}
+
+/**
+ * ECMinAvailableTest - Test minimum available shards for PG activation
+ *
+ * This test verifies that a PG does not go active when too many shards
+ * are offline in one zone, even though the other zone is complete. In
+ * healthy stretch mode min_size applies to every zone, so each zone
+ * tolerates k+m-min_size failures. The test:
+ * 1. Writes an object
+ * 2. Takes the tolerated number of shards offline in zone 0, starting at
+ *    shard 1
+ * 3. Takes an additional shard offline in zone 0 - PG should NOT go active
+ * 4. Takes shard k+m+1 offline (from zone 1)
+ * 5. Brings back shard 1
+ * 6. Asserts there is no recovery scheduled
+ *
+ * This test only runs for multi-zone configurations (num_zones > 1).
+ */
+TEST_P(TestECFailoverWithPeering, ECMinAvailableTest) {
+  // Skip test if zones are not configured or only one zone
+  if (num_zones <= 1) {
+    GTEST_SKIP() << "ECMinAvailableTest requires num_zones > 1";
+  }
+
+  ASSERT_TRUE(all_shards_active()) << "Initial peering must complete";
+
+  const std::string obj_name = "test_min_available";
+  const size_t data_size = stripe_unit * k;  // One full stripe
+  std::string test_data(data_size, 'X');
+
+  // Get min_size from the pool
+  const pg_pool_t* pool = osdmap->get_pg_pool(pool_id);
+  ASSERT_NE(pool, nullptr);
+  unsigned int min_size = pool->min_size;
+  const int tolerated = k + m - min_size;
+  ASSERT_GE(tolerated, 1);
+
+  std::cout << "\n=== Testing minimum available shards (k=" << k
+            << ", m=" << m << ", zones=" << num_zones
+            << ", min_size=" << min_size << ") ===" << std::endl;
+
+  // Step 1: Write an object
+  std::cout << "Step 1: Writing object" << std::endl;
+  create_and_write_verify(obj_name, test_data);
+
+  // Step 2: Take the tolerated number of shards offline in zone 0
+  std::cout << "Step 2: Taking " << tolerated << " shards offline in zone 0, starting at shard 1" << std::endl;
+  std::vector<int> failed_shards_zone0;
+  for (int i = 1; i <= tolerated; i++) {
+    failed_shards_zone0.push_back(i);
+  }
+  mark_osds_down(failed_shards_zone0);
+
+  // Zone 0 now has exactly min_size shards, so PG should still be active
+  ASSERT_TRUE(all_shards_active())
+    << "PG should still be active with " << tolerated << " shards down in zone 0";
+
+  // Step 3: Take an additional shard offline in zone 0
+  int additional_shard_zone0 = tolerated + 1;
+  std::cout << "Step 3: Taking additional shard " << additional_shard_zone0
+            << " offline in zone 0" << std::endl;
+  mark_osd_down(additional_shard_zone0);
+
+  // Zone 0 is now below min_size, so PG should NOT be active
+  std::cout << "Step 3: Checking that PG is NOT active" << std::endl;
+  ASSERT_FALSE(all_shards_active())
+    << "PG should NOT be active with " << (tolerated + 1) << " shards down in zone 0";
+
+  // Step 4: Take shard k+m+1 offline (first shard in zone 1, after shard k+m which is zone 0's last)
+  int shard_zone1 = k + m + 1;
+  std::cout << "Step 4: Taking shard " << shard_zone1 << " offline (zone 1)" << std::endl;
+  mark_osd_down(shard_zone1);
+
+  // PG should still not be active
+  ASSERT_FALSE(all_shards_active())
+    << "PG should still NOT be active after taking zone 1 shard offline";
+
+  // Step 5: Bring back shard 1; zone 0 is back at min_size and zone 1 is
+  // within its tolerated failures.
+  std::cout << "Step 5: Bringing shard 1 back online" << std::endl;
+  mark_osd_up(1);
+
+  // Step 6: Assert there is no recovery scheduled
+  // After bringing shard 1 back, zone 0 has min_size shards again
+  // (shard 0, shard 1, and shards tolerated+2 to k+m-1)
+  // The PG should become active, but since shard 1 was down during the write,
+  // it should be marked for recovery
+  std::cout << "Step 6: Checking recovery state" << std::endl;
+
+  // Get the current primary
+  int current_primary = get_primary_shard_from_osdmap();
+  ASSERT_GE(current_primary, 0) << "Should have a valid primary";
+
+  auto primary_ps = get_primary_test_pg()->get_peering_state();
+
+  // The headline assertion this test exists for: after bringing shard 1
+  // back, the PG must actually be active, or none of the peer_missing
+  // checking below means anything.
+  ASSERT_TRUE(primary_ps->is_active())
+    << "PG should be active after bringing shard 1 back online. State: "
+    << primary_ps->get_current_state();
+
+  // Check peer_missing to see if shard 1 has missing objects
+  const auto& peer_missing_map = primary_ps->get_peer_missing();
+
+  hobject_t hoid = make_test_object(obj_name);
+  pg_shard_t shard1(1, shard_id_t(1));
+
+  auto peer_missing_it = peer_missing_map.find(shard1);
+  if (peer_missing_it != peer_missing_map.end()) {
+    const pg_missing_t& peer_missing = peer_missing_it->second;
+    bool is_missing = peer_missing.is_missing(hoid);
+
+    std::cout << "  Shard 1 missing status for object: " << (is_missing ? "MISSING" : "NOT MISSING") << std::endl;
+
+    // Since shard 1 was down when we wrote the object, it should NOT be missing
+    // because we never successfully wrote to it in the first place
+    // Recovery should not be scheduled for objects that were never written
+    ASSERT_FALSE(is_missing)
+      << "Shard 1 should not have the object marked as missing since it was down during write";
+  } else {
+    std::cout << "  Shard 1 not in peer_missing_map (no recovery needed)" << std::endl;
+  }
+
+  std::cout << "=== ECMinAvailableTest completed successfully ===" << std::endl;
+}
+
+/**
+ * AddNewZoneWhileSingleZone - Test adding a second zone to a single-zone pool.
+ *
+ * This test is restricted to configurations that start with num_zones == 1.
+ * It exercises the full lifecycle of a second zone being added to a running pool:
+ *
+ * 1. Write an object and verify it via the original single zone.
+ * 2. Add a new zone (k+m new OSDs, pool size/num_zones/min_size updated), then
+ *    scrub to confirm the pool is consistent with both zones active.
+ * 3. Take the original zone offline (mark all k+m original OSDs down, lower
+ *    min_size to the new single-zone value).
+ * 4. Read / verify the object from the new zone alone, then write a third
+ *    object while the original zone is still down, so it has something to
+ *    recover.
+ * 5. Bring the original zone back online and recover the write it missed
+ *    while it was down.
+ * 6. Remove the new zone (shrink acting set and pool back to single-zone).
+ */
+TEST_P(TestECFailoverWithPeering, AddNewZoneWhileSingleZone) {
+  // This test targets single-zone pools only.
+  if (num_zones != 1) {
+    GTEST_SKIP() << "AddNewZoneWhileSingleZone only runs for num_zones == 1";
+  }
+
+  ASSERT_TRUE(all_shards_active()) << "Initial peering must complete";
+
+  const std::string obj_name = "test_add_zone";
+  const std::string obj_name2 = "test_add_zone_2";
+  const std::string obj_name3 = "test_add_zone_3";
+  const size_t data_size = stripe_unit * k;
+  const std::string pattern_a(data_size, 'A');
+  const std::string pattern_b(data_size, 'B');
+  const std::string pattern_c(data_size, 'C');
+
+  // ------------------------------------------------------------------
+  // Step 1: Write and verify via the original zone.
+  // ------------------------------------------------------------------
+  std::cout << "Step 1: Writing pattern A to original single zone" << std::endl;
+  create_and_write_verify(obj_name, pattern_a);
+  ASSERT_TRUE(primary_is_clean()) << "Pool should be clean after initial write";
+
+  // ------------------------------------------------------------------
+  // Step 2: Add a second zone and scrub.
+  //
+  // A "zone" in multi-zone EC pools is a replica of the full k+m acting
+  // set.  Zone 0 uses OSDs 0..(k+m-1) and zone 1 uses OSDs (k+m)..(2(k+m)-1).
+  // We must:
+  //   a. Add k+m new OSDs to the OSDMap (they appear as new, up OSDs).
+  //   b. Extend the pg_upmap so the new shard positions point at the new OSDs.
+  //   c. Update the pool: size, num_zones, min_size, nonprimary_shards.
+  //   d. Trigger peering so PeeringState picks up the new acting set.
+  // ------------------------------------------------------------------
+  std::cout << "Step 2: Adding new zone (OSDs " << (k + m)
+            << ".." << (2 * (k + m) - 1) << ")" << std::endl;
+
+  const int zone0_start = 0;
+  const int zone1_start = k + m;
+
+  {
+    auto new_osdmap = std::make_shared<OSDMap>();
+    new_osdmap->deepish_copy_from(*osdmap);
+
+    // 2a. Add k+m new OSDs for zone 1.
+    for (int i = zone1_start; i < zone1_start + (k + m); ++i) {
+      OSDMapTestHelpers::add_osd(*new_osdmap, i);
+      OSDMapTestHelpers::mark_osd_up(*new_osdmap, i);
+    }
+
+    // 2b. Build the new acting set: zone 0 first, then zone 1.
+    //     For EC pools the pg_upmap lists shard positions in order.
+    std::vector<int> new_acting;
+    for (int i = zone0_start; i < zone0_start + (k + m); ++i) {
+      new_acting.push_back(i);
+    }
+    for (int i = zone1_start; i < zone1_start + (k + m); ++i) {
+      new_acting.push_back(i);
+    }
+
+    // 2c. Update pool settings for 2-zone configuration.
+    const pg_pool_t* existing = new_osdmap->get_pg_pool(pool_id);
+    ceph_assert(existing != nullptr);
+    pg_pool_t updated = *existing;
+    updated.size = 2 * (k + m);
+    updated.num_zones = 2;
+    // min_size = num_zones * (k+m) - m
+    updated.min_size = 2 * (k + m) - m;
+    if (pool_flags & pg_pool_t::FLAG_EC_OPTIMIZATIONS) {
+      updated.nonprimary_shards = ECUtil::nonprimary_shards(k, m, {}, 2);
+    }
+
+    // Apply pool update, pg_upmap extension, and pg_temp clear in a single
+    // incremental.  Splitting these into separate epochs would create a
+    // transient state where pool.size == 2*(k+m) but pg_temp still has the
+    // old k+m entries, causing pgtemp_undo_primaryfirst to assert.
+    {
+      OSDMap::Incremental inc(new_osdmap->get_epoch() + 1);
+      inc.fsid = new_osdmap->get_fsid();
+      inc.new_pools[pool_id] = updated;
+      inc.new_pg_upmap[pgid] = mempool::osdmap::vector<int32_t>(
+        new_acting.begin(), new_acting.end());
+      // Clear any stale pg_temp; it was sized for the old pool and is now
+      // invalid.  Peering will set a new one after activation.
+      inc.new_pg_temp[pgid] = mempool::osdmap::vector<int32_t>();
+      new_osdmap->apply_incremental(inc);
+    }
+
+    update_osdmap_with_peering(new_osdmap);
+  }
+
+  // After adding zone 1, all shards across both zones should peer and go active.
+  ASSERT_TRUE(all_shards_active())
+    << "All shards (both zones) should be active after zone addition";
+
+  // Write a second object now that both zones are active.  This object will
+  // be written to both zone 0 and zone 1 shards, so zone 1 holds its data
+  // without any backfill and we can read it when zone 0 goes offline.
+  // Note: the pool is degraded because obj_name (written before zone 1) is
+  // still missing from zone-1 shards pending recovery; do not assert clean.
+  std::cout << "Step 2 (write): Writing pattern B to both zones" << std::endl;
+  create_and_write_verify(obj_name2, pattern_b);
+
+  // Scrub obj_name2 (just written to both zones, so every shard genuinely
+  // has it - unlike obj_name, which predates zone 1 and is still pending
+  // backfill onto zone-1 shards, so scrubbing it here would flag legitimate
+  // missing-shard degradation as corruption) to confirm the pool is
+  // consistent now that both zones are active, as this test's docstring
+  // claims step 2 does. This is the actual fix for the gap the previous
+  // commit's ASSERT_GT(scrub_object_call_count, 0) demonstrated: nothing
+  // here ever called scrub_object() before.
+  ASSERT_FALSE(scrub_object(obj_name2))
+    << "Scrub should find no corruption in " << obj_name2
+    << " with both zones active";
+
+  // This test's own docstring claims step 2 "scrub[s] to confirm the pool
+  // is consistent with both zones active" - verify that actually happened
+  // (scrub_object_call_count is 0 for a freshly constructed fixture, so
+  // this only passes if something in this test body actually scrubbed).
+  ASSERT_GT(scrub_object_call_count, 0)
+    << "Step 2 should scrub to confirm consistency with both zones active, "
+       "as this test's docstring claims, but scrub_object() was never called";
+
+  // ------------------------------------------------------------------
+  // Step 3: Take the original zone offline.
+  // ------------------------------------------------------------------
+  std::cout << "Step 3: Taking original zone (OSDs 0.." << (k + m - 1)
+            << ") offline" << std::endl;
+
+  std::vector<int> zone0_osds;
+  for (int i = zone0_start; i < zone0_start + (k + m); ++i) {
+    zone0_osds.push_back(i);
+  }
+  mark_osds_down(zone0_osds);
+
+  // With zone 0 gone we are back to a single active zone, so min_size
+  // reverts to the single-zone value: (k+m) - m = k.
+  set_pool_min_size(static_cast<unsigned>((k + m) - m));
+
+  // Verify the new primary is from zone 1.
+  int primary_after_zone0_down = get_primary_shard_from_osdmap();
+  ASSERT_GE(primary_after_zone0_down, zone1_start)
+    << "Primary should be from zone 1 after zone 0 goes offline";
+  ASSERT_LT(primary_after_zone0_down, zone1_start + (k + m))
+    << "Primary should be from zone 1 after zone 0 goes offline";
+
+  ASSERT_TRUE(all_shards_active())
+    << "Zone 1 shards should be active after zone 0 goes offline";
+
+  // ------------------------------------------------------------------
+  // Step 4: Read / verify from zone 1 only.
+  // obj_name2 was written when both zones were active, so zone 1 holds it.
+  // ------------------------------------------------------------------
+  std::cout << "Step 4: Reading object (written to both zones) from zone 1 only" << std::endl;
+  verify_object(obj_name2);
+
+  // Write a third object while zone 0 is still down, so that zone 0 has
+  // something genuine to recover once it rejoins in step 5. Without this,
+  // zone-0 shards would have no missing objects at all (they already have
+  // obj_name from step 1, and never received obj_name2), so recovery would
+  // have nothing to do and calling it would prove nothing.
+  std::cout << "Step 4 (write): Writing pattern C to zone 1 alone while zone 0 is down" << std::endl;
+  create_and_write_verify(obj_name3, pattern_c);
+
+  // ------------------------------------------------------------------
+  // Step 5: Bring back the original zone and recover.
+  // ------------------------------------------------------------------
+  std::cout << "Step 5: Bringing original zone back online" << std::endl;
+  for (int osd : zone0_osds) {
+    mark_osd_up(osd);
+  }
+
+  // Restore two-zone min_size.
+  set_pool_min_size(static_cast<unsigned>(2 * (k + m) - m));
+
+  ASSERT_TRUE(all_shards_active())
+    << "All shards should be active again after zone 0 comes back online";
+
+  // Zone 0 was offline while obj_name3 was written, so every zone-0 OSD
+  // should have that object in its missing set.  Run recovery now.
+  //
+  // This is the actual fix for the gap the previous commit's
+  // ASSERT_GT(run_recovery_call_count, 0) demonstrated: nothing here ever
+  // called run_recovery() before, and there was nothing to recover anyway
+  // since no write happened while zone 0 was down. recover_primary=true
+  // because once zone 0's OSDs come back up, the primary reverts to zone 0
+  // (its OSDs sort first in the acting set), and that primary is exactly
+  // the one that was down and missed the write.
+  std::cout << "Step 5 (recovery): Recovering zone 0 after rejoining" << std::endl;
+  run_recovery(obj_name3, /*recover_primary=*/true, pattern_c);
+
+  // This test's own docstring (step 5) claims it "recover[s] the missing
+  // writes [zone 0] missed while it was down" - verify recovery actually
+  // ran (run_recovery_call_count is 0 for a freshly constructed fixture,
+  // so this only passes if something in this test body actually recovered).
+  ASSERT_GT(run_recovery_call_count, 0)
+    << "Step 5 should recover zone 0's missed writes, as this test's "
+       "docstring claims, but run_recovery()/run_parallel_recovery() was "
+       "never called";
+
+  // ------------------------------------------------------------------
+  // Step 6: Remove (delete) the new zone.
+  //
+  // To delete zone 1 we shrink the acting set back to zone 0 only, and
+  // restore single-zone pool settings.
+  // ------------------------------------------------------------------
+  std::cout << "Step 6: Removing new zone (reverting to single-zone pool)" << std::endl;
+
+  {
+    auto new_osdmap = std::make_shared<OSDMap>();
+    new_osdmap->deepish_copy_from(*osdmap);
+
+    // Mark zone-1 OSDs as down first (they are being removed).
+    for (int i = zone1_start; i < zone1_start + (k + m); ++i) {
+      OSDMapTestHelpers::mark_osd_down(*new_osdmap, i);
+    }
+
+    // Restore single-zone pool settings.
+    const pg_pool_t* existing = new_osdmap->get_pg_pool(pool_id);
+    ceph_assert(existing != nullptr);
+    pg_pool_t restored = *existing;
+    restored.size = k + m;
+    restored.num_zones = 1;
+    restored.min_size = static_cast<unsigned>((k + m) - m);
+    if (pool_flags & pg_pool_t::FLAG_EC_OPTIMIZATIONS) {
+      restored.nonprimary_shards = ECUtil::nonprimary_shards(k, m, {}, 1);
+    }
+
+    // Shrink pool, pg_upmap, and clear pg_temp in one incremental to avoid a
+    // transient epoch where pool.size == k+m but pg_temp still has 2*(k+m)
+    // entries, which would cause pgtemp_undo_primaryfirst to assert.
+    {
+      std::vector<int> zone0_acting;
+      for (int i = zone0_start; i < zone0_start + (k + m); ++i) {
+        zone0_acting.push_back(i);
+      }
+      OSDMap::Incremental inc(new_osdmap->get_epoch() + 1);
+      inc.fsid = new_osdmap->get_fsid();
+      inc.new_pools[pool_id] = restored;
+      inc.new_pg_upmap[pgid] = mempool::osdmap::vector<int32_t>(
+        zone0_acting.begin(), zone0_acting.end());
+      // Clear the stale pg_temp from the two-zone epoch.
+      inc.new_pg_temp[pgid] = mempool::osdmap::vector<int32_t>();
+      new_osdmap->apply_incremental(inc);
+    }
+
+    update_osdmap_with_peering(new_osdmap);
+  }
+
+  // After removing zone 1, the original zone should become the sole active zone.
+  ASSERT_TRUE(all_shards_active())
+    << "Zone 0 shards should be active after zone 1 is removed";
+
+  // Final read to confirm data is still accessible from the restored single zone.
+  std::cout << "Step 6 (verify): Reading object after zone removal" << std::endl;
+  verify_object(obj_name);
+
+  std::cout << "=== AddNewZoneWhileSingleZone test completed successfully ===" << std::endl;
+}
+
+// Primary stays in zone 0 while zone 0 holds only k-1 shards: reads, writes
+// and recovery must source the missing relative shards from zone 1. A stretch
+// pool only gets there in recovery stretch mode, with zone 0 partly back.
+TEST_P(TestECFailoverWithPeering, LocalZoneBelowKUsesRemoteZone) {
+  if (num_zones != 2) {
+    GTEST_SKIP() << "requires num_zones == 2";
+  }
+
+  const size_t object_size = stripe_unit * k;
+  const std::string full_obj = "test_remote_full";
+  const std::string partial_obj = "test_remote_partial";
+  const std::string pattern_a(object_size, 'A');
+
+  create_and_write_verify(full_obj, pattern_a);
+  create_and_write_verify(partial_obj, pattern_a);
+
+  std::vector<int> failed;
+  for (int i = 1; i <= m + 1; i++) {
+    failed.push_back(i);
+  }
+  fail_zone(0);
+  mark_osd_up(0);
+  for (int osd = m + 2; osd < k + m; osd++) {
+    mark_osd_up(osd);
+  }
+  enter_recovery_stretch_mode();
+  ASSERT_EQ(0, get_primary_shard_from_osdmap());
+  ASSERT_TRUE(all_shards_active());
+
+  verify_object(full_obj);
+  verify_object(partial_obj);
+
+  write_verify(full_obj, 0, std::string(object_size, 'B'), object_size);
+  write_verify(partial_obj, stripe_unit, std::string(stripe_unit, 'C'), object_size);
+  std::string partial_expected = pattern_a;
+  partial_expected.replace(stripe_unit, stripe_unit, std::string(stripe_unit, 'C'));
+
+  for (int osd : failed) {
+    mark_osd_up(osd);
+  }
+  ASSERT_EQ(0, get_primary_shard_from_osdmap());
+  auto* primary_ps = get_primary_test_pg()->get_peering_state();
+  ASSERT_TRUE(primary_ps->is_active());
+  hobject_t full_hoid = make_test_object(full_obj);
+  for (int osd : failed) {
+    const auto& pm = primary_ps->get_peer_missing().at(pg_shard_t(osd, shard_id_t(osd)));
+    EXPECT_TRUE(pm.is_missing(full_hoid)) << "shard " << osd;
+  }
+
+  run_parallel_recovery({full_obj, partial_obj}, false,
+                        {std::string(object_size, 'B'), partial_expected});
+  for (int osd : failed) {
+    const auto& pm = primary_ps->get_peer_missing().at(pg_shard_t(osd, shard_id_t(osd)));
+    EXPECT_FALSE(pm.is_missing(full_hoid)) << "shard " << osd;
+  }
+  EXPECT_FALSE(scrub_object(full_obj));
+  EXPECT_FALSE(scrub_object(partial_obj));
+
+  finish_stretch_recovery();
+  fail_zone(1);
+  ASSERT_LT(get_primary_shard_from_osdmap(), k + m);
+  verify_object(full_obj);
+  verify_object(partial_obj);
+}
+
+// Both copies of the same relative shard miss different writes and are
+// recovered together in one recovery op.
+TEST_P(TestECFailoverWithPeering, SameRelativeShardMissingInBothZones) {
+  if (num_zones != 2) {
+    GTEST_SKIP() << "requires num_zones == 2";
+  }
+
+  const size_t object_size = stripe_unit * k;
+  const int zone0_shard = 1;
+  const int zone1_shard = k + m + 1;
+  const std::string obj1 = "test_same_rel_obj1";
+  const std::string obj2 = "test_same_rel_obj2";
+
+  create_and_write_verify(obj1, std::string(object_size, 'A'));
+  mark_osd_down(zone0_shard);
+  write_verify(obj1, 0, std::string(object_size, 'B'), object_size);
+  mark_osd_down(zone1_shard);
+  write_verify(obj1, 0, std::string(object_size, 'C'), object_size);
+  create_and_write_verify(obj2, std::string(object_size, 'D'));
+  mark_osd_up(zone0_shard);
+  mark_osd_up(zone1_shard);
+
+  auto* primary_ps = get_primary_test_pg()->get_peering_state();
+  ASSERT_TRUE(primary_ps->is_active());
+  for (int shard : {zone0_shard, zone1_shard}) {
+    const auto& pm = primary_ps->get_peer_missing().at(pg_shard_t(shard, shard_id_t(shard)));
+    EXPECT_TRUE(pm.is_missing(make_test_object(obj1))) << "shard " << shard;
+    EXPECT_TRUE(pm.is_missing(make_test_object(obj2))) << "shard " << shard;
+  }
+
+  run_parallel_recovery({obj1, obj2}, false,
+                        {std::string(object_size, 'C'), std::string(object_size, 'D')});
+  for (const std::string& obj : {obj1, obj2}) {
+    EXPECT_EQ(read_shard_object_info(obj, 0).version,
+              read_shard_object_info(obj, zone0_shard).version);
+    EXPECT_EQ(read_shard_object_info(obj, 0).version,
+              read_shard_object_info(obj, zone1_shard).version);
+    EXPECT_FALSE(scrub_object(obj));
+  }
+
+  fail_zone(0);
+  verify_object(obj1);
+  verify_object(obj2);
+}
+
+// A zone-1 nonprimary shard that misses a mix of sub-stripe writes is
+// recovered to the per-shard version of the last write to its relative shard.
+TEST_P(TestECFailoverWithPeering, Zone1NonPrimaryPartialWriteMissingNeed) {
+  if (num_zones != 2 || k < 3) {
+    GTEST_SKIP() << "requires num_zones == 2 and k >= 3";
+  }
+
+  const size_t object_size = stripe_unit * k;
+  const int rel = 2;
+  const int target = k + m + rel;
+  const pg_shard_t target_shard(target, shard_id_t(target));
+  const std::string obj = "test_zone1_partial";
+  const std::string untouched_obj = "test_zone1_untouched";
+  std::string expected(object_size, 'A');
+
+  create_and_write_verify(obj, expected);
+  create_and_write_verify(untouched_obj, expected);
+
+  mark_osd_down(target);
+  write_verify(obj, 0, std::string(stripe_unit, 'B'), object_size);
+  write_verify(obj, rel * stripe_unit, std::string(stripe_unit, 'C'), object_size);
+  const eversion_t rel_write = read_shard_object_info(obj, 0).version;
+  write_verify(obj, 0, std::string(stripe_unit, 'D'), object_size);
+  const eversion_t last_write = read_shard_object_info(obj, 0).version;
+  write_verify(untouched_obj, 0, std::string(stripe_unit, 'E'), object_size);
+  mark_osd_up(target);
+  expected.replace(0, stripe_unit, std::string(stripe_unit, 'D'));
+  expected.replace(rel * stripe_unit, stripe_unit, std::string(stripe_unit, 'C'));
+
+  auto* primary_ps = get_primary_test_pg()->get_peering_state();
+  ASSERT_TRUE(primary_ps->is_active());
+  const pg_missing_t& pm = primary_ps->get_peer_missing().at(target_shard);
+  pg_missing_item item;
+  ASSERT_TRUE(pm.is_missing(make_test_object(obj), &item));
+  EXPECT_EQ(last_write, item.need);
+  EXPECT_FALSE(pm.is_missing(make_test_object(untouched_obj)));
+
+  run_recovery(obj, false, expected);
+  object_info_t primary_oi = read_shard_object_info(obj, 0);
+  EXPECT_EQ(rel_write, primary_oi.get_version_for_shard(shard_id_t(rel)));
+  EXPECT_EQ(rel_write, read_shard_object_info(obj, target).version);
+  EXPECT_EQ(read_shard_object_info(obj, rel).version,
+            read_shard_object_info(obj, target).version);
+  EXPECT_FALSE(scrub_object(obj));
+  EXPECT_FALSE(scrub_object(untouched_obj));
+
+  fail_zone(0);
+  verify_object(obj);
+  verify_object(untouched_obj);
+}
+
+// A zone-1 primary issues sub-stripe writes to live zone-0 nonprimary shards,
+// then zone 0 takes the primary back and recovers from both zones.
+TEST_P(TestECFailoverWithPeering, Zone1PrimaryPartialWritesThenZone0Recovers) {
+  if (num_zones != 2 || k < 3) {
+    GTEST_SKIP() << "requires num_zones == 2 and k >= 3";
+  }
+
+  const size_t object_size = stripe_unit * k;
+  const std::string obj = "test_zone1_primary_partial";
+  std::string expected(object_size, 'A');
+
+  create_and_write_verify(obj, expected);
+  const eversion_t v_create = read_shard_object_info(obj, 0).version;
+
+  std::vector<int> zone0_primaries = {0};
+  for (int i = k; i < k + m; i++) {
+    zone0_primaries.push_back(i);
+  }
+  fail_zone(0);
+  for (int osd = 1; osd < k; osd++) {
+    mark_osd_up(osd);
+  }
+  enter_recovery_stretch_mode();
+  ASSERT_EQ(k + m, get_primary_shard_from_osdmap());
+  ASSERT_TRUE(all_shards_active());
+  create_and_write_verify("dummy", std::string(object_size, 'Z'));
+
+  write_verify(obj, 0, std::string(stripe_unit / 2, 'B'), object_size);
+  write_verify(obj, 2 * stripe_unit, std::string(stripe_unit, 'C'), object_size);
+  const eversion_t v_rel2 = read_shard_object_info(obj, k + m).version;
+  ASSERT_EQ(0, write_attribute(obj, "key", "v1", false));
+  expected.replace(0, stripe_unit / 2, std::string(stripe_unit / 2, 'B'));
+  expected.replace(2 * stripe_unit, stripe_unit, std::string(stripe_unit, 'C'));
+
+  EXPECT_EQ(v_create, read_shard_object_info(obj, 1).version);
+  EXPECT_EQ(v_rel2, read_shard_object_info(obj, 2).version);
+  object_info_t primary_oi = read_shard_object_info(obj, k + m);
+  for (int rel = 1; rel < k; rel++) {
+    EXPECT_EQ(primary_oi.get_version_for_shard(shard_id_t(rel)),
+              read_shard_object_info(obj, rel).version) << "shard " << rel;
+    EXPECT_EQ(primary_oi.get_version_for_shard(shard_id_t(rel)),
+              read_shard_object_info(obj, k + m + rel).version) << "shard " << k + m + rel;
+  }
+
+  for (int osd : zone0_primaries) {
+    mark_osd_up(osd);
+  }
+  ASSERT_EQ(0, get_primary_shard_from_osdmap());
+  run_recovery(obj, true, expected);
+  run_recovery("dummy", true, std::string(object_size, 'Z'));
+  verify_object(obj);
+  primary_oi = read_shard_object_info(obj, 0);
+  for (int rel = 1; rel < k; rel++) {
+    EXPECT_EQ(primary_oi.get_version_for_shard(shard_id_t(rel)),
+              read_shard_object_info(obj, rel).version) << "shard " << rel;
+  }
+  EXPECT_FALSE(scrub_object(obj));
+
+  finish_stretch_recovery();
+  fail_zone(1);
+  verify_object(obj);
+}
+
+// Zero-size object attrs written by a zone-1 primary must be recovered to
+// every primary-capable shard once zone 0 returns.
+TEST_P(TestECFailoverWithPeering, ZeroSizeAttrsAcrossZoneFailover) {
+  if (num_zones != 2) {
+    GTEST_SKIP() << "requires num_zones == 2";
+  }
+
+  const std::string obj = "test_zero_size_attrs";
+  ASSERT_EQ(0, create_and_write(obj, ""));
+
+  fail_zone(0);
+  ASSERT_GE(get_primary_shard_from_osdmap(), k + m);
+  ASSERT_EQ(0, write_attribute(obj, "key", "v1", false));
+
+  restore_zone(0);
+  ASSERT_EQ(0, get_primary_shard_from_osdmap());
+  run_recovery(obj, true, "");
+
+  hobject_t hoid = make_test_object(obj);
+  for (int zone = 0; zone < num_zones; zone++) {
+    for (int rel = 0; rel < k + m; rel++) {
+      if (rel > 0 && rel < k) {
+        continue;
+      }
+      int shard = zone * (k + m) + rel;
+      ceph::buffer::ptr value;
+      int r = get_osd_fixture(shard)->store->getattr(
+        get_test_pg(shard, shard)->ch,
+        ghobject_t(hoid, ghobject_t::NO_GEN, shard_id_t(shard)), "key", value);
+      ASSERT_GE(r, 0) << "shard " << shard;
+      EXPECT_EQ("v1", std::string(value.c_str(), value.length())) << "shard " << shard;
+    }
+  }
+  EXPECT_FALSE(scrub_object(obj));
+
+  finish_stretch_recovery();
+  fail_zone(1);
+  verify_object(obj);
+}
+
+// Delete and recreate (smaller) an object while zone 1 is down; zone 1 must
+// be left with no stale pre-delete data after recovery.
+TEST_P(TestECFailoverWithPeering, DeleteRecreateAcrossZoneFailover) {
+  if (num_zones != 2) {
+    GTEST_SKIP() << "requires num_zones == 2";
+  }
+
+  const size_t object_size = stripe_unit * k;
+  const std::string obj = "test_delete_recreate";
+  const std::string recreated(stripe_unit / 2, 'B');
+
+  create_and_write_verify(obj, std::string(object_size, 'A'));
+
+  fail_zone(1);
+  ASSERT_EQ(0, get_primary_shard_from_osdmap());
+  ASSERT_EQ(0, delete_object(obj));
+  create_and_write_verify(obj, recreated);
+
+  restore_zone(1);
+  auto* primary_ps = get_primary_test_pg()->get_peering_state();
+  ASSERT_TRUE(primary_ps->is_active());
+  hobject_t hoid = make_test_object(obj);
+  for (int osd : zone_osds(1)) {
+    EXPECT_TRUE(primary_ps->get_peer_missing().at(
+      pg_shard_t(osd, shard_id_t(osd))).is_missing(hoid)) << "shard " << osd;
+  }
+
+  run_recovery(obj, false, recreated);
+  for (int rel = 0; rel < k + m; rel++) {
+    int shard = k + m + rel;
+    EXPECT_EQ(read_shard_object_info(obj, rel).version,
+              read_shard_object_info(obj, shard).version) << "shard " << shard;
+    EXPECT_EQ(read_shard_object_info(obj, rel).size,
+              read_shard_object_info(obj, shard).size) << "shard " << shard;
+  }
+  EXPECT_FALSE(scrub_object(obj));
+
+  finish_stretch_recovery();
+  fail_zone(0);
+  verify_object(obj);
+}
+
+// Zone-1 shards that miss writes rejoin as async recovery targets, receive
+// log-only updates for new writes, and are then recovered.
+TEST_P(TestECFailoverWithPeering, AsyncRecoveryOfZone1Shards) {
+  if (num_zones < 2 || m < 2) {
+    GTEST_SKIP() << "requires num_zones > 1 and m >= 2";
+  }
+  ScopedConfig cfg_async_recovery("osd_async_recovery_min_cost", "0");
+
+  const size_t object_size = stripe_unit * k;
+  // Healthy stretch mode keeps every zone at min_size or above.
+  std::vector<int> targets = {k + m, 2 * k + m};
+  targets.resize(std::min<size_t>(targets.size(), k + m - get_pool().min_size));
+  const std::string obj1 = "test_async_zone1_full";
+  const std::string obj2 = "test_async_zone1_partial";
+  const std::string obj3 = "test_async_zone1_new";
+  std::string expected2(object_size, 'A');
+
+  create_and_write_verify(obj1, std::string(object_size, 'A'));
+  create_and_write_verify(obj2, expected2);
+  mark_osds_down(targets);
+  write_verify(obj1, 0, std::string(object_size, 'B'), object_size);
+  write_verify(obj2, stripe_unit, std::string(stripe_unit, 'C'), object_size);
+  expected2.replace(stripe_unit, stripe_unit, std::string(stripe_unit, 'C'));
+  for (int osd : targets) {
+    mark_osd_up(osd);
+  }
+
+  auto* primary_ps = get_primary_test_pg()->get_peering_state();
+  ASSERT_TRUE(primary_ps->is_active());
+  for (int osd : targets) {
+    pg_shard_t shard(osd, shard_id_t(osd));
+    EXPECT_TRUE(primary_ps->get_async_recovery_targets().contains(shard)) << "shard " << osd;
+    EXPECT_FALSE(primary_ps->is_acting(shard)) << "shard " << osd;
+  }
+
+  create_and_write_verify(obj3, std::string(object_size, 'D'));
+  for (int osd : targets) {
+    EXPECT_EQ(primary_ps->get_info().last_update,
+              get_peering_state(osd)->get_info().last_update) << "shard " << osd;
+    EXPECT_TRUE(shard_has_object(obj3, ghobject_t::NO_GEN, osd)) << "shard " << osd;
+  }
+
+  run_recovery(obj1, false, std::string(object_size, 'B'));
+  run_recovery(obj2, false, expected2);
+  EXPECT_FALSE(primary_ps->needs_recovery());
+
+  set_config("osd_async_recovery_min_cost", "100");
+  mark_osd_down(1);
+  mark_osd_up(1);
+  primary_ps = get_primary_test_pg()->get_peering_state();
+  for (int osd : targets) {
+    EXPECT_TRUE(primary_ps->is_acting(pg_shard_t(osd, shard_id_t(osd)))) << "shard " << osd;
+  }
+  EXPECT_TRUE(primary_is_clean());
+  for (const std::string& obj : {obj1, obj2, obj3}) {
+    for (int osd : targets) {
+      EXPECT_EQ(read_shard_object_info(obj, osd - (k + m)).version,
+                read_shard_object_info(obj, osd).version)
+        << obj << " shard " << osd;
+    }
+    EXPECT_FALSE(scrub_object(obj));
+  }
+}
+
+// Divergent sub-stripe writes rolled forward on a zone-1 async recovery
+// target are rewound into its missing set on the next interval.
+TEST_P(TestECFailoverWithPeering, DivergentLogRewindZone1Target) {
+  if (num_zones < 2 || m < 2 || k < 3) {
+    GTEST_SKIP() << "requires num_zones > 1, k >= 3 and m >= 2";
+  }
+
+  ScopedConfig cfg_async_recovery("osd_async_recovery_min_cost", "0");
+  ScopedConfig cfg_trim_min("osd_pg_log_trim_min", "1");
+  ScopedConfig cfg_trim_max("osd_pg_log_trim_max", "1000");
+  osdmap->set_flag(CEPH_OSDMAP_PGLOG_HARDLIMIT);
+
+  const int target = k + m + 1;
+  const int blocked = 2 * k + m + 1;
+  const pg_shard_t target_shard(target, shard_id_t(target));
+  const size_t data_size = stripe_unit * k;
+  const std::string pa(data_size, 'A'), pb(data_size, 'B');
+  const std::string chunk_b(stripe_unit, 'B');
+
+  create_and_write_verify("obj_head", pa);
+  create_and_write_verify("obj_clone", pa);
+  create_and_write_verify("trigger", pa);
+  enable_log_trimming = true;
+  set_target_pg_log_entries(1);
+  for (int i = 0; i < 10; ++i) {
+    write_verify("obj_head", 0, pa, data_size);
+    write_verify("obj_clone", 0, pa, data_size);
+  }
+
+  mark_osd_down(target);
+  write_verify("trigger", 0, pb, data_size);
+  mark_osd_up(target);
+  ASSERT_FALSE(get_peering_state(0)->is_acting(target_shard));
+
+  suspend_primary_to_osd(blocked);
+  ASSERT_EQ(-EINPROGRESS, write("obj_head", stripe_unit, chunk_b, data_size));
+  ASSERT_EQ(-EINPROGRESS, write("obj_clone", stripe_unit, chunk_b, data_size));
+  {
+    auto* t = get_peering_state(target);
+    ASSERT_EQ(t->get_pg_log().get_can_rollback_to(), t->get_pg_log().get_log().head);
+  }
+
+  run_recovery("trigger", false, pb);
+  set_stall_recovery_reservations(true);
+
+  mark_osd_down(2);
+  unsuspend_primary_to_osd(blocked);
+  event_loop->run_until_idle();
+  {
+    auto* t = get_peering_state(target);
+    EXPECT_TRUE(t->get_pg_log().get_log().log.empty());
+    EXPECT_EQ(2u, t->get_pg_log().get_missing().num_missing());
+    EXPECT_LT(t->get_info().last_complete, t->get_info().last_update);
+  }
+
+  set_config("osd_async_recovery_min_cost", "100");
+  advance_epoch();
+  auto* primary_ps = get_primary_test_pg()->get_peering_state();
+  const auto& pm = primary_ps->get_peer_missing().at(target_shard);
+  EXPECT_TRUE(pm.is_missing(make_test_object("obj_head")));
+  EXPECT_TRUE(pm.is_missing(make_test_object("obj_clone")));
+}
+
+// A rolled-back sub-stripe overwrite must be undone on the zone-1 copies of
+// the written shards too, so a later zone-0 outage reads the old data.
+TEST_P(TestECFailoverWithPeering, PartialOverwriteRollbackZone1Shards) {
+  if (num_zones != 2 || m < 2 || k < 3) {
+    GTEST_SKIP() << "requires num_zones == 2, k >= 3 and m >= 2";
+  }
+
+  const std::string obj_name = "test_partial_rollback";
+  const size_t object_size = stripe_unit * k;
+
+  create_and_write_verify(obj_name, std::string(object_size, 'A'));
+
+  suspend_primary_to_osd(k);
+  ASSERT_EQ(-EINPROGRESS, write(obj_name, stripe_unit,
+                                std::string(stripe_unit, 'B'), object_size));
+  const version_t gen = get_peering_state(0)->get_pg_log().get_head().version;
+  mark_osd_down(2);
+  unsuspend_primary_to_osd(k);
+  event_loop->run_until_idle();
+  mark_osd_up(2);
+  ASSERT_TRUE(all_shards_active());
+
+  verify_object(obj_name);
+  for (int zone = 0; zone < num_zones; zone++) {
+    for (int rel : {1, k, k + 1}) {
+      int shard = zone * (k + m) + rel;
+      EXPECT_FALSE(shard_has_object(obj_name, gen, shard))
+        << "rollback clone object left behind on shard " << shard;
+    }
+  }
+
+  fail_zone(0);
+  ASSERT_GE(get_primary_shard_from_osdmap(), k + m);
+  verify_object(obj_name);
+}
+
+// Once a sub-stripe overwrite is rolled forward, the rollback clone objects
+// must be trimmed on the zone-1 copies of the written shards too.
+TEST_P(TestECFailoverWithPeering, PartialOverwriteRollForwardTrimsZone1Clones) {
+  if (num_zones < 2 || k < 3) {
+    GTEST_SKIP() << "requires num_zones > 1 and k >= 3";
+  }
+
+  const std::string obj_name = "test_partial_trim";
+  const size_t object_size = stripe_unit * k;
+  enable_log_trimming = true;
+
+  create_and_write_verify(obj_name, std::string(object_size, 'A'));
+  write_verify(obj_name, stripe_unit, std::string(stripe_unit, 'B'), object_size);
+  const version_t gen = read_shard_object_info(obj_name, 0).version.version;
+  for (int i = 0; i < 3; i++) {
+    create_and_write_verify("dummy" + std::to_string(i),
+                            std::string(object_size, 'C'));
+  }
+
+  for (int zone = 0; zone < num_zones; zone++) {
+    for (int rel : {1, k, k + 1}) {
+      int shard = zone * (k + m) + rel;
+      EXPECT_FALSE(shard_has_object(obj_name, gen, shard))
+        << "rollback clone object not trimmed on shard " << shard;
+    }
+  }
+}
+
+// Rolling back a full write must restore the per-shard OI version on zone-1
+// nonprimary shards, as it does on their zone-0 twins.
+TEST_P(TestECFailoverWithPeering, RollbackVersionMismatchZone1) {
+  if (num_zones < 2 || k < 3 || m < 2) {
+    GTEST_SKIP() << "requires num_zones > 1, k >= 3 and m >= 2";
+  }
+
+  const std::string obj_name = "test_attr_rollback_zone1";
+  const int zone1_nonprimary = k + m + 1;
+  const int zone1_parity = 2 * k + m;
+
+  create_and_write_verify(obj_name, "initial_data");
+  eversion_t v1 = read_shard_object_info(obj_name, 0).version;
+  ASSERT_EQ(v1, read_shard_object_info(obj_name, zone1_nonprimary).version);
+
+  ASSERT_EQ(0, write_attribute(obj_name, "test_attr", "value1", false));
+  eversion_t v2 = read_shard_object_info(obj_name, 0).version;
+  ASSERT_GT(v2, v1);
+  ASSERT_EQ(v1, read_shard_object_info(obj_name, 1).version);
+  ASSERT_EQ(v1, read_shard_object_info(obj_name, zone1_nonprimary).version);
+  ASSERT_EQ(v2, read_shard_object_info(obj_name, zone1_parity).version);
+
+  suspend_primary_to_osd(k);
+  ASSERT_NE(0, write_attribute(obj_name, "test_attr", "value2", true));
+  mark_osd_down(2);
+  unsuspend_primary_to_osd(k);
+  event_loop->run_until_idle();
+
+  EXPECT_EQ(v1, read_shard_object_info(obj_name, 1).version);
+  EXPECT_EQ(v2, read_shard_object_info(obj_name, zone1_parity).version);
+  object_info_t oi = read_shard_object_info(obj_name, zone1_nonprimary);
+  EXPECT_EQ(v1, oi.version);
+  EXPECT_TRUE(oi.shard_versions.empty());
+
+  mark_osd_up(2);
+  EXPECT_FALSE(scrub_object(obj_name));
+}
+
+// CRUSH can put a PG's zones in a different order, e.g. after a datacenter's
+// weight changes, while every OSD stays up. Each OSD then only holds the
+// shard of its old position, so the PG must keep serving from those until
+// the new positions are backfilled. The upmap stands in for the new CRUSH
+// order, and the pg_temp matching the old up set is dropped as the monitor
+// would have dropped it.
+TEST_P(TestECFailoverWithPeering, ZoneOrderChangeKeepsPGAvailable) {
+  if (num_zones < 2) {
+    GTEST_SKIP() << "requires num_zones > 1";
+  }
+
+  ScopedConfig cfg_trim_min("osd_pg_log_trim_min", "1");
+  ScopedConfig cfg_trim_max("osd_pg_log_trim_max", "1000");
+  osdmap->set_flag(CEPH_OSDMAP_PGLOG_HARDLIMIT);
+  const size_t object_size = stripe_unit * k;
+  const std::string obj = "test_zone_order";
+  create_and_write_verify(obj, std::string(object_size, 'A'));
+  enable_log_trimming = true;
+  set_target_pg_log_entries(1);
+  for (int i = 0; i < 3; ++i) {
+    write_verify(obj, 0, std::string(object_size, 'B' + i), object_size);
+  }
+
+  std::vector<int> reordered = zone_osds(1);
+  for (int osd : zone_osds(0)) {
+    reordered.push_back(osd);
+  }
+  auto new_osdmap = std::make_shared<OSDMap>();
+  new_osdmap->deepish_copy_from(*osdmap);
+  OSDMap::Incremental inc(new_osdmap->get_epoch() + 1);
+  inc.fsid = new_osdmap->get_fsid();
+  inc.new_pg_upmap[pgid] =
+    mempool::osdmap::vector<int32_t>(reordered.begin(), reordered.end());
+  inc.new_pg_temp[pgid] = mempool::osdmap::vector<int32_t>();
+  new_osdmap->apply_incremental(inc);
+  update_osdmap_with_peering(new_osdmap);
+
+  auto* primary_ps = get_primary_test_pg()->get_peering_state();
+  ASSERT_TRUE(primary_ps->is_active()) << primary_ps->get_current_state();
+  verify_object(obj);
+}
+
+// Going to one zone while zone 0 is down keeps zone 0's shards. Once zone 0
+// is back, an object that only zone 1's old shards, k+m and up, hold at its
+// last version is recovered from them, read as their relative shards. The
+// read plan once tried only the zone of the primary of a pool with one zone,
+// so recovery of that object aborted in continue_recovery_op().
+TEST_P(TestECFailoverWithPeering, OneZoneRecoversFromStraysBeyondSize) {
+  if (num_zones != 2) {
+    GTEST_SKIP() << "requires num_zones == 2";
+  }
+  const size_t object_size = stripe_unit * k;
+  const std::string kept = "test_one_zone_kept";
+  const std::string rewritten = "test_one_zone_rewritten";
+  const std::string pattern_b(object_size, 'B');
+  create_and_write_verify(kept, std::string(object_size, 'A'));
+  create_and_write_verify(rewritten, std::string(object_size, 'A'));
+
+  fail_zone(0);
+  ASSERT_TRUE(get_primary_test_pg()->get_peering_state()->is_active());
+  write_verify(rewritten, 0, pattern_b, object_size);
+
+  go_to_one_zone();
+  for (int osd : zone_osds(0)) {
+    mark_osd_up(osd);
+  }
+
+  auto* primary_ps = get_primary_test_pg()->get_peering_state();
+  ASSERT_TRUE(primary_ps->is_active()) << primary_ps->get_current_state();
+  const hobject_t hoid = make_test_object(rewritten);
+  ASSERT_TRUE(primary_ps->get_missing_loc().needs_recovery(hoid));
+  EXPECT_FALSE(primary_ps->get_missing_loc().is_unfound(hoid));
+  get_primary_listener()->sent_messages_with_dest.clear();
+  run_recovery(rewritten, true, pattern_b);
+  const std::set<shard_id_t> read = ec_read_shards();
+  ASSERT_FALSE(read.empty());
+  EXPECT_GE(int(read.rbegin()->id), k + m);
+  EXPECT_FALSE(get_primary_test_pg()->get_peering_state()->needs_recovery());
+  verify_object(kept);
+  verify_object(rewritten, pattern_b, 0, object_size);
+}
+
+// After going to one zone, an object an OSD missed is recovered from the
+// pool's own shards, although the strays of the old zone 1 hold it too.
+TEST_P(TestECFailoverWithPeering, OneZoneRecoversFromItsOwnShards) {
+  if (num_zones != 2) {
+    GTEST_SKIP() << "requires num_zones == 2";
+  }
+  const size_t object_size = stripe_unit * k;
+  const std::string obj = "test_one_zone_missed";
+  const std::string pattern_b(object_size, 'B');
+  create_and_write_verify(obj, std::string(object_size, 'A'));
+  const int missed_write_osd = 1;
+  mark_osd_down(missed_write_osd);
+  write_verify(obj, 0, pattern_b, object_size);
+
+  go_to_one_zone();
+  mark_osd_up(missed_write_osd);
+
+  auto* primary_ps = get_primary_test_pg()->get_peering_state();
+  ASSERT_TRUE(primary_ps->is_active()) << primary_ps->get_current_state();
+  ASSERT_TRUE(primary_ps->get_missing_loc().needs_recovery(
+                make_test_object(obj)));
+  get_primary_listener()->sent_messages_with_dest.clear();
+  run_recovery(obj, false, pattern_b);
+  const std::set<shard_id_t> read = ec_read_shards();
+  ASSERT_FALSE(read.empty());
+  EXPECT_LT(int(read.rbegin()->id), k + m);
+  verify_object(obj);
+}
+
+// Zone 1's copy of a nonprimary shard, shard k+m+1, misses the peering that
+// records the partial writes it skipped, and is back as a stray once the
+// pool is in one zone. osd.1 missed a write that the copy holds, so the
+// primary sends the copy an info that pwlc moves past its log. A stray takes
+// that only from a nonprimary shard, and the copy, whose shard ID is at or
+// above the pool's size, once was not one.
+TEST_P(TestECFailoverWithPeering, OneZoneStrayOfNonprimaryShardTakesPwlc) {
+  if (num_zones != 2 || k < 2) {
+    GTEST_SKIP() << "requires num_zones == 2 and a nonprimary shard";
+  }
+  const size_t object_size = stripe_unit * k;
+  const int copy = k + m + 1;
+  const std::string missed = "test_one_zone_missed";
+  const std::string partial = "test_one_zone_partial";
+  const std::string a(object_size, 'A');
+  create_and_write_verify(partial, a);
+  mark_osd_down(1);
+  ASSERT_TRUE(get_primary_test_pg()->get_peering_state()->is_active());
+  create_and_write_verify(missed, a);
+  mark_osd_up(1);
+  // writes to the first data shard only: the first of an interval goes to
+  // every shard, and shard 1 and its copy skip the others
+  for (char c : {'B', 'C', 'D'}) {
+    write_verify(partial, 0, std::string(stripe_unit, c), object_size);
+  }
+  mark_osd_down(copy);
+  go_to_one_zone(0, {copy});
+
+  auto* primary_ps = get_primary_test_pg()->get_peering_state();
+  ASSERT_TRUE(primary_ps->is_active()) << primary_ps->get_current_state();
+  run_recovery(missed, false, a);
+  verify_object(missed);
+  verify_object(partial, std::string(stripe_unit, 'D') + a.substr(stripe_unit),
+                0, object_size);
+}
+
 // ---------------------------------------------------------------------------
 // Instantiate TestECFailoverWithPeering with EC configurations
 // ---------------------------------------------------------------------------
@@ -1987,3 +4244,462 @@ INSTANTIATE_TEST_SUITE_P(
   }
 );
 
+/**
+ * TestECTruncateMatrix
+ *
+ * Ops mixing truncates, writes and zeros on optimized EC objects, drawn from
+ * a table of cases with offsets computed from k and the stripe unit. Each
+ * case is run forward, where the objects and their shards must match a model
+ * of the expected contents, including after a data shard goes down, and
+ * rolled back after an OSD fails, where the objects and their shards must be
+ * restored exactly. Rollback is run with the op blocked to shard 1 and the
+ * last parity shard, a data shard other than the first two or the primary
+ * failing, and with the op blocked to the first parity shard, which every op
+ * writes, and a data shard or the primary failing.
+ */
+namespace {
+
+/* Rollback modes block the op to shard 1, which it may not write, or to the
+ * first parity shard, which it always writes, and fail the named shard. A
+ * mode that blocks shard 1 is skipped for a case that does not write it. */
+enum class TruncateMode {
+  Forward,
+  RollbackParity,
+  RollbackData,
+  RollbackPrimary,
+  BlockParityRollbackData,
+  BlockParityRollbackPrimary,
+};
+
+struct TruncateCase {
+  std::string name;
+  /* The objects of the case for k and stripe unit su, or nullopt if the case
+   * means nothing for them. */
+  std::function<std::optional<std::vector<ObjectScenario>>(uint64_t k,
+                                                           uint64_t su)> make;
+};
+
+constexpr uint64_t PAGE = EC_ALIGN_SIZE;
+
+enum class SizeKind { ChunkAligned, PageAligned, Unaligned, SubStripe };
+
+const std::vector<std::pair<SizeKind, std::string>> kSizeKinds = {
+  {SizeKind::ChunkAligned, "ChunkAligned"},
+  {SizeKind::PageAligned, "PageAligned"},
+  {SizeKind::Unaligned, "Unaligned"},
+  {SizeKind::SubStripe, "SubStripe"},
+};
+
+uint64_t object_size(SizeKind kind, uint64_t k, uint64_t su) {
+  const uint64_t sw = k * su;
+  switch (kind) {
+  case SizeKind::ChunkAligned: return 8 * sw + 3 * su;
+  case SizeKind::PageAligned: return 5 * sw + su + PAGE;
+  case SizeKind::Unaligned: return 5 * sw + su + 123;
+  case SizeKind::SubStripe: return sw / 2 + 1234;
+  }
+  ceph_abort();
+}
+
+enum class TargetKind {
+  Chunk0MidPage,
+  Chunk0Page,
+  ChunkBoundary,
+  MiddleChunkMidPage,
+  LastChunk,
+  StripeBoundary,
+  LastPage,
+  One,
+  Zero,
+  Equal,
+  Grow,
+};
+
+const std::vector<std::pair<TargetKind, std::string>> kTargetKinds = {
+  {TargetKind::Chunk0MidPage, "Chunk0MidPage"},
+  {TargetKind::Chunk0Page, "Chunk0Page"},
+  {TargetKind::ChunkBoundary, "ChunkBoundary"},
+  {TargetKind::MiddleChunkMidPage, "MiddleChunkMidPage"},
+  {TargetKind::LastChunk, "LastChunk"},
+  {TargetKind::StripeBoundary, "StripeBoundary"},
+  {TargetKind::LastPage, "LastPage"},
+  {TargetKind::One, "One"},
+  {TargetKind::Zero, "Zero"},
+  {TargetKind::Equal, "Equal"},
+  {TargetKind::Grow, "Grow"},
+};
+
+/* The size to truncate an object of size s to, or nullopt if the target
+ * means nothing for this geometry. Targets inside chunks are in the second
+ * stripe, if the object has more than two stripes, so that the stripe below
+ * is left intact. */
+std::optional<uint64_t> truncate_target(TargetKind kind, uint64_t s,
+                                        uint64_t k, uint64_t su) {
+  const uint64_t sw = k * su;
+  const uint64_t base = s >= 2 * sw ? sw : 0;
+  std::optional<uint64_t> target;
+  switch (kind) {
+  case TargetKind::Chunk0MidPage:
+    target = base + su / 2 + 1;
+    break;
+  case TargetKind::Chunk0Page:
+    if (su > PAGE) {
+      target = base + PAGE;
+    }
+    break;
+  case TargetKind::ChunkBoundary:
+    target = base + su;
+    break;
+  case TargetKind::MiddleChunkMidPage:
+    if (k > 2) {
+      target = base + (k / 2) * su + su / 2 + 3;
+    }
+    break;
+  case TargetKind::LastChunk:
+    target = base + (k - 1) * su + su / 4 + 5;
+    break;
+  case TargetKind::StripeBoundary:
+    target = base + sw;
+    break;
+  case TargetKind::LastPage: {
+    const uint64_t page_start = (s - 1) / PAGE * PAGE;
+    target = page_start + (s - page_start) / 2;
+    break;
+  }
+  case TargetKind::One:
+    target = 1;
+    break;
+  case TargetKind::Zero:
+    target = 0;
+    break;
+  case TargetKind::Equal:
+    return s;
+  case TargetKind::Grow:
+    return s + sw + 77;
+  }
+  if (target && *target >= s) {
+    return std::nullopt;
+  }
+  return target;
+}
+
+enum class WriteKind {
+  None,
+  Below,
+  EndingAt,
+  Straddling,
+  AboveInPage,
+  InTruncatedRange,
+  PastEnd,
+  Several,
+  ZeroInside,
+};
+
+const std::vector<std::pair<WriteKind, std::string>> kWriteKinds = {
+  {WriteKind::None, "NoWrite"},
+  {WriteKind::Below, "WriteBelow"},
+  {WriteKind::EndingAt, "WriteEndingAt"},
+  {WriteKind::Straddling, "WriteStraddling"},
+  {WriteKind::AboveInPage, "WriteAboveInPage"},
+  {WriteKind::InTruncatedRange, "WriteInTruncatedRange"},
+  {WriteKind::PastEnd, "WritePastEnd"},
+  {WriteKind::Several, "SeveralWrites"},
+  {WriteKind::ZeroInside, "ZeroInside"},
+};
+
+/* The ops that follow a truncate from size s to t in the same op, or nullopt
+ * if the kind means nothing for these sizes. */
+std::optional<std::vector<ObjOp>> writes_after_truncate(
+    WriteKind kind, uint64_t s, uint64_t t, uint64_t k, uint64_t su) {
+  const uint64_t sw = k * su;
+  const uint64_t end = std::max(s, t);
+  switch (kind) {
+  case WriteKind::None:
+    return std::vector<ObjOp>{};
+  case WriteKind::Below:
+    if (t < 8) {
+      return std::nullopt;
+    }
+    return std::vector<ObjOp>{Write(t / 3, std::min<uint64_t>(t / 3, 3000))};
+  case WriteKind::EndingAt:
+    if (t == 0) {
+      return std::nullopt;
+    }
+    return std::vector<ObjOp>{Write(t - std::min<uint64_t>(t, 777),
+                                    std::min<uint64_t>(t, 777))};
+  case WriteKind::Straddling:
+    return std::vector<ObjOp>{Write(t - std::min<uint64_t>(t, 500),
+                                    std::min<uint64_t>(t, 500) + 700)};
+  case WriteKind::AboveInPage:
+    return std::vector<ObjOp>{Write(t + 7, 50)};
+  case WriteKind::InTruncatedRange:
+    if (t + sw + 13 + 1000 >= s) {
+      return std::nullopt;
+    }
+    return std::vector<ObjOp>{Write(t + sw + 13, 1000)};
+  case WriteKind::PastEnd:
+    return std::vector<ObjOp>{Write(end + su + 5, 999)};
+  case WriteKind::Several: {
+    std::vector<ObjOp> ops;
+    if (t >= 3) {
+      ops.push_back(Write(t / 3, std::min<uint64_t>(t / 3, 100)));
+    }
+    ops.push_back(Write(t - std::min<uint64_t>(t, 40),
+                        std::min<uint64_t>(t, 40) + 60));
+    ops.push_back(Write(end + 100, 300));
+    return ops;
+  }
+  case WriteKind::ZeroInside:
+    if (t < 4) {
+      return std::nullopt;
+    }
+    return std::vector<ObjOp>{Zero(t / 4, std::min<uint64_t>(t / 2, su))};
+  }
+  ceph_abort();
+}
+
+std::vector<TruncateCase> make_truncate_cases() {
+  std::vector<TruncateCase> cases;
+
+  /* Every target with every kind of write for the chunk aligned and
+   * unaligned sizes, and with a few kinds for the others. */
+  for (const auto& [size_kind, size_name] : kSizeKinds) {
+    const bool all_writes = size_kind == SizeKind::ChunkAligned ||
+                            size_kind == SizeKind::Unaligned;
+    for (const auto& [target_kind, target_name] : kTargetKinds) {
+      for (const auto& [write_kind, write_name] : kWriteKinds) {
+        if (!all_writes && write_kind != WriteKind::None &&
+            write_kind != WriteKind::Straddling &&
+            write_kind != WriteKind::AboveInPage) {
+          continue;
+        }
+        cases.push_back({
+          size_name + "_Truncate" + target_name + "_" + write_name,
+          [size_kind, target_kind, write_kind](uint64_t k, uint64_t su)
+              -> std::optional<std::vector<ObjectScenario>> {
+            const uint64_t s = object_size(size_kind, k, su);
+            const auto t = truncate_target(target_kind, s, k, su);
+            if (!t) {
+              return std::nullopt;
+            }
+            auto writes = writes_after_truncate(write_kind, s, *t, k, su);
+            if (!writes) {
+              return std::nullopt;
+            }
+            std::vector<ObjOp> ops{Truncate(*t)};
+            ops.insert(ops.end(), writes->begin(), writes->end());
+            return std::vector<ObjectScenario>{{s, {}, {ops}}};
+          }});
+      }
+    }
+  }
+
+  /* Cases on an unaligned object with a low target t1 in the first chunk of
+   * the second stripe and a higher target t2 in the fourth stripe. */
+  auto add = [&cases](const std::string& name,
+                      std::function<std::vector<ObjectScenario>(
+                        uint64_t s, uint64_t t1, uint64_t t2,
+                        uint64_t sw, uint64_t su)> make) {
+    cases.push_back({name, [make](uint64_t k, uint64_t su)
+        -> std::optional<std::vector<ObjectScenario>> {
+      const uint64_t sw = k * su;
+      const uint64_t s = object_size(SizeKind::Unaligned, k, su);
+      return make(s, sw + su / 2 + 1, 3 * sw + su + 555, sw, su);
+    }});
+  };
+
+  // Several truncates in one op.
+  add("TruncateDownThenUp", [](auto s, auto t1, auto t2, auto sw, auto su) {
+    return std::vector<ObjectScenario>{{s, {}, {{Truncate(t1), Truncate(t2)}}}};
+  });
+  add("TruncateDownThenUpThenWrite", [](auto s, auto t1, auto t2, auto sw, auto su) {
+    return std::vector<ObjectScenario>{
+      {s, {}, {{Truncate(t1), Truncate(t2), Write(t1 - 100, 400)}}}};
+  });
+  add("TruncateDownWriteUp", [](auto s, auto t1, auto t2, auto sw, auto su) {
+    return std::vector<ObjectScenario>{
+      {s, {}, {{Truncate(t1), Write(t1 + 300, 2000), Truncate(t2)}}}};
+  });
+  add("TruncateUpThenDown", [](auto s, auto t1, auto t2, auto sw, auto su) {
+    return std::vector<ObjectScenario>{{s, {}, {{Truncate(s + sw), Truncate(t1)}}}};
+  });
+  add("TruncateUpWriteDown", [](auto s, auto t1, auto t2, auto sw, auto su) {
+    return std::vector<ObjectScenario>{
+      {s, {}, {{Truncate(s + sw), Write(s + 100, 500), Truncate(t1)}}}};
+  });
+  add("WriteThenTruncateCuttingIt", [](auto s, auto t1, auto t2, auto sw, auto su) {
+    return std::vector<ObjectScenario>{{s, {}, {{Write(t1 - 300, 1000), Truncate(t1)}}}};
+  });
+  add("WriteThenTruncateUp", [](auto s, auto t1, auto t2, auto sw, auto su) {
+    return std::vector<ObjectScenario>{
+      {s, {}, {{Write(t1 - 300, 1000), Truncate(s + su + 3)}}}};
+  });
+  add("TruncateWriteTruncateCuttingIt", [](auto s, auto t1, auto t2, auto sw, auto su) {
+    return std::vector<ObjectScenario>{
+      {s, {}, {{Truncate(t2), Write(t1 - 50, 3000), Truncate(t1 + 1000)}}}};
+  });
+
+  // Several ops in flight on one object.
+  add("ChainTruncateThenWrite", [](auto s, auto t1, auto t2, auto sw, auto su) {
+    return std::vector<ObjectScenario>{
+      {s, {}, {{Truncate(t1)}, {Write(t1 - 100, 300)}}}};
+  });
+  add("ChainWriteThenTruncate", [](auto s, auto t1, auto t2, auto sw, auto su) {
+    return std::vector<ObjectScenario>{
+      {s, {}, {{Write(t1 - 100, 300)}, {Truncate(t1 - 50)}}}};
+  });
+  add("ChainTruncateThenTruncate", [](auto s, auto t1, auto t2, auto sw, auto su) {
+    return std::vector<ObjectScenario>{{s, {}, {{Truncate(t2)}, {Truncate(t1)}}}};
+  });
+  add("ChainTruncateThenAppend", [](auto s, auto t1, auto t2, auto sw, auto su) {
+    return std::vector<ObjectScenario>{{s, {}, {{Truncate(t1)}, {Write(t1, 5000)}}}};
+  });
+  add("ChainTruncateWriteTruncate", [](auto s, auto t1, auto t2, auto sw, auto su) {
+    return std::vector<ObjectScenario>{
+      {s, {}, {{Truncate(t2)}, {Write(t1 - 10, 100)}, {Truncate(t1)}}}};
+  });
+  add("ChainTruncateThenGrowingWrite", [](auto s, auto t1, auto t2, auto sw, auto su) {
+    return std::vector<ObjectScenario>{
+      {s, {}, {{Truncate(t1)}, {Write(s + 100, 5000)}}}};
+  });
+  add("ChainTruncateToZeroThenWrite", [](auto s, auto t1, auto t2, auto sw, auto su) {
+    return std::vector<ObjectScenario>{{s, {}, {{Truncate(0)}, {Write(0, 3000)}}}};
+  });
+  add("ChainWriteThenTruncateThenWrite", [](auto s, auto t1, auto t2, auto sw, auto su) {
+    return std::vector<ObjectScenario>{
+      {s, {}, {{Write(t1 - 5, su)}, {Truncate(t1)}, {Write(t1 + 50, 100)}}}};
+  });
+
+  // A committed op followed by ops in flight.
+  add("CommittedTruncateThenWrite", [](auto s, auto t1, auto t2, auto sw, auto su) {
+    return std::vector<ObjectScenario>{
+      {s, {{Truncate(t1)}}, {{Write(t1 - 100, 3000)}}}};
+  });
+  add("CommittedTruncateThenTruncate", [](auto s, auto t1, auto t2, auto sw, auto su) {
+    return std::vector<ObjectScenario>{{s, {{Truncate(t2)}}, {{Truncate(t1)}}}};
+  });
+  add("CommittedWriteThenTruncateAndWrite", [](auto s, auto t1, auto t2, auto sw, auto su) {
+    return std::vector<ObjectScenario>{
+      {s, {{Write(t1 - 5, 10)}}, {{Truncate(t1), Write(t1 - 20, 40)}}}};
+  });
+
+  // Two objects with ops in flight together.
+  add("TwoObjects", [](auto s, auto t1, auto t2, auto sw, auto su) {
+    return std::vector<ObjectScenario>{
+      {s, {}, {{Truncate(t1), Write(t1 - 100, 300)}}},
+      {8 * sw + 3 * su, {}, {{Write(t1 - 50, 200)}, {Truncate(t1 + su)}}}};
+  });
+  add("TwoObjectsSameOps", [](auto s, auto t1, auto t2, auto sw, auto su) {
+    return std::vector<ObjectScenario>{
+      {s, {}, {{Truncate(t1)}, {Write(t1 - 100, 300)}}},
+      {s, {}, {{Truncate(t1)}, {Write(t1 - 100, 300)}}}};
+  });
+
+  return cases;
+}
+
+const std::vector<TruncateCase> kTruncateCases = make_truncate_cases();
+
+}  // namespace
+
+class TestECTruncateMatrix
+  : public ECTruncateTestBase,
+    public ::testing::WithParamInterface<
+      std::tuple<BackendConfig, TruncateCase, TruncateMode>> {
+public:
+  TestECTruncateMatrix() : ECTruncateTestBase(std::get<0>(GetParam())) {}
+};
+
+TEST_P(TestECTruncateMatrix, Run) {
+  const auto& [config, truncate_case, mode] = GetParam();
+  const auto objects = truncate_case.make(k, stripe_unit);
+  if (!objects) {
+    GTEST_SKIP() << truncate_case.name << " does not apply to this geometry";
+  }
+  const bool blocks_shard_1 = mode == TruncateMode::RollbackParity ||
+                              mode == TruncateMode::RollbackData ||
+                              mode == TruncateMode::RollbackPrimary;
+  if (blocks_shard_1 && !ops_write_shard(*objects, 1)) {
+    GTEST_SKIP() << truncate_case.name << " does not write shard 1";
+  }
+  SCOPED_TRACE(config.label + " " + truncate_case.name);
+
+  switch (mode) {
+  case TruncateMode::Forward:
+    run_forward(truncate_case.name, *objects);
+    break;
+  case TruncateMode::RollbackParity:
+    run_rollback(truncate_case.name, *objects, 1, get_shard(k + m - 1));
+    break;
+  case TruncateMode::RollbackData:
+    if (k <= 2) {
+      GTEST_SKIP() << "needs a data shard other than the first two";
+    }
+    run_rollback(truncate_case.name, *objects, 1, get_shard(2));
+    break;
+  case TruncateMode::RollbackPrimary:
+    run_rollback(truncate_case.name, *objects, 1,
+                 get_primary_shard_from_osdmap());
+    break;
+  case TruncateMode::BlockParityRollbackData:
+    run_rollback(truncate_case.name, *objects, get_shard(k),
+                 get_shard(k > 2 ? 2 : 1));
+    break;
+  case TruncateMode::BlockParityRollbackPrimary:
+    run_rollback(truncate_case.name, *objects, get_shard(k),
+                 get_primary_shard_from_osdmap());
+    break;
+  }
+}
+
+std::string truncate_matrix_name(
+    const ::testing::TestParamInfo<TestECTruncateMatrix::ParamType>& info) {
+  static const std::map<TruncateMode, std::string> mode_names = {
+    {TruncateMode::Forward, "Forward"},
+    {TruncateMode::RollbackParity, "RollbackParity"},
+    {TruncateMode::RollbackData, "RollbackData"},
+    {TruncateMode::RollbackPrimary, "RollbackPrimary"},
+    {TruncateMode::BlockParityRollbackData, "BlockParityRollbackData"},
+    {TruncateMode::BlockParityRollbackPrimary, "BlockParityRollbackPrimary"},
+  };
+  return std::get<0>(info.param).label + "_" + std::get<1>(info.param).name +
+         "_" + mode_names.at(std::get<2>(info.param));
+}
+
+INSTANTIATE_TEST_SUITE_P(
+  ECConfigs,
+  TestECTruncateMatrix,
+  ::testing::Combine(
+    ::testing::ValuesIn(kECPeeringConfigs),
+    ::testing::ValuesIn(kTruncateCases),
+    ::testing::Values(TruncateMode::Forward,
+                      TruncateMode::RollbackParity,
+                      TruncateMode::RollbackData,
+                      TruncateMode::RollbackPrimary,
+                      TruncateMode::BlockParityRollbackData,
+                      TruncateMode::BlockParityRollbackPrimary)),
+  truncate_matrix_name
+);
+
+// Test the shard versions of an object of a pool over two zones: the shards
+// of each zone have the versions of the first zone's shards
+TEST(PrimaryLogPG, get_shard_versions_over_zones)
+{
+  pg_pool_t pool;
+  pool.type = pg_pool_t::TYPE_ERASURE;
+  pool.size = 6;
+  pool.num_zones = 2;
+  object_info_t oi;
+  oi.version = eversion_t(1, 5);
+  oi.shard_versions[shard_id_t(0)] = eversion_t(1, 5);
+  oi.shard_versions[shard_id_t(1)] = eversion_t(1, 3);
+  oi.shard_versions[shard_id_t(2)] = eversion_t(1, 5);
+
+  const auto versions = PrimaryLogPG::get_shard_versions(oi, pool);
+  ASSERT_EQ(6u, versions.size());
+  for (int zone = 0; zone < 2; ++zone) {
+    EXPECT_EQ(eversion_t(1, 5), versions.at(shard_id_t(zone * 3)));
+    EXPECT_EQ(eversion_t(1, 3), versions.at(shard_id_t(zone * 3 + 1)));
+    EXPECT_EQ(eversion_t(1, 5), versions.at(shard_id_t(zone * 3 + 2)));
+  }
+}
