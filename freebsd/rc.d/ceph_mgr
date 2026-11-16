@@ -1,0 +1,39 @@
+#!/bin/sh
+#
+# PROVIDE: ceph_mgr
+# REQUIRE: LOGIN ceph_mon
+# KEYWORD: shutdown
+#
+# Ceph cluster manager daemon.
+#
+# /etc/rc.conf:
+#   ceph_mgr_enable="YES"
+#
+# Optional (shared knobs: ${CEPH_PREFIX}/libexec/ceph/rc.ceph.subr):
+#
+# ceph_mgr_instances (str):	Instance ids.  Default: discovered from
+#				${ceph_datadir}/mgr/${ceph_cluster}-<id>
+# ceph_mgr_flags (str):		Extra arguments for ceph-mgr.
+# ceph_mgr_limits (str):		limits(1) arguments.  Default: "-n 1048576".
+#
+# service ceph_mgr start		all instances
+# service ceph_mgr start a	mgr.a only
+#
+
+. /etc/rc.subr
+
+name="ceph_mgr"
+rcvar="ceph_mgr_enable"
+desc="Ceph cluster manager daemon"
+
+load_rc_config "${name}"
+: ${CEPH_PREFIX:=/usr/local}
+
+: ${ceph_mgr_enable:="NO"}
+
+ceph_type="mgr"
+ceph_bin="${CEPH_PREFIX}/bin/ceph-mgr"
+
+. ${CEPH_PREFIX}/libexec/ceph/rc.ceph.subr
+
+ceph_dispatch "$@"

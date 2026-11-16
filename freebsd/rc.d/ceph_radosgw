@@ -1,0 +1,41 @@
+#!/bin/sh
+#
+# PROVIDE: ceph_radosgw
+# REQUIRE: LOGIN ceph_mon ceph_osd
+# KEYWORD: shutdown
+#
+# Ceph RADOS gateway.
+#
+# /etc/rc.conf:
+#   ceph_radosgw_enable="YES"
+#
+# Optional (shared knobs: ${CEPH_PREFIX}/libexec/ceph/rc.ceph.subr):
+#
+# ceph_radosgw_instances (str):	Instance ids.  Default: discovered from
+#				${ceph_datadir}/radosgw/${ceph_cluster}-<id>
+#				(id is e.g. "rgw.`hostname -s`", run as
+#				--name client.<id>)
+# ceph_radosgw_flags (str):		Extra arguments for radosgw.
+# ceph_radosgw_limits (str):		limits(1) arguments.  Default: "-n 1048576".
+#
+# service ceph_radosgw start		all instances
+# service ceph_radosgw start rgw.gw1	client.rgw.gw1 only
+#
+
+. /etc/rc.subr
+
+name="ceph_radosgw"
+rcvar="ceph_radosgw_enable"
+desc="Ceph RADOS gateway"
+
+load_rc_config "${name}"
+: ${CEPH_PREFIX:=/usr/local}
+
+: ${ceph_radosgw_enable:="NO"}
+
+ceph_type="radosgw"
+ceph_bin="${CEPH_PREFIX}/bin/radosgw"
+
+. ${CEPH_PREFIX}/libexec/ceph/rc.ceph.subr
+
+ceph_dispatch "$@"

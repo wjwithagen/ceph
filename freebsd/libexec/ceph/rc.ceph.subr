@@ -1,0 +1,352 @@
+#
+# rc.ceph.subr -- functions shared by the Ceph rc.d scripts
+#
+# Sourced by ${CEPH_PREFIX}/etc/rc.d/ceph_{mon,mgr,osd,mds,radosgw} after
+# load_rc_config, with ${name}, ${rcvar}, ${ceph_type} and ${ceph_bin}
+# already set.  Not meant to be run on its own.
+#
+# Replaces the systemd ceph-<type>@.service templates and ceph-*.target:
+#   - one rc.d script per daemon type, any number of instances:
+#       service ceph_osd start        all instances
+#       service ceph_osd start 12     osd.12 only
+#   - daemon(8) supervises and restarts      (Restart=on-failure, RestartSec)
+#   - ${name}_limits is applied via limits(1) (LimitNOFILE=1048576)
+#   - rcorder(8) REQUIRE: lines replace the After=/Wants= of the targets
+#   - ExecReload (kill -HUP $MAINPID) is "service ceph_<type> reload"
+#
+# Where output goes: daemon(8) runs each daemon with -S, so what it prints on
+# stdout and stderr goes to syslog (/var/log/messages), tagged ceph-<type>.<id>,
+# for example ceph-osd.0. That is where a daemon that fails before its own log
+# file is open leaves its message, and where the supervisor reports restarts.
+# Once it runs, the daemon logs to ${ceph_logdir}/<cluster>-<type>.<id>.log.
+#
+# Knobs shared by all Ceph daemons (/etc/rc.conf):
+#
+# CEPH_PREFIX (path):		Where Ceph is installed.  Default: /usr/local
+#				The rc.d scripts read it before this file is
+#				sourced, so it can be set in /etc/rc.conf.
+# ceph_cluster (str):		Cluster name.  Default: "ceph".
+# ceph_conf (path):		Default: ${CEPH_PREFIX}/etc/ceph/${ceph_cluster}.conf
+# ceph_datadir (path):		Default: /var/lib/ceph
+# ceph_rundir (path):		Admin sockets and pidfiles.
+#				Default: /var/run/ceph
+# ceph_logdir (path):		Default: /var/log/ceph
+# ceph_user (str):		Default: ceph
+# ceph_group (str):		Default: ceph
+# ceph_restart_delay (int):	Seconds before daemon(8) restarts a daemon
+#				that exited.  Default: 10.
+# ceph_logrotate_on_crash (bool): When daemon(8) restarts a daemon that did
+#				not stop through "service stop", move its log
+#				aside as <log>.<yyyymmdd-hhmmss>, the time the
+#				log was last written, so that the crash stays
+#				intact and the new run starts a log of its own.
+#				Default: YES.
+# ceph_logrotate_keep (int):	How many of those files to keep per daemon, the
+#				oldest go first. Default: 20.
+#
+# Knobs per daemon type, <type> being mon, mgr, osd, mds or radosgw:
+#
+# ceph_<type>_enable (bool):	Default: NO.
+# ceph_<type>_instances (str):	Instance ids.  Default: every directory
+#				${ceph_datadir}/<type>/${ceph_cluster}-<id>
+#				that holds a keyring.
+# ceph_<type>_flags (str):	Extra arguments for the Ceph binary itself
+#				(not for daemon(8)).
+# ceph_<type>_limits (str):	limits(1) arguments.  Default: "-n 1048576".
+#
+
+: ${ceph_cluster:="ceph"}
+: ${ceph_conf:="${CEPH_PREFIX}/etc/ceph/${ceph_cluster}.conf"}
+: ${ceph_datadir:="/var/lib/ceph"}
+: ${ceph_rundir:="/var/run/ceph"}
+: ${ceph_logdir:="/var/log/ceph"}
+: ${ceph_user:="ceph"}
+: ${ceph_group:="ceph"}
+: ${ceph_restart_delay:="10"}
+: ${ceph_logrotate_on_crash:="YES"}
+: ${ceph_logrotate_keep:="20"}
+# rc.subr calls checkyesno on ${name}_svcj and warns when it is empty
+# (which it is when svcj_all_enable is set).  Our daemons are supervised by
+# daemon(8) on the host, not in a service jail, so default to NO.
+eval ": \${${name}_svcj:=NO}"
+
+CEPH_BINDIR="${CEPH_PREFIX}/bin"
+CEPH_SBINDIR="${CEPH_PREFIX}/sbin"
+
+# rc runs with PATH=/sbin:/bin:/usr/sbin:/usr/bin, and daemon(8) hands that on
+# to what it starts, so a tool from a port such as jq is not found by name.
+PATH="${PATH}:${CEPH_SBINDIR}:${CEPH_BINDIR}:/usr/local/sbin:/usr/local/bin"
+export PATH
+ceph_self="${CEPH_PREFIX}/etc/rc.d/${name}"
+
+# ${name}_flags is meant for the Ceph binary.  rc.subr would put it in
+# front of command_args, i.e. hand it to daemon(8), so take it out here.
+eval ceph_extra_flags=\"\${${name}_flags}\"
+eval ${name}_flags=\"\"
+eval : \${${name}_limits:=\"-n 1048576\"}
+
+command="/usr/sbin/daemon"
+procname="/usr/sbin/daemon"
+required_files="${ceph_conf} ${ceph_bin}"
+start_precmd="ceph_prestart"
+stop_postcmd="ceph_stop_postcmd"
+status_cmd="ceph_status"
+extra_commands="reload"
+reload_cmd="ceph_reload"
+
+# Set the per-instance variables run_rc_command needs.
+ceph_instance_setup()
+{
+	ceph_id="$1"
+	case "${ceph_type}" in
+	radosgw)
+		ceph_ident="client.${ceph_id}"
+		ceph_idarg="--name client.${ceph_id}"
+		;;
+	*)
+		ceph_ident="${ceph_type}.${ceph_id}"
+		ceph_idarg="--id ${ceph_id}"
+		;;
+	esac
+	ceph_instdir="${ceph_datadir}/${ceph_type}/${ceph_cluster}-${ceph_id}"
+	ceph_tag="${ceph_cluster}-${ceph_ident}"
+	pidfile="${ceph_rundir}/${ceph_tag}.daemon.pid"
+	ceph_childpidfile="${ceph_rundir}/${ceph_tag}.pid"
+	ceph_runmarker="${ceph_rundir}/${ceph_tag}.running"
+	ceph_logfile="${ceph_logdir}/${ceph_tag}.log"
+	# The arguments of the Ceph binary itself.
+	ceph_bin_args="-f --cluster ${ceph_cluster}"
+	ceph_bin_args="${ceph_bin_args} -c ${ceph_conf} ${ceph_idarg}"
+	ceph_bin_args="${ceph_bin_args} --setuser ${ceph_user} --setgroup ${ceph_group}"
+	ceph_bin_args="${ceph_bin_args} ${ceph_extra_flags}"
+	# daemon(8) supervises "<this script> daemonrun <id>", which does a
+	# little housekeeping and then becomes the Ceph binary (exec), so the
+	# pid daemon(8) keeps is that of the Ceph daemon itself.
+	command_args="-R ${ceph_restart_delay} -P ${pidfile} -p ${ceph_childpidfile}"
+	command_args="${command_args} -t ${ceph_tag} -S -T ${ceph_tag}"
+	command_args="${command_args} ${ceph_self} daemonrun ${ceph_id}"
+}
+
+# daemon(8) runs this each time it starts the daemon and each time it restarts
+# it after it died. The marker file is there from the start of a run until
+# "service stop" removes it, so a marker found at the start of a run means the
+# run before it ended in a crash (or a kill): then its log is moved aside.
+ceph_daemon_run()
+{
+	ceph_rotate_crashed_log
+	: > "${ceph_runmarker}"
+	exec ${ceph_bin} ${ceph_bin_args}
+}
+
+# Move the log of a run that did not stop cleanly aside as
+# <log>.<yyyymmdd-hhmmss>, with the time it was last written, and keep the
+# newest ceph_logrotate_keep of those.
+ceph_rotate_crashed_log()
+{
+	local _stamp _new _count _excess _f
+
+	checkyesno ceph_logrotate_on_crash || return 0
+	[ -e "${ceph_runmarker}" ] || return 0
+	[ -s "${ceph_logfile}" ] || return 0
+	_stamp=$(date -r "$(stat -f %m "${ceph_logfile}")" +%Y%m%d-%H%M%S)
+	_new="${ceph_logfile}.${_stamp}"
+	[ ! -e "${_new}" ] || _new="${_new}.$$"
+	if mv "${ceph_logfile}" "${_new}"; then
+		echo "${ceph_tag} did not stop cleanly, its log is now ${_new}"
+	else
+		warn "${ceph_tag}: could not move ${ceph_logfile} aside"
+		return 0
+	fi
+	# The names sort by time, and the shell expands them in that order.
+	_count=0
+	for _f in "${ceph_logfile}".[0-9]*-[0-9]*; do
+		[ -f "${_f}" ] && _count=$((_count + 1))
+	done
+	_excess=$((_count - ceph_logrotate_keep))
+	for _f in "${ceph_logfile}".[0-9]*-[0-9]*; do
+		[ "${_excess}" -gt 0 ] || break
+		[ -f "${_f}" ] || continue
+		rm -f "${_f}"
+		_excess=$((_excess - 1))
+	done
+}
+
+# After a stop the run counts as finished in order.
+ceph_stop_postcmd()
+{
+	rm -f "${ceph_runmarker}"
+}
+
+# Split an rc verb into prefix (fast/force/one/quiet) and base verb.
+ceph_verb_split()
+{
+	ceph_verb_base="${1#fast}"
+	ceph_verb_base="${ceph_verb_base#force}"
+	ceph_verb_base="${ceph_verb_base#one}"
+	ceph_verb_base="${ceph_verb_base#quiet}"
+	ceph_verb_prefix="${1%"${ceph_verb_base}"}"
+}
+
+# Would rc.subr act on the current verb?
+ceph_enabled()
+{
+	case "${ceph_verb_prefix}" in
+	one|force)	return 0 ;;
+	esac
+	checkyesno "${rcvar}"
+}
+
+# Instances from rc.conf, or discovered from the data directories.
+ceph_instances_configured()
+{
+	local _list _d
+
+	eval _list=\"\${${name}_instances}\"
+	if [ -n "${_list}" ]; then
+		echo ${_list}
+		return
+	fi
+	for _d in "${ceph_datadir}/${ceph_type}/${ceph_cluster}"-*; do
+		[ -f "${_d}/keyring" ] || continue
+		echo "${_d##*/${ceph_cluster}-}"
+	done
+}
+
+# Instances that have a supervisor pidfile, configured or not.
+ceph_instances_running()
+{
+	local _f _t
+
+	for _f in "${ceph_rundir}/${ceph_cluster}"-*.daemon.pid; do
+		[ -f "${_f}" ] || continue
+		_t="${_f##*/${ceph_cluster}-}"
+		_t="${_t%.daemon.pid}"
+		case "${ceph_type}:${_t}" in
+		radosgw:client.*)	echo "${_t#client.}" ;;
+		radosgw:*)		;;
+		*:${ceph_type}.*)	echo "${_t#${ceph_type}.}" ;;
+		esac
+	done
+}
+
+ceph_prestart()
+{
+	local _owner
+
+	install -d -o "${ceph_user}" -g "${ceph_group}" -m 0770 "${ceph_rundir}"
+	install -d -o "${ceph_user}" -g "${ceph_group}" -m 0750 "${ceph_logdir}"
+
+	if [ ! -d "${ceph_instdir}" ]; then
+		warn "${ceph_tag}: data directory ${ceph_instdir} does not exist"
+		return 1
+	fi
+	_owner=$(stat -f %Su "${ceph_instdir}/.")
+	case "${_owner}" in
+	"${ceph_user}"|root)
+		;;
+	*)
+		warn "${ceph_tag}: ${ceph_instdir} is owned by ${_owner};" \
+		    "chown -R ${ceph_user}:${ceph_group} ${ceph_instdir}"
+		return 1
+		;;
+	esac
+	if [ ! -f "${ceph_instdir}/keyring" ]; then
+		if [ "${ceph_type}" = "radosgw" ]; then
+			warn "${ceph_tag}: no ${ceph_instdir}/keyring," \
+			    "relying on keyring setting in ${ceph_conf}"
+		else
+			warn "${ceph_tag}: ${ceph_instdir}/keyring missing"
+			return 1
+		fi
+	fi
+	return 0
+}
+
+ceph_status()
+{
+	local _child
+
+	if [ -z "${rc_pid}" ]; then
+		echo "${ceph_tag} is not running."
+		return 1
+	fi
+	_child=$(check_pidfile "${ceph_childpidfile}" "${ceph_bin}")
+	echo "${ceph_tag} is running as pid ${_child:-?} (supervisor ${rc_pid})."
+}
+
+# HUP the Ceph daemon itself, not daemon(8): reopens logs.
+ceph_reload()
+{
+	local _child
+
+	_child=$(check_pidfile "${ceph_childpidfile}" "${ceph_bin}")
+	if [ -z "${_child}" ]; then
+		warn "${ceph_tag}: supervisor running but no child process"
+		return 1
+	fi
+	echo "Reloading ${ceph_tag}."
+	kill -HUP ${_child}
+}
+
+# Entry point.  With an instance argument handle that instance; without
+# one, run the verb for every instance by re-invoking this script.
+ceph_dispatch()
+{
+	local _verb _list _i _rc
+
+	_verb="$1"
+	if [ "${_verb}" = "daemonrun" ]; then
+		# Not a verb for people: what daemon(8) supervises.
+		ceph_instance_setup "$2"
+		ceph_daemon_run
+		return
+	fi
+	if [ $# -ge 2 ]; then
+		ceph_instance_setup "$2"
+		run_rc_command "${_verb}"
+		return
+	fi
+
+	ceph_verb_split "${_verb}"
+	case "${ceph_verb_base}" in
+	start|restart|reload)
+		_list=$(ceph_instances_configured)
+		;;
+	stop)
+		_list=$(ceph_instances_running)
+		;;
+	status)
+		_list="$(ceph_instances_configured) $(ceph_instances_running)"
+		;;
+	*)
+		run_rc_command "${_verb}"
+		return
+		;;
+	esac
+	_list=$(echo ${_list} | tr ' ' '\n' | sort -u)
+
+	if [ -z "${_list}" ]; then
+		if [ "${ceph_verb_base}" != "stop" ] && ceph_enabled; then
+			warn "no ${ceph_type} instances configured or found in" \
+			    "${ceph_datadir}/${ceph_type}"
+		fi
+		return 0
+	fi
+
+	_rc=0
+	case "${ceph_verb_base}" in
+	stop)
+		# In parallel: shutdown is bounded by rcshutdown_timeout.
+		for _i in ${_list}; do
+			${ceph_self} "${_verb}" "${_i}" &
+		done
+		wait
+		;;
+	*)
+		for _i in ${_list}; do
+			${ceph_self} "${_verb}" "${_i}" || _rc=1
+		done
+		;;
+	esac
+	return ${_rc}
+}

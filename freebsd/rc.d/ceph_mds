@@ -1,0 +1,39 @@
+#!/bin/sh
+#
+# PROVIDE: ceph_mds
+# REQUIRE: LOGIN ceph_mon ceph_osd
+# KEYWORD: shutdown
+#
+# Ceph metadata server daemon.
+#
+# /etc/rc.conf:
+#   ceph_mds_enable="YES"
+#
+# Optional (shared knobs: ${CEPH_PREFIX}/libexec/ceph/rc.ceph.subr):
+#
+# ceph_mds_instances (str):	Instance ids.  Default: discovered from
+#				${ceph_datadir}/mds/${ceph_cluster}-<id>
+# ceph_mds_flags (str):		Extra arguments for ceph-mds.
+# ceph_mds_limits (str):		limits(1) arguments.  Default: "-n 1048576".
+#
+# service ceph_mds start		all instances
+# service ceph_mds start a	mds.a only
+#
+
+. /etc/rc.subr
+
+name="ceph_mds"
+rcvar="ceph_mds_enable"
+desc="Ceph metadata server daemon"
+
+load_rc_config "${name}"
+: ${CEPH_PREFIX:=/usr/local}
+
+: ${ceph_mds_enable:="NO"}
+
+ceph_type="mds"
+ceph_bin="${CEPH_PREFIX}/bin/ceph-mds"
+
+. ${CEPH_PREFIX}/libexec/ceph/rc.ceph.subr
+
+ceph_dispatch "$@"

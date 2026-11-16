@@ -1,0 +1,459 @@
+#!/bin/sh
+#
+# PROVIDE: ceph_osd
+# REQUIRE: LOGIN ceph_mon
+# KEYWORD: shutdown
+#
+# Ceph object storage daemons.
+#
+# /etc/rc.conf:
+#   ceph_osd_enable="YES"
+#
+# Optional (shared knobs: ${CEPH_PREFIX}/libexec/ceph/rc.ceph.subr):
+#
+# ceph_osd_instances (str):	OSD ids.  Default: discovered from
+#				${ceph_datadir}/osd/${ceph_cluster}-<id>
+#				after device activation.
+# ceph_osd_flags (str):		Extra arguments for ceph-osd.
+# ceph_osd_limits (str):	limits(1) arguments.  Default: "-n 1048576 -c unlimited"
+#				(open files, and core dumps of any size, so that a
+#				crashing OSD leaves a core; see kern.corefile).
+# ceph_osd_activate (bool):	Rebuild the OSD directories before starting,
+#				which is needed after every boot because they
+#				live on tmpfs.  Default: YES.
+# ceph_osd_activate_method (str): How to rebuild them.  Default: "both".
+#				zfs:   "ceph-volume zfs activate", OSDs are
+#				       found through the ceph:* ZFS properties
+#				       that "ceph-volume zfs prepare" set.
+#				label: scan devices for BlueStore labels, for
+#				       OSDs that were not made by ceph-volume.
+#				both:  zfs, then label: zvol and GEOM OSDs on
+#				       the same host.
+#				none:  do nothing.
+# ceph_osd_devices (str):	Only for method "label": devices or globs to
+#				scan, e.g. "/dev/gpt/osd-*".  Default: every
+#				disk in kern.disks plus its partitions and
+#				slices.
+# ceph_osd_tmpfs (bool):	Keep the OSD directories on tmpfs.  NO passes
+#				--no-tmpfs to ceph-volume.  Default: YES.
+# ceph_osd_wait_quorum (bool):	"service ceph_osd start" returns at once; a
+#				background job starts the OSDs once the
+#				monitors have quorum.  Default: YES.
+# ceph_osd_quorum_timeout (int): Stop waiting after this many seconds and
+#				start the OSDs anyway; 0 waits forever.
+#				Default: 0.
+# ceph_osd_quorum_args (str):	Identity for the quorum probe.  Default:
+#				client.admin if its keyring is readable,
+#				else the first local OSD's own key.
+# ceph_osd_aio_unsafe (bool):	Set vfs.aio.enable_unsafe=1 before starting.
+#				Default: YES.
+#
+# service ceph_osd start	activate devices, start all OSDs (after quorum)
+# service ceph_osd start 12	osd.12 only, no quorum wait
+# service ceph_osd activate	only rebuild the OSD directories; do not run
+#				this while OSDs are running, it re-primes them
+#
+
+. /etc/rc.subr
+
+name="ceph_osd"
+rcvar="ceph_osd_enable"
+desc="Ceph object storage daemon"
+
+load_rc_config "${name}"
+: ${CEPH_PREFIX:=/usr/local}
+
+: ${ceph_osd_enable:="NO"}
+: ${ceph_osd_activate:="YES"}
+: ${ceph_osd_activate_method:="both"}
+: ${ceph_osd_devices:=""}
+: ${ceph_osd_tmpfs:="YES"}
+: ${ceph_osd_wait_quorum:="YES"}
+: ${ceph_osd_quorum_timeout:="0"}
+: ${ceph_osd_quorum_args:=""}
+: ${ceph_osd_aio_unsafe:="YES"}
+: ${ceph_osd_limits:="-n 1048576 -c unlimited"}
+
+ceph_type="osd"
+ceph_bin="${CEPH_PREFIX}/bin/ceph-osd"
+
+. ${CEPH_PREFIX}/libexec/ceph/rc.ceph.subr
+
+start_precmd="ceph_osd_prestart"
+extra_commands="${extra_commands} activate"
+activate_cmd="ceph_osd_activate"
+ceph_osd_waitpidfile="${ceph_rundir}/${ceph_cluster}-osd-wait.pid"
+
+ceph_is_mountpoint()
+{
+	mount -p | awk -v d="$1" '$2 == d { f = 1 } END { exit !f }'
+}
+
+ceph_osd_scan_devices()
+{
+	local _d _p
+
+	if [ -n "${ceph_osd_devices}" ]; then
+		for _p in ${ceph_osd_devices}; do
+			[ -c "${_p}" ] && echo "${_p}"
+		done
+		return 0
+	fi
+	for _d in $(sysctl -n kern.disks); do
+		case "${_d}" in
+		cd*)	continue ;;
+		esac
+		for _p in "/dev/${_d}" "/dev/${_d}"p* "/dev/${_d}"s*; do
+			[ -c "${_p}" ] && echo "${_p}"
+		done
+	done
+	return 0
+}
+
+# Print "description|osd_uuid|whoami|ceph_fsid" for a BlueStore device.
+# The 22-byte magic check keeps ceph-bluestore-tool off everything else.
+ceph_osd_label()
+{
+	[ "$(dd if="$1" bs=4096 count=1 status=none | head -c 22)" = \
+	    "bluestore block device" ] || return 1
+	${CEPH_BINDIR}/ceph-bluestore-tool show-label --dev "$1" |
+	    jq -r '.[] | [.description // "", .osd_uuid // "", .whoami // "",
+		.ceph_fsid // ""] | join("|")'
+}
+
+# Method "zfs": let ceph-volume find the OSDs through their ZFS properties
+# and prime the tmpfs directories.  Without an id every OSD on this host is
+# activated.
+ceph_osd_activate_zfs()
+{
+	local _args _out _rc
+
+	_args="--cluster ${ceph_cluster}"
+	if [ -n "$1" ]; then
+		_args="${_args} zfs activate --osd-id $1"
+	else
+		_args="${_args} zfs activate --all"
+	fi
+	checkyesno ceph_osd_tmpfs || _args="${_args} --no-tmpfs"
+	# ceph-volume reads /etc/ceph/<cluster>.conf unless CEPH_CONF is set.
+	if [ "${ceph_osd_activate_method}" = "both" ]; then
+		# Most hosts have only one kind of OSD; "nothing found" is not news.
+		_out=$(env CEPH_CONF="${ceph_conf}" ${CEPH_SBINDIR}/ceph-volume ${_args} 2>&1)
+		_rc=$?
+		[ -z "${_out}" ] || echo "${_out}" |
+		    grep -v 'no ZFS-backed Ceph OSDs found to activate'
+		return ${_rc}
+	fi
+	env CEPH_CONF="${ceph_conf}" ${CEPH_SBINDIR}/ceph-volume ${_args}
+}
+
+# Activate according to ceph_osd_activate_method.  $1 is an optional OSD id.
+ceph_osd_activate()
+{
+	case "${ceph_osd_activate_method}" in
+	zfs)	ceph_osd_activate_zfs "$1" ;;
+	label)	ceph_osd_activate_label ;;
+	both)
+		# zvol OSDs and GEOM OSDs on one host.  Either half may have
+		# nothing to do, or fail (no plugin), without stopping the other.
+		ceph_osd_activate_zfs "$1" || warn "zfs activation failed"
+		ceph_osd_activate_label
+		;;
+	none)	return 0 ;;
+	*)
+		warn "unknown ceph_osd_activate_method" \
+		    "'${ceph_osd_activate_method}'"
+		return 1
+		;;
+	esac
+}
+
+# Method "label": find BlueStore devices of this cluster and prime their
+# OSD directories.
+ceph_osd_activate_label()
+{
+	local _fsid _dev _lbl _labels _desc _uuid _who _cfsid _dir _cur _link _f
+
+	install -d -o "${ceph_user}" -g "${ceph_group}" -m 0750 \
+	    "${ceph_datadir}/osd"
+	_fsid=$(${CEPH_BINDIR}/ceph-conf --cluster "${ceph_cluster}" \
+	    -c "${ceph_conf}" --lookup fsid)
+	[ -n "${_fsid}" ] || warn "no fsid in ${ceph_conf}," \
+	    "not checking which cluster a device belongs to"
+
+	_labels=""
+	for _dev in $(ceph_osd_scan_devices); do
+		_lbl=$(ceph_osd_label "${_dev}") || continue
+		[ -n "${_lbl}" ] || continue
+		_labels="${_labels}${_dev}|${_lbl}
+"
+	done
+	[ -n "${_labels}" ] || return 0
+
+	# Pass 1: main devices -> OSD directories.
+	echo "${_labels}" | while IFS='|' read -r _dev _desc _uuid _who _cfsid; do
+		[ "${_desc}" = "main" ] || continue
+		if [ -z "${_who}" ]; then
+			warn "${_dev}: label has no whoami (osd_uuid ${_uuid}), skipped"
+			continue
+		fi
+		if [ -n "${_fsid}" ] && [ "${_cfsid}" != "${_fsid}" ]; then
+			warn "${_dev}: osd.${_who} is from cluster ${_cfsid}," \
+			    "not ${_fsid}, skipped"
+			continue
+		fi
+		_dir="${ceph_datadir}/osd/${ceph_cluster}-${_who}"
+		_cur=""
+		[ -f "${_dir}/fsid" ] && _cur=$(cat "${_dir}/fsid")
+		if [ -c "${_dir}/block" ]; then
+			# Already active, possibly under another device name.
+			[ "${_cur}" = "${_uuid}" ] && continue
+			warn "${_dev}: osd.${_who} (${_uuid}) collides with active" \
+			    "${_dir} (${_cur}), skipped"
+			continue
+		fi
+
+		mkdir -p "${_dir}"
+		if checkyesno ceph_osd_tmpfs && \
+		    ! ceph_is_mountpoint "${_dir}" && [ -z "$(ls -A "${_dir}")" ]; then
+			mount -t tmpfs -o mode=0750 tmpfs "${_dir}" || continue
+		fi
+		echo "Activating osd.${_who} (${_uuid}) on ${_dev}."
+		if ! ${CEPH_BINDIR}/ceph-bluestore-tool prime-osd-dir \
+		    --dev "${_dev}" --path "${_dir}" --no-mon-config; then
+			warn "osd.${_who}: prime-osd-dir from ${_dev} failed"
+			continue
+		fi
+		ln -snf "${_dev}" "${_dir}/block"
+		chown -R "${ceph_user}:${ceph_group}" "${_dir}"
+		chown -h "${ceph_user}:${ceph_group}" "${_dir}/block"
+		chown "${ceph_user}:${ceph_group}" "${_dev}"
+		[ -f "${_dir}/keyring" ] || warn "osd.${_who}: label carries no" \
+		    "osd_key, put the keyring in ${_dir}/keyring yourself"
+	done
+
+	# Pass 2: DB/WAL devices, matched to their OSD by osd_uuid.
+	echo "${_labels}" | while IFS='|' read -r _dev _desc _uuid _who _cfsid; do
+		case "${_desc}" in
+		"bluefs db")	_link="block.db" ;;
+		"bluefs wal")	_link="block.wal" ;;
+		*)		continue ;;
+		esac
+		for _f in "${ceph_datadir}/osd/${ceph_cluster}"-*/fsid; do
+			[ -f "${_f}" ] || continue
+			[ "$(cat "${_f}")" = "${_uuid}" ] || continue
+			_dir="${_f%/fsid}"
+			ln -snf "${_dev}" "${_dir}/${_link}"
+			chown -h "${ceph_user}:${ceph_group}" "${_dir}/${_link}"
+			chown "${ceph_user}:${ceph_group}" "${_dev}"
+		done
+	done
+	return 0
+}
+
+ceph_osd_prestart()
+{
+	local _l
+
+	if [ ! -f "${ceph_instdir}/keyring" ] && checkyesno ceph_osd_activate; then
+		ceph_osd_activate "${ceph_id}"
+	fi
+	ceph_prestart || return 1
+
+	# Was ceph-osd-prestart.sh: refuse to start with a device missing.
+	for _l in block block.db block.wal; do
+		[ -L "${ceph_instdir}/${_l}" ] || continue
+		if [ ! -e "${ceph_instdir}/${_l}" ]; then
+			warn "${ceph_tag}: ${_l} -> $(readlink "${ceph_instdir}/${_l}")" \
+			    "not present, not starting"
+			return 1
+		fi
+		# devfs forgets ownership at reboot; chown follows the link.
+		chown "${ceph_user}:${ceph_group}" "${ceph_instdir}/${_l}"
+	done
+
+	if checkyesno ceph_osd_aio_unsafe && \
+	    [ "$(sysctl -n vfs.aio.enable_unsafe)" != "1" ]; then
+		sysctl vfs.aio.enable_unsafe=1
+	fi
+	return 0
+}
+
+ceph_osd_quorum_auth()
+{
+	local _kr _f _d
+
+	if [ -n "${ceph_osd_quorum_args}" ]; then
+		echo "${ceph_osd_quorum_args}"
+		return
+	fi
+	_kr="${CEPH_PREFIX}/etc/ceph/${ceph_cluster}.client.admin.keyring"
+	if [ -r "${_kr}" ]; then
+		echo "--name client.admin --keyring ${_kr}"
+		return
+	fi
+	for _f in "${ceph_datadir}/osd/${ceph_cluster}"-*/keyring; do
+		[ -r "${_f}" ] || continue
+		_d="${_f%/keyring}"
+		echo "--name osd.${_d##*/${ceph_cluster}-} --keyring ${_f}"
+		return
+	done
+}
+
+# A mon only answers quorum_status while it is part of a quorum.
+# $1 is the time to give the probe, in seconds (default 30).
+ceph_osd_have_quorum()
+{
+	local _n _t
+
+	_t="${1:-30}"
+	_n=$(timeout "${_t}" ${CEPH_BINDIR}/ceph --cluster "${ceph_cluster}" \
+	    -c "${ceph_conf}" --connect-timeout $(( _t > 20 ? 20 : _t )) \
+	    $(ceph_osd_quorum_auth) \
+	    quorum_status --format json | jq -r '.quorum_names | length')
+	case "${_n}" in
+	""|*[!0-9]*)	return 1 ;;
+	esac
+	[ "${_n}" -gt 0 ]
+}
+
+# Runs under daemon(8), output goes to syslog.
+ceph_osd_waitstart()
+{
+	local _verb _t0 _waited _tries _log _rc
+
+	_verb="${1:-start}"
+	_t0=$(date +%s)
+	_tries=0
+	until ceph_osd_have_quorum; do
+		_waited=$(( $(date +%s) - _t0 ))
+		if [ "${ceph_osd_quorum_timeout}" -gt 0 ] && \
+		    [ "${_waited}" -ge "${ceph_osd_quorum_timeout}" ]; then
+			warn "no monitor quorum after ${_waited}s, starting OSDs anyway"
+			break
+		fi
+		# Once a minute, so that syslog shows a start that is held up.
+		[ $(( _tries % 6 )) -eq 0 ] && \
+		    echo "Waiting for monitor quorum (${_waited}s so far;" \
+			"ceph_osd_wait_quorum=NO does not wait)."
+		_tries=$(( _tries + 1 ))
+		sleep 10
+	done
+	echo "Monitor quorum reached, starting OSDs."
+	# The OSD supervisors inherit our stdout, which is the pipe of the
+	# daemon(8) that runs this waiter.  That daemon only exits when the pipe
+	# is closed, so it would stay around for as long as the OSDs run and
+	# "status" would keep saying we are waiting.  Give the dispatch a file
+	# instead and hand its output to syslog afterwards.
+	_log="${ceph_rundir}/${ceph_cluster}-osd-wait.log"
+	ceph_dispatch "${_verb}" </dev/null >"${_log}" 2>&1
+	_rc=$?
+	[ ! -s "${_log}" ] || cat "${_log}"
+	rm -f "${_log}"
+	return ${_rc}
+}
+
+ceph_osd_spawn_waiter()
+{
+	local _p
+
+	_p=$(check_pidfile "${ceph_osd_waitpidfile}" /usr/sbin/daemon)
+	if [ -n "${_p}" ]; then
+		echo "OSD start already waiting for quorum (pid ${_p})."
+		return 0
+	fi
+	install -d -o "${ceph_user}" -g "${ceph_group}" -m 0770 "${ceph_rundir}"
+	echo "Starting ${ceph_cluster} OSDs in the background once the" \
+	    "monitors have quorum."
+	/usr/sbin/daemon -S -T "${ceph_cluster}-osd-wait" \
+	    -P "${ceph_osd_waitpidfile}" -t "${ceph_cluster}-osd-wait" \
+	    "${ceph_self}" waitstart "$1"
+}
+
+ceph_osd_stop_waiter()
+{
+	local _p _n
+
+	_p=$(check_pidfile "${ceph_osd_waitpidfile}" /usr/sbin/daemon)
+	[ -n "${_p}" ] || return 0
+	echo "Cancelling pending OSD start (pid ${_p})."
+	kill -TERM ${_p}
+	# daemon(8) can outlive its child while the pipe is still held open;
+	# do not wait for it forever.
+	_n=0
+	while kill -0 ${_p} 2>/dev/null && [ "${_n}" -lt 10 ]; do
+		sleep 1
+		_n=$((_n + 1))
+	done
+	if kill -0 ${_p} 2>/dev/null; then
+		kill -KILL ${_p} 2>/dev/null
+	fi
+	rm -f "${ceph_osd_waitpidfile}"
+	return 0
+}
+
+ceph_osd_main()
+{
+	local _p
+
+	ceph_verb_split "$1"
+	case "${ceph_verb_base}" in
+	start)
+		if [ $# -ge 2 ]; then
+			ceph_dispatch "$@"
+			return
+		fi
+		ceph_enabled || return 0
+		# Re-priming a running OSD would pull its directory away.
+		if checkyesno ceph_osd_activate &&
+		    [ -z "$(ceph_instances_running)" ]; then
+			ceph_osd_activate
+		fi
+		if checkyesno ceph_osd_wait_quorum && [ -z "$(command -v jq)" ]; then
+			# The quorum probe needs jq. Waiting for it to appear would
+			# keep the OSDs from ever starting.
+			warn "jq not found in PATH, not waiting for monitor quorum"
+			ceph_dispatch "$1"
+		elif checkyesno ceph_osd_wait_quorum; then
+			# With quorum already there (a manual start) there is
+			# nothing to wait for; at boot the monitor is not up yet.
+			if ceph_osd_have_quorum 5; then
+				ceph_dispatch "$1"
+			else
+				ceph_osd_spawn_waiter "$1"
+			fi
+		else
+			ceph_dispatch "$1"
+		fi
+		;;
+	stop)
+		[ $# -lt 2 ] && ceph_osd_stop_waiter
+		ceph_dispatch "$@"
+		;;
+	restart)
+		if [ $# -ge 2 ]; then
+			ceph_dispatch "$@"
+			return
+		fi
+		_p="${ceph_verb_prefix}"
+		ceph_osd_main "${_p}stop"
+		ceph_osd_main "${_p}start"
+		;;
+	status)
+		if [ $# -lt 2 ]; then
+			_p=$(check_pidfile "${ceph_osd_waitpidfile}" /usr/sbin/daemon)
+			[ -n "${_p}" ] && echo "OSD start waiting for monitor" \
+			    "quorum (pid ${_p})."
+		fi
+		ceph_dispatch "$@"
+		;;
+	waitstart)
+		ceph_osd_waitstart "$2"
+		;;
+	*)
+		ceph_dispatch "$@"
+		;;
+	esac
+}
+
+ceph_osd_main "$@"
