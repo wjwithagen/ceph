@@ -499,6 +499,7 @@ if [ x$(uname)x = xFreeBSDx ]; then
 	py${PYTHON_VERSION}-grpcio \
 	py${PYTHON_VERSION}-sphinx \
 	py${PYTHON_VERSION}-textproc \
+	py${PYTHON_VERSION}-black \
 	
 
 # --- dropped for v21 on FreeBSD -------------------------------------------
