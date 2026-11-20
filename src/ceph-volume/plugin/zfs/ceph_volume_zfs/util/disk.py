@@ -84,6 +84,11 @@ def geom_disk_parser(block):
         column = re.sub(r"^[0-9]+\.", "", column)
         value = value.strip()
         value = re.sub(r"\([0-9A-Z.]+\)", '', value).strip()
+        # lunname is the SCSI INQUIRY vendor, product and serial fields
+        # concatenated, each padded to its fixed width, so it arrives full
+        # of runs of spaces. Collapse them here rather than in every
+        # consumer.
+        value = re.sub(r'\s+', ' ', value)
         parsed[column.lower()] = value
     return parsed
 
@@ -144,54 +149,131 @@ def get_geom_disk(diskname):
     return geom_disk_parser(geom_block)
 
 
-def get_partitions(diskname):
+def natural_key(name):
     """
-    Runs `gpart show -p <diskname>` and returns a list of partition
-    dicts: [{'name': 'ada0p1', 'type': 'freebsd-boot',
-    'size_human': '512K'}, ...].
+    Sort key that puts da2 before da10, which a plain string sort does
+    not.  Splits a device name into runs of digits and runs of anything
+    else, and compares the digit runs as numbers.
 
-    The -p flag makes gpart print full partition device names
-    (ada0p1) instead of bare index numbers, which is what we need to
-    cross-reference against `mount -p` output. Free-space gaps
-    (unallocated regions between/after partitions) are skipped -- gpart
-    reports these with no partition name, they're not real partitions.
-
-    Returns an empty list if the disk has no partition table at all.
+    Each part is tagged with 0 for text or 1 for a number so that a name
+    without a trailing unit number never ends up compared against one,
+    which would raise.
     """
-    command = ['/sbin/gpart', 'show', '-p', diskname]
-    # verbose_on_failure=False: a non-zero rc here means "no partition
-    # table", which is an expected, meaningful result for us -- not a
-    # failure worth printing "gpart: No such geom: adaN." to stderr.
-    out, err, rc = process.call(command, verbose_on_failure=False)
-    partitions = []
+    return [(1, int(part)) if part.isdigit() else (0, part)
+            for part in re.split(r'(\d+)', name) if part != '']
+
+
+def _part_index(part):
+    """
+    Sort key for one gpart table: p4 before p5 and s1 before s2, by
+    index rather than by the start sector gpart orders its output on.
+    """
+    m = re.search(r'[ps](\d+)$', part['name'])
+    return int(m.group(1)) if m else 0
+
+
+def gpart_show_all():
+    """
+    Every gpart table on the system, from one `gpart show -p`, keyed by
+    the geom the table sits on:
+
+      {'ada0': {'scheme': 'GPT', 'raw': [...],
+                 'partitions': [{'name': 'ada0p1', 'type': ..., ...}]},
+       'da0s1': {'scheme': 'BSD', ...}}
+
+    Called once per run.  Asking gpart per disk instead means a failed
+    command for every disk without a table, and ceph_volume.process
+    logs each of those at WARNING: a host whose pool members are whole
+    disks recorded a "No such geom" error for every one of them.  This
+    also picks up nested tables for free, since `gpart show` with no
+    geom named lists those as blocks of their own.
+
+    The -p flag makes gpart print full partition device names (ada0p1)
+    instead of bare index numbers, which is what we need to
+    cross-reference against `mount -p` output.  Free-space gaps are
+    skipped: gpart reports those with no partition name, they are not
+    real partitions.
+    """
+    out, err, rc = process.call(['/sbin/gpart', 'show', '-p'],
+                                verbose_on_failure=False)
+    tables = {}
     if rc != 0 or not out:
-        return partitions
+        return tables
     line_re = re.compile(r'^\s*\d+\s+\d+\s+(\S+)\s+(\S+)\s+\(([^)]+)\)\s*$')
+    current = None
     for line in out:
-        if line.strip().startswith('=>'):
+        stripped = line.strip()
+        if stripped.startswith('=>'):
+            # "=>       63  976773105    da0  MBR  (466G)": the geom and
+            # then the scheme, both before the parenthesized size
+            fields = stripped.split()
+            if len(fields) < 3:
+                current = None
+                continue
+            current = fields[-3]
+            tables[current] = {'scheme': fields[-2], 'partitions': [],
+                               'raw': [line]}
             continue
+        if current is None:
+            continue
+        tables[current]['raw'].append(line)
         m = line_re.match(line)
         if not m:
             continue
         name, ptype, human = m.groups()
-        if name == '-' or not name.startswith(diskname):
+        if name == '-' or not name.startswith(current):
             # unallocated / free space region, not a real partition
             continue
-        partitions.append({'name': name, 'type': ptype, 'size_human': human})
-    # Sort by partition index number so p4 always appears before p5
-    # regardless of how gpart orders them in its output (which is by
-    # start sector, not by partition number).
+        tables[current]['partitions'].append(
+            {'name': name, 'type': ptype, 'size_human': human})
+    for table in tables.values():
+        table['partitions'].sort(key=_part_index)
+    return tables
 
-    def _part_index(p):
-        m = re.search(r'p(\d+)$', p['name'])
-        return int(m.group(1)) if m else 0
-    partitions.sort(key=_part_index)
+
+def get_partitions(diskname, tables=None):
+    """
+    Every partition on a disk, as a list of dicts:
+    [{'name': 'ada0p1', 'type': 'freebsd-boot', 'size_human': '512K'},
+    ...].
+
+    An MBR slice can hold a BSD disklabel of its own, and
+    `gpart show -p da0` does not descend into it: it reports da0s1 but
+    not the da0s1a inside it, so a filesystem or a pool on that label
+    would never be matched against the disk.  Each slice of an MBR or
+    EBR table is therefore asked for its own table, and what it holds
+    follows it in the list, carrying 'parent' with the slice name.
+    GPT is only allowed at the outermost level and BSD does not nest,
+    both by default, so neither is descended into.
+
+    Returns an empty list if the disk has no partition table at all.
+    """
+    if tables is None:
+        tables = gpart_show_all()
+    table = tables.get(diskname) or {}
+    scheme = table.get('scheme')
+    result = []
+    # copy, so that the per-disk keys added below never land on the
+    # shared tables dict
+    for part in table.get('partitions', []):
+        result.append(dict(part))
+        if scheme not in ('MBR', 'EBR'):
+            continue
+        nested = tables.get(part['name']) or {}
+        for sub in nested.get('partitions', []):
+            sub = dict(sub)
+            sub['parent'] = part['name']
+            result.append(sub)
     # `gpart show` does not print the label, the raw uuid or whether the
     # partition is open; `gpart list` does. Add them when available.
-    details = get_partition_details(diskname)
-    for part in partitions:
+    containers = [diskname]
+    containers.extend(sorted(set(p['parent'] for p in result if 'parent' in p)))
+    details = {}
+    for container in containers:
+        details.update(get_partition_details(container))
+    for part in result:
         part.update(details.get(part['name'], {}))
-    return partitions
+    return result
 
 
 def get_partition_details(diskname):
@@ -241,22 +323,36 @@ def get_partition_details(diskname):
     return details
 
 
-def get_label_aliases(partitions=None):
+def get_glabel_aliases():
+    """
+    Every GEOM label on the system, from one `glabel status`:
+    {'gpt/zfs0': 'ada2p3', 'gptid/fa257269-...': 'da4p3', ...}.
+
+    This is the same for every disk, so get_disks() reads it once and
+    hands it to get_label_aliases() per disk.
+    """
+    aliases = {}
+    out, err, rc = process.call(['/sbin/glabel', 'status'], verbose_on_failure=False)
+    if rc != 0:
+        return aliases
+    for line in out:
+        fields = line.split()
+        if len(fields) >= 3 and fields[0] != 'Name':
+            aliases[fields[0]] = fields[2]
+    return aliases
+
+
+def get_label_aliases(partitions=None, glabel=None):
     """
     Maps GEOM label names (gpt/zfs0, gptid/fa257269-..., diskid/DISK-...)
     to the device they stand for ('da4p3'). zpool, mount and swap often
     use these names, so comparing only with /dev/daNpM misses them.
 
     Built from `glabel status`, plus the label and raw uuid of the given
-    partitions for the cases glabel does not list.
+    partitions for the cases glabel does not list.  Pass `glabel` from
+    get_glabel_aliases() to avoid running glabel again.
     """
-    aliases = {}
-    out, err, rc = process.call(['/sbin/glabel', 'status'], verbose_on_failure=False)
-    if rc == 0:
-        for line in out:
-            fields = line.split()
-            if len(fields) >= 3 and fields[0] != 'Name':
-                aliases[fields[0]] = fields[2]
+    aliases = dict(glabel) if glabel is not None else get_glabel_aliases()
     for part in partitions or []:
         if part.get('label'):
             aliases.setdefault('gpt/' + part['label'], part['name'])
@@ -271,25 +367,40 @@ def resolve_device(path, aliases):
     return aliases.get(name, name)
 
 
+# A GEOM transform appends its own suffix to the provider it sits on, and
+# that is the name a mount or a pool then uses: geli (.eli), gjournal
+# (.journal), gnop (.nop).  They can be stacked.
+_GEOM_SUFFIX_RE = re.compile(r'(?:\.(?:eli|journal|nop))+$')
+
+
 def _device_on_disk(name, diskname):
     """
-    'da4p3' -> 'da4p3' when it is the disk or one of its partitions, else None.
+    'da4p3' -> 'da4p3' when it is the disk or something on it, else None.
 
-    Covers GPT partitions (da4p3), MBR slices and the BSD labels inside
-    them (da4s1, da4s1a), and a GELI provider layered on either of those
-    (da4p3.eli), which is the name a mount or a pool uses once the
-    partition is encrypted.
+    What a partitioning scheme can put after the disk name on FreeBSD:
+      p<n>      GPT partition                        da4p3
+      s<n>      MBR slice, or an EBR one past s4     da4s1, da4s5
+      s<n><l>   BSD disklabel inside a slice         da4s1a
+      <l>       BSD disklabel on the raw disk        da4a
+    gpart's BSD scheme takes up to 20 entries, so the disklabel letter
+    runs a-t and not just a-h.  APM, LDM and BSD64 are left out: they
+    describe Apple, Windows NT and DragonFly disks.
+
+    Known gap: kern.geom.part.separator inserts a separator between the
+    disk name and the partition name, so with that tunable set the names
+    become da4.p3 and nothing matches here.
     """
-    name = re.sub(r'\.eli$', '', name)
-    m = re.match(r'^(' + re.escape(diskname) + r'(?:p\d+|s\d+[a-h]?)?)$', name)
+    name = _GEOM_SUFFIX_RE.sub('', name)
+    m = re.match(r'^(' + re.escape(diskname) + r'(?:p\d+|s\d+[a-t]?|[a-t])?)$',
+                 name)
     return m.group(1) if m else None
 
 
-def get_gpart_info(diskname):
+def get_gpart_info(diskname, tables=None):
     """
-    Runs `gpart show <diskname>` to detect an existing partition
-    scheme, and augments with the actual partition list from
-    get_partitions(). Returns a dict with:
+    The partition scheme of one disk, from the tables gpart_show_all()
+    prepared, plus the partition list from get_partitions().  Returns a
+    dict with:
       - 'has_partitions': bool
       - 'scheme': 'GPT'/'MBR'/None
       - 'empty': bool -- True if there's no partition table AND no
@@ -300,32 +411,23 @@ def get_gpart_info(diskname):
     A disk with an existing partition table is not safe to blindly
     hand to `prepare` without an explicit zap first.
     """
-    command = ['/sbin/gpart', 'show', diskname]
-    # verbose_on_failure=False: see note in get_partitions() -- a
-    # non-zero rc is the expected signal for an unpartitioned disk.
-    out, err, rc = process.call(command, verbose_on_failure=False)
+    if tables is None:
+        tables = gpart_show_all()
+    table = tables.get(diskname) or {}
     info = {
         'has_partitions': False,
-        'scheme': None,
+        'scheme': table.get('scheme'),
         'empty': True,
         'partitions': [],
-        'raw': out,
+        'raw': table.get('raw', []),
     }
-    if rc != 0 or not out:
-        # rc != 0 typically means "no such geom" -- i.e. no partition
-        # table at all, which gpart reports as an error rather than
-        # empty output. Disk is genuinely empty.
+    if not table:
+        # no table for this geom at all: the disk is genuinely blank
         return info
-    header = out[0]
-    # Header looks like: "=>       40  976773127  ada0  GPT  (466G)"
-    # -- scheme is the bare word before the parenthesized human-size
-    # field, not inside the parens (that's the size, e.g. "(466G)").
-    m = re.search(r'\s(\S+)\s+\([^)]+\)\s*$', header)
-    if m:
-        info['scheme'] = m.group(1)
+    if info['scheme']:
         info['has_partitions'] = True
         info['empty'] = False
-    partitions = get_partitions(diskname)
+    partitions = get_partitions(diskname, tables=tables)
     info['partitions'] = partitions
     if partitions:
         info['empty'] = False
@@ -386,7 +488,11 @@ def _zpool_leaf_vdevs_plaintext():
             group = None
             group_indent = -1
             continue
-        m = re.match(r'^(raidz\d*-\d+|mirror-\d+|logs|cache|spares)\s', stripped)
+        # A section header can be the only thing on its line, so do not
+        # require anything after it: a cache device was being reported as
+        # a plain stripe member because "cache" never matched.
+        m = re.match(r'^(raidz\d*-\d+|mirror-\d+|logs|cache|spares|dedup|special)'
+                     r'(?:\s|$)', stripped)
         if m:
             group = m.group(1)
             group_indent = indent
@@ -404,6 +510,27 @@ def _zpool_leaf_vdevs_plaintext():
     return leaves
 
 
+def zpool_supports_json():
+    """
+    True when `zpool status -j` exists, which is OpenZFS 2.3 and newer.
+
+    Running `zpool status -j` and reading the exit status would be the
+    obvious probe, but ceph_volume.process logs every command that
+    fails at WARNING and offers no way to turn that off, so a host on
+    2.2 would record a zpool usage error on every single run.  Read the
+    version instead: `zpool version` prints a first line of the form
+    "zfs-2.2.6-FreeBSD_g33174af15".
+    """
+    out, err, rc = process.call(['/sbin/zpool', 'version'],
+                                verbose_on_failure=False)
+    if rc != 0 or not out:
+        return False
+    m = re.match(r'^zfs-(\d+)\.(\d+)', out[0].strip())
+    if not m:
+        return False
+    return (int(m.group(1)), int(m.group(2))) >= (2, 3)
+
+
 def get_zpool_leaf_vdevs():
     """
     Every leaf vdev of every imported pool:
@@ -411,6 +538,8 @@ def get_zpool_leaf_vdevs():
       'path': '/dev/gptid/fa257269-...'}, ...]
     vdev_name is None for a plain stripe member.
     """
+    if not zpool_supports_json():
+        return _zpool_leaf_vdevs_plaintext()
     command = ['/sbin/zpool', 'status', '-j']
     out, err, rc = process.call(command, verbose_on_failure=False)
     if rc == 0 and out:
@@ -421,13 +550,27 @@ def get_zpool_leaf_vdevs():
         if data is not None:
             leaves = []
             for pool_name, pool in data.get('pools', {}).items():
-                for key in ('vdevs', 'logs', 'l2cache', 'spares'):
-                    _collect_leaf_vdevs(pool.get(key) or {}, pool_name, pool_name, leaves)
+                # 'vdevs' holds one root vdev named after the pool, and
+                # every group hangs below it, so the walk from here finds
+                # anything nested, a logs or cache group included.
+                _collect_leaf_vdevs(pool.get('vdevs') or {}, pool_name,
+                                    pool_name, leaves)
+                # A pool that has them also carries these beside 'vdevs',
+                # keyed either by a group name holding nested vdevs or by
+                # the device itself. Pass the key as the parent so a
+                # device sitting directly under one is reported as part of
+                # that class rather than as a bare stripe member. Absent
+                # keys cost nothing, and which of these OpenZFS actually
+                # emits has not been seen on a live pool yet.
+                for key in ('logs', 'log', 'cache', 'l2cache', 'spares',
+                            'dedup', 'special'):
+                    _collect_leaf_vdevs(pool.get(key) or {}, pool_name,
+                                        key, leaves)
             return leaves
     return _zpool_leaf_vdevs_plaintext()
 
 
-def get_zpool_membership(diskname, partitions=None, aliases=None):
+def get_zpool_membership(diskname, partitions=None, aliases=None, leaves=None):
     """
     Checks whether this disk (or any gpart partition on it) is a member of
     an imported zpool. A pool names its devices as it was created: by
@@ -444,7 +587,8 @@ def get_zpool_membership(diskname, partitions=None, aliases=None):
     """
     result = {'in_pool': False, 'pool_name': None, 'vdev_name': None,
               'vdev_type': None, 'partitions': {}}
-    leaves = get_zpool_leaf_vdevs()
+    if leaves is None:
+        leaves = get_zpool_leaf_vdevs()
     if not leaves:
         return result
     if partitions is None:
@@ -463,7 +607,44 @@ def get_zpool_membership(diskname, partitions=None, aliases=None):
     return result
 
 
-def get_mount_info(diskname, partitions=None, aliases=None):
+def get_mount_entries():
+    """
+    Every mounted device with where it is mounted, from one `mount -p`:
+    [('/dev/gpt/data', '/mnt/data'), ...].
+
+    The output is the same whichever disk is being looked at, so
+    get_disks() reads it once and hands it to get_mount_info().
+    """
+    out, err, rc = process.call(['/sbin/mount', '-p'])
+    entries = []
+    if rc != 0:
+        return entries
+    for line in out:
+        fields = line.split()
+        if not fields or not fields[0].startswith('/dev/'):
+            continue
+        entries.append((fields[0], fields[1] if len(fields) > 1 else None))
+    return entries
+
+
+def get_swap_entries():
+    """
+    Every active swap device, from one `swapctl -l`.  Read once per run
+    for the same reason as get_mount_entries().
+    """
+    out, err, rc = process.call(['/sbin/swapctl', '-l'])
+    entries = []
+    if rc != 0 or not out:
+        return entries
+    for line in out[1:]:  # first line is the header: "Device  1K-blocks  Used"
+        fields = line.split()
+        if not fields or not fields[0].startswith('/dev/'):
+            continue
+        entries.append(fields[0])
+    return entries
+
+
+def get_mount_info(diskname, partitions=None, aliases=None, entries=None):
     """
     Cross-references `mount -p` (parseable output) against this disk's
     partitions to catch cases where something on the disk is actively
@@ -489,24 +670,15 @@ def get_mount_info(diskname, partitions=None, aliases=None):
     A mount by label (/dev/gpt/somelabel) or by gptid (/dev/gptid/...)
     is resolved to the partition it stands for first.
     """
-    command = ['/sbin/mount', '-p']
-    out, err, rc = process.call(command)
     result = {'mounted': False, 'mountpoints': [], 'by_partition': {}}
     partitions = partitions or []
     for part in partitions:
         result['by_partition'][part['name']] = {'mounted': False, 'mountpoint': None}
-    if rc != 0:
-        return result
+    if entries is None:
+        entries = get_mount_entries()
     if aliases is None:
         aliases = get_label_aliases(partitions)
-    for line in out:
-        fields = line.split()
-        if not fields:
-            continue
-        device = fields[0]
-        mountpoint = fields[1] if len(fields) > 1 else None
-        if not device.startswith('/dev/'):
-            continue
+    for device, mountpoint in entries:
         matched_name = _device_on_disk(resolve_device(device, aliases), diskname)
         if not matched_name:
             continue
@@ -529,7 +701,7 @@ def get_mount_info(diskname, partitions=None, aliases=None):
     return result
 
 
-def get_swap_info(diskname, partitions=None, aliases=None):
+def get_swap_info(diskname, partitions=None, aliases=None, entries=None):
     """
     Cross-references `swapctl -l` against this disk's partitions to
     catch active swap devices. Swap is NOT visible via `mount -p` --
@@ -554,23 +726,15 @@ def get_swap_info(diskname, partitions=None, aliases=None):
         },
       }
     """
-    command = ['/sbin/swapctl', '-l']
-    out, err, rc = process.call(command)
     result = {'active': False, 'devices': [], 'by_partition': {}}
     partitions = partitions or []
     for part in partitions:
         result['by_partition'][part['name']] = {'active': False}
-    if rc != 0 or not out:
-        return result
+    if entries is None:
+        entries = get_swap_entries()
     if aliases is None:
         aliases = get_label_aliases(partitions)
-    for line in out[1:]:  # first line is the header: "Device  1K-blocks  Used"
-        fields = line.split()
-        if not fields:
-            continue
-        device = fields[0]
-        if not device.startswith('/dev/'):
-            continue
+    for device in entries:
         matched_name = _device_on_disk(resolve_device(device, aliases), diskname)
         if not matched_name:
             continue
@@ -742,6 +906,8 @@ def get_zpool_vdevs(pool_name):
     Tries `zpool status -j` (OpenZFS >= 2.3) first, falls back to
     plaintext parsing on older versions.
     """
+    if not zpool_supports_json():
+        return _get_zpool_vdevs_plaintext(pool_name)
     command = ['/sbin/zpool', 'status', '-j', pool_name]
     out, err, rc = process.call(command, verbose_on_failure=False)
     paths = []
@@ -797,17 +963,42 @@ def list_ceph_zpools():
     return results
 
 
+def list_kern_disks():
+    """
+    Every disk GEOM knows about, from sysctl kern.disks, which is a
+    single space separated line: "ada0 da0 vtbd0".
+
+    This is the enumeration source rather than `camcontrol devlist`,
+    because camcontrol only knows devices on the CAM bus.  Virtio disks
+    in a VM (vtbd), NVMe with hw.nvme.use_nvd=1 (nvd), SD/eMMC (mmcsd),
+    memory disks (md) and the RAID drivers that do not use CAM (mfid,
+    amrd, aacd, twed, mlxd) never appear there, and a host with only
+    those would report no disks at all.  camcontrol devlist still
+    supplies scbus/target/lun/pass for the devices that are on the bus.
+    """
+    command = ['/sbin/sysctl', '-n', 'kern.disks']
+    out, err, rc = process.call(command, verbose_on_failure=False)
+    if rc != 0 or not out:
+        return []
+    return sorted(out[0].split(), key=natural_key)
+
+
 def get_disks():
     cam_devices = camcontrol_devlist_parser()
+    # Both of these describe the whole system rather than one disk, and
+    # `zpool status` in particular is expensive: read them once here
+    # instead of once per disk.
+    glabel = get_glabel_aliases()
+    leaves = get_zpool_leaf_vdevs()
+    tables = gpart_show_all()
+    mounts = get_mount_entries()
+    swaps = get_swap_entries()
     disks = {}
-    for dsk, cam_info in cam_devices.items():
-        if re.match(r'^cd\d+$', dsk):
+    for dsk in list_kern_disks():
+        # cd = optical, ses = SCSI Enclosure Services, pass = CAM
+        # passthrough -- never OSD targets
+        if re.match(r'^(cd|ses|pass)\d+$', dsk):
             continue
-        # ses = SCSI Enclosure Services, pass = CAM passthrough -- never OSD targets
-        if re.match(r'^(ses|pass)\d+$', dsk):
-            continue
-        # strip any accidental /dev/ prefix from the camcontrol parser
-        dsk = dsk.replace('/dev/', '')
         disk = get_geom_disk(dsk)
         # For SAS/SCSI (da*) devices geom sometimes can't report mediasize
         # via ATA commands, or reports 0. Augment from camcontrol identify.
@@ -821,14 +1012,17 @@ def get_disks():
                 cam_id = get_camcontrol_identify(dsk)
                 if cam_id.get('mediasize'):
                     disk.update(cam_id)
-        disk['cam'] = cam_info
-        disk['gpart'] = get_gpart_info(dsk)
+        # empty for a disk that is not on the CAM bus, e.g. vtbd0
+        disk['cam'] = cam_devices.get(dsk, {})
+        disk['gpart'] = get_gpart_info(dsk, tables=tables)
         partitions = disk['gpart'].get('partitions')
-        # One `glabel status` per disk, not one per lookup below.
-        aliases = get_label_aliases(partitions)
-        disk['zpool'] = get_zpool_membership(dsk, partitions=partitions, aliases=aliases)
-        disk['mount'] = get_mount_info(dsk, partitions=partitions, aliases=aliases)
-        disk['swap'] = get_swap_info(dsk, partitions=partitions, aliases=aliases)
+        aliases = get_label_aliases(partitions, glabel=glabel)
+        disk['zpool'] = get_zpool_membership(dsk, partitions=partitions,
+                                             aliases=aliases, leaves=leaves)
+        disk['mount'] = get_mount_info(dsk, partitions=partitions,
+                                       aliases=aliases, entries=mounts)
+        disk['swap'] = get_swap_info(dsk, partitions=partitions,
+                                     aliases=aliases, entries=swaps)
         disks['/dev/' + dsk] = disk
     return disks
 
@@ -860,7 +1054,7 @@ class Disks(object):
                 descr='Model name',
                 reason='',
             )]
-        for disk in sorted(self.disks):
+        for disk in sorted(self.disks, key=natural_key):
             output.append(self.disks[disk].report())
         return ''.join(output)
 
@@ -869,11 +1063,12 @@ class Disks(object):
         Detailed report for -v: one block per disk with its status, the
         reasons it is not available, its partitions and mount state.
         """
-        return '\n\n'.join(self.disks[disk].describe() for disk in sorted(self.disks))
+        order = sorted(self.disks, key=natural_key)
+        return '\n\n'.join(self.disks[disk].describe() for disk in order)
 
     def json_report(self):
         output = []
-        for disk in sorted(self.disks):
+        for disk in sorted(self.disks, key=natural_key):
             output.append(self.disks[disk].json_report())
         return output
 
@@ -974,6 +1169,20 @@ class Disk(object):
                 self.available = False
 
     @staticmethod
+    def _rotational(value):
+        """
+        True for a spinning disk, False for flash, None when geom does
+        not know.  geom reports "rotationrate: unknown" for a SATA disk
+        behind a SAS HBA, and reporting those as non-rotational would
+        say they are flash, which is worse than saying nothing.
+        """
+        try:
+            rate = int(value)
+        except (TypeError, ValueError):
+            return None
+        return rate != 0
+
+    @staticmethod
     def _safe_int(value, default=0):
         """
         geom fields are sometimes non-numeric strings, e.g.
@@ -992,10 +1201,11 @@ class Disk(object):
         else:
             available_str = 'False'
             reason_str = '(' + self.reject_reasons[0] + ')' if self.reject_reasons else ''
+        rotational = self._rotational(self.sys_api.get('rotationrate'))
         return report_template.format(
             geomname='/dev/' + self.sys_api.get('geomname', self.path).replace('/dev/', ''),
             mediasize=human_readable_size(self._safe_int(self.sys_api.get('mediasize'))),
-            rotational=self._safe_int(self.sys_api.get('rotationrate')) != 0,
+            rotational=('unknown' if rotational is None else rotational),
             available=available_str,
             descr=self.sys_api.get('descr'),
             reason=reason_str,
@@ -1036,14 +1246,31 @@ class Disk(object):
                 lines.append('  partitions: none (disk is empty)')
         else:
             lines.append('  partitions:')
+            rows = []
             for part in partitions:
-                lines.append('    {name}  {type}  {size}{label}  ({state})'.format(
-                    name=part['name'],
-                    type=part['type'],
-                    size=part['size_human'],
-                    label='  [{}]'.format(part['label']) if part.get('label') else '',
-                    state=self._partition_state(part),
-                ))
+                # a disklabel inside a slice is indented under it, and the
+                # indent counts towards the name column so the rest lines up
+                indent = '  ' if part.get('parent') else ''
+                rows.append({
+                    'name': indent + part['name'],
+                    'type': part['type'],
+                    'size': part['size_human'],
+                    'label': '[{}]'.format(part['label']) if part.get('label') else '',
+                    'state': self._partition_state(part),
+                })
+            widths = dict((key, max(len(row[key]) for row in rows))
+                          for key in ('name', 'type', 'size', 'label'))
+            for row in rows:
+                fields = [
+                    row['name'].ljust(widths['name']),
+                    row['type'].ljust(widths['type']),
+                    row['size'].rjust(widths['size']),
+                ]
+                # leave the column out entirely when nothing here is labelled
+                if widths['label']:
+                    fields.append(row['label'].ljust(widths['label']))
+                fields.append('({})'.format(row['state']))
+                lines.append('    ' + '  '.join(fields))
         return '\n'.join(lines)
 
     def _partition_state(self, part):
