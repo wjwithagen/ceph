@@ -1,3 +1,4 @@
+import json
 import re
 
 from ceph_volume.util.disk import human_readable_size
@@ -180,6 +181,7 @@ def get_partitions(diskname):
     # Sort by partition index number so p4 always appears before p5
     # regardless of how gpart orders them in its output (which is by
     # start sector, not by partition number).
+
     def _part_index(p):
         m = re.search(r'p(\d+)$', p['name'])
         return int(m.group(1)) if m else 0
@@ -270,8 +272,16 @@ def resolve_device(path, aliases):
 
 
 def _device_on_disk(name, diskname):
-    """'da4p3' -> 'da4p3' when it is the disk or one of its partitions, else None."""
-    m = re.match(r'^(' + re.escape(diskname) + r'(p\d+)?)$', name)
+    """
+    'da4p3' -> 'da4p3' when it is the disk or one of its partitions, else None.
+
+    Covers GPT partitions (da4p3), MBR slices and the BSD labels inside
+    them (da4s1, da4s1a), and a GELI provider layered on either of those
+    (da4p3.eli), which is the name a mount or a pool uses once the
+    partition is encrypted.
+    """
+    name = re.sub(r'\.eli$', '', name)
+    m = re.match(r'^(' + re.escape(diskname) + r'(?:p\d+|s\d+[a-h]?)?)$', name)
     return m.group(1) if m else None
 
 
@@ -401,7 +411,6 @@ def get_zpool_leaf_vdevs():
       'path': '/dev/gptid/fa257269-...'}, ...]
     vdev_name is None for a plain stripe member.
     """
-    import json
     command = ['/sbin/zpool', 'status', '-j']
     out, err, rc = process.call(command, verbose_on_failure=False)
     if rc == 0 and out:
@@ -418,7 +427,7 @@ def get_zpool_leaf_vdevs():
     return _zpool_leaf_vdevs_plaintext()
 
 
-def get_zpool_membership(diskname, partitions=None):
+def get_zpool_membership(diskname, partitions=None, aliases=None):
     """
     Checks whether this disk (or any gpart partition on it) is a member of
     an imported zpool. A pool names its devices as it was created: by
@@ -440,7 +449,8 @@ def get_zpool_membership(diskname, partitions=None):
         return result
     if partitions is None:
         partitions = get_partitions(diskname)
-    aliases = get_label_aliases(partitions)
+    if aliases is None:
+        aliases = get_label_aliases(partitions)
     for leaf in leaves:
         matched = _device_on_disk(resolve_device(leaf['path'], aliases), diskname)
         if not matched:
@@ -453,7 +463,7 @@ def get_zpool_membership(diskname, partitions=None):
     return result
 
 
-def get_mount_info(diskname, partitions=None):
+def get_mount_info(diskname, partitions=None, aliases=None):
     """
     Cross-references `mount -p` (parseable output) against this disk's
     partitions to catch cases where something on the disk is actively
@@ -487,7 +497,8 @@ def get_mount_info(diskname, partitions=None):
         result['by_partition'][part['name']] = {'mounted': False, 'mountpoint': None}
     if rc != 0:
         return result
-    aliases = get_label_aliases(partitions)
+    if aliases is None:
+        aliases = get_label_aliases(partitions)
     for line in out:
         fields = line.split()
         if not fields:
@@ -518,7 +529,7 @@ def get_mount_info(diskname, partitions=None):
     return result
 
 
-def get_swap_info(diskname, partitions=None):
+def get_swap_info(diskname, partitions=None, aliases=None):
     """
     Cross-references `swapctl -l` against this disk's partitions to
     catch active swap devices. Swap is NOT visible via `mount -p` --
@@ -551,7 +562,8 @@ def get_swap_info(diskname, partitions=None):
         result['by_partition'][part['name']] = {'active': False}
     if rc != 0 or not out:
         return result
-    aliases = get_label_aliases(partitions)
+    if aliases is None:
+        aliases = get_label_aliases(partitions)
     for line in out[1:]:  # first line is the header: "Device  1K-blocks  Used"
         fields = line.split()
         if not fields:
@@ -730,7 +742,6 @@ def get_zpool_vdevs(pool_name):
     Tries `zpool status -j` (OpenZFS >= 2.3) first, falls back to
     plaintext parsing on older versions.
     """
-    import json
     command = ['/sbin/zpool', 'status', '-j', pool_name]
     out, err, rc = process.call(command, verbose_on_failure=False)
     paths = []
@@ -812,11 +823,15 @@ def get_disks():
                     disk.update(cam_id)
         disk['cam'] = cam_info
         disk['gpart'] = get_gpart_info(dsk)
-        disk['zpool'] = get_zpool_membership(dsk, partitions=disk['gpart'].get('partitions'))
-        disk['mount'] = get_mount_info(dsk, partitions=disk['gpart'].get('partitions'))
-        disk['swap'] = get_swap_info(dsk, partitions=disk['gpart'].get('partitions'))
+        partitions = disk['gpart'].get('partitions')
+        # One `glabel status` per disk, not one per lookup below.
+        aliases = get_label_aliases(partitions)
+        disk['zpool'] = get_zpool_membership(dsk, partitions=partitions, aliases=aliases)
+        disk['mount'] = get_mount_info(dsk, partitions=partitions, aliases=aliases)
+        disk['swap'] = get_swap_info(dsk, partitions=partitions, aliases=aliases)
         disks['/dev/' + dsk] = disk
     return disks
+
 
 class Disks(object):
 
@@ -824,11 +839,15 @@ class Disks(object):
         if not sys_info.devices:
             sys_info.devices = get_disks()
         self.disks = {}
+        if path is None:
+            for k in sys_info.devices:
+                self.disks[k] = Disk(k)
+            return
+        # Match the device, not every name it is a substring of: 'ada1'
+        # must not also select /dev/ada10.
+        wanted = '/dev/' + re.sub(r'^/dev/', '', path)
         for k in sys_info.devices:
-            if path != None:
-                if path in k:
-                    self.disks[k] = Disk(k)
-            else:
+            if k == wanted:
                 self.disks[k] = Disk(k)
 
     def pretty_report(self, all=True):
@@ -902,7 +921,6 @@ class Disk(object):
         zpool = self.sys_api.get('zpool', {})
         if zpool.get('in_pool'):
             vdev_name = zpool.get('vdev_name')
-            vdev_type = zpool.get('vdev_type') or 'stripe'
             if vdev_name:
                 self.reject_reasons.append(
                     'Member of {} vdev in zpool "{}"'.format(
